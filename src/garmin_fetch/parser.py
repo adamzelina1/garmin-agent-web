@@ -273,12 +273,6 @@ def parse_fitnessage(payload: dict[str, Any]) -> dict[str, Any]:
     ])
 
 
-def parse_hydration(payload: dict[str, Any]) -> dict[str, Any]:
-    return _leaf(payload, [
-        ("hydration_sweat_loss_ml", "sweatLossInML"),
-    ])
-
-
 def parse_intensity_minutes(payload: dict[str, Any]) -> dict[str, Any]:
     return _leaf(payload, [
         ("moderate_intensity_minutes", "moderateMinutes"),
@@ -371,7 +365,6 @@ PARSERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "body_battery": parse_body_battery,
     "max_metrics": parse_max_metrics,
     "fitnessage": parse_fitnessage,
-    "hydration": parse_hydration,
     "intensity_minutes": parse_intensity_minutes,
     "floors": parse_floors,
     "training_status": parse_training_status,

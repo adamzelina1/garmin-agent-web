@@ -117,10 +117,6 @@ class FakeClient:
         self.calls.append(("fitnessage", cdate))
         return {"calendarDate": cdate, "fitnessAge": 25}
 
-    def get_hydration_data(self, cdate):
-        self.calls.append(("hydration", cdate))
-        return {"calendarDate": cdate, "waterIntakeInLiters": 2.5}
-
     def get_training_status(self, cdate):
         self.calls.append(("training_status", cdate))
         return {"calendarDate": cdate, "trainingStatus": "productive"}

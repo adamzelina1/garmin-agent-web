@@ -86,10 +86,6 @@ def fetch_fitnessage(client: Any, cdate: str) -> Any:
     return client.get_fitnessage_data(cdate)
 
 
-def fetch_hydration(client: Any, cdate: str) -> Any:
-    return client.get_hydration_data(cdate)
-
-
 def fetch_training_status(client: Any, cdate: str) -> Any:
     return client.get_training_status(cdate)
 
@@ -119,7 +115,6 @@ DATA_TYPES: dict[str, DataType] = {
         "morning_training_readiness", fetch_morning_training_readiness
     ),
     "fitnessage": DataType("fitnessage", fetch_fitnessage),
-    "hydration": DataType("hydration", fetch_hydration),
     "training_status": DataType("training_status", fetch_training_status),
     "lactate_threshold": DataType("lactate_threshold", fetch_lactate_threshold),
 }

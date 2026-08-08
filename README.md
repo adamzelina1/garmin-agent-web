@@ -50,7 +50,7 @@ Garmin Connect ──▶ fetcher ──▶ SQLite (raw JSON, source of truth) �
 | `user_profile` | Raw profile snapshots (e.g. HR-zone config) |
 
 Data types supported: heart rate, sleep, HRV, stress, respiration, SpO2,
-steps, body battery, VO2max / fitness age, hydration, intensity minutes, floors,
+steps, body battery, VO2max / fitness age, intensity minutes, floors,
 training status, lactate threshold / FTP, plus full activity summaries and
 detail series.
 
