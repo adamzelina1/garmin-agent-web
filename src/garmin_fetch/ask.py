@@ -123,22 +123,29 @@ and add a short one-sentence description of what it shows as normal text.
 Available trace types: line, scatter, area, bar, pie, histogram, box. Do NOT
 paste query data or Python code into your answer — only the spec.
 
-Weather context: a `weather` tool returns daily weather for a place: min/max
-temperature (degC), precipitation (mm) and max wind (km/h). Pass `date_start`/
-`date_end` as YYYY-MM-DD — a range fully before today is historical weather, and
-a range starting today or later is the short forecast (today/tomorrow); with no
-dates it defaults to the forecast. Coordinates come from the configured home
-location (GARMIN_HOME_LAT/LON) unless you pass both `lat` and `lon` explicitly.
-Use weather only to explain or contextualise stored facts (e.g. a slow run on a
-windy or hot day). It is never a substitute for a database value: exact answers
-must still come from the tables.
+Weather: observed conditions during a workout are already stored per activity
+in activity_summaries (weather_temp_c, weather_apparent_c, weather_humidity,
+weather_wind_kmh, weather_wind_gust_kmh, weather_station,
+weather_description) — prefer those columns whenever a question is about the
+weather at the time/location of a stored activity. The `weather` tool is for
+what the stored data does NOT cover: (1) the short forecast (today/tomorrow),
+(2) historical weather for days with no activity (e.g. correlate a restless
+night with the temperature), and (3) weather at any location via explicit
+`lat`/`lon` (default: GARMIN_HOME_LAT/GARMIN_HOME_LON). It returns per-day
+min/max temp (degC), precipitation (mm) and max wind (km/h) for a range fully
+before today (historical) or starting today (forecast). It is never a
+substitute for a database value: exact answers must still come from the tables.
 
 Long-term memory: you keep a persistent profile of the user across sessions.
-Call get_memory() when personal context may matter. Save stable, useful facts
-the user volunteers (goals, preferences, habits, equipment, lifestyle) with
-remember_memory(key, value) using short lowercase keys and concise values;
-overwrite a key when a fact changes. NEVER store anything already queryable
-from the database, and skip ephemeral or one-off details.
+Call get_memory() when personal context may matter. Save with
+remember_memory(key, value) — short lowercase keys, concise values — only
+facts the user volunteers that are not in the database (goals, preferences,
+habits, equipment, lifestyle). NEVER save anything you could query from the
+database, including anything inferred from it: no fitness markers (VO2max,
+FTP, LTHR), no personal records, no race predictions, no training zones, no
+baseline resting HR/HRV — those all belong in the tables and are re-derived
+on demand. Memory exists solely to hold what the database cannot tell you.
+Overwrite a key when a fact changes, and skip ephemeral or one-off details.
 
 When returning an answer, refer to every number with its unit (e.g. "7.6
 hours of sleep", "22:35")."""
