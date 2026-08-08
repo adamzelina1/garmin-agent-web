@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS activities (
     raw_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL,
     details_json TEXT,
-    details_fetched_at TEXT
+    details_fetched_at TEXT,
+    weather_json TEXT,
+    weather_fetched_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -73,6 +75,13 @@ CREATE TABLE IF NOT EXISTS activity_summaries (
     max_cadence REAL,
     avg_power_w REAL,
     max_power_w REAL,
+    weather_temp_c REAL,
+    weather_apparent_c REAL,
+    weather_humidity REAL,
+    weather_wind_kmh REAL,
+    weather_wind_gust_kmh REAL,
+    weather_station TEXT,
+    weather_description TEXT,
     fetched_at TEXT
 );
 
@@ -116,6 +125,15 @@ CREATE TABLE IF NOT EXISTS hr_zones (
     resting_hr_auto_update INTEGER,
     fetched_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS race_predictions (
+    calendar_date TEXT PRIMARY KEY,
+    time_5k_min REAL,
+    time_10k_min REAL,
+    time_half_marathon_min REAL,
+    time_marathon_min REAL,
+    fetched_at TEXT
+);
 """
 
 
@@ -146,6 +164,7 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_SCHEMA)
         _ensure_columns(self.conn, "activities", ["details_json", "details_fetched_at"])
+        _ensure_columns(self.conn, "activities", ["weather_json", "weather_fetched_at"])
         _ensure_columns(self.conn, "activity_summaries", list(self._ACTIVITY_SUMMARY_COLUMNS))
         self.conn.commit()
 
@@ -233,6 +252,25 @@ class Database:
         )
         self.conn.commit()
 
+    def set_activity_weather(
+        self, activity_id: int, weather: dict[str, Any], fetched_at: str | None = None
+    ) -> None:
+        """Store the raw weather payload for an activity (upsert)."""
+        self.conn.execute(
+            "UPDATE activities SET weather_json = ?, weather_fetched_at = ? "
+            "WHERE activity_id = ?",
+            (json.dumps(weather), fetched_at, activity_id),
+        )
+        self.conn.commit()
+
+    def activities_missing_weather(self) -> list[int]:
+        """Activity ids that have no stored weather payload yet."""
+        rows = self.conn.execute(
+            "SELECT activity_id FROM activities "
+            "WHERE weather_json IS NULL OR weather_json = ''"
+        ).fetchall()
+        return [r["activity_id"] for r in rows]
+
     def close(self) -> None:
         self.conn.close()
 
@@ -291,6 +329,9 @@ class Database:
         "min_respiration_rate", "avg_respiration_rate", "max_respiration_rate",
         "body_battery_change", "water_estimated_ml", "is_pr",
         "avg_cadence", "max_cadence", "avg_power_w", "max_power_w",
+        "weather_temp_c", "weather_apparent_c", "weather_humidity",
+        "weather_wind_kmh", "weather_wind_gust_kmh", "weather_station",
+        "weather_description",
     )
 
     def upsert_activity_summary(
@@ -417,6 +458,33 @@ class Database:
             )
         self.conn.commit()
         return len(rows)
+
+    def replace_race_predictions(self, row: dict[str, Any] | None) -> int:
+        """Replace the race-prediction snapshot with a fresh one.
+
+        Race predictions are a current-fitness snapshot (like hr_zones), so the
+        single stored row is overwritten entirely. Returns 1 when a row was
+        written, else 0.
+        """
+        self.conn.execute("DELETE FROM race_predictions")
+        if row is None:
+            self.conn.commit()
+            return 0
+        self.conn.execute(
+            """
+            INSERT INTO race_predictions (
+                calendar_date, time_5k_min, time_10k_min,
+                time_half_marathon_min, time_marathon_min, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row.get("calendar_date"), row.get("time_5k_min"),
+                row.get("time_10k_min"), row.get("time_half_marathon_min"),
+                row.get("time_marathon_min"), row.get("fetched_at"),
+            ),
+        )
+        self.conn.commit()
+        return 1
 
     # -- Sync state -----------------------------------------------------------
 

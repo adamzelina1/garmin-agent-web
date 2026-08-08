@@ -158,6 +158,32 @@ class FakeClient:
             },
         ]
 
+    def get_race_predictions(self):
+        self.calls.append(("race_predictions", ""))
+        return {
+            "calendarDate": "2026-08-08",
+            "time5K": 1424,
+            "time10K": 3093,
+            "timeHalfMarathon": 7008,
+            "timeMarathon": 15825,
+        }
+
+    def get_activity_weather(self, activity_id):
+        self.calls.append(("activity_weather", str(activity_id)))
+        return {
+            "issueDate": "2026-08-01T07:00:00.000+00:00",
+            "temp": 68.0,
+            "apparentTemp": 66.0,
+            "dewPoint": 50.0,
+            "relativeHumidity": 60,
+            "windDirection": 180,
+            "windDirectionCompassPoint": "s",
+            "windSpeed": 10.0,
+            "windGust": 15.0,
+            "weatherStationDTO": {"id": "LZIB", "name": "Bratislava Ivanka"},
+            "weatherTypeDTO": {"desc": "Fair"},
+        }
+
     def get_activities_by_date(self, startdate, enddate=None, activitytype=None, sortorder=None):
         self.calls.append(("activities", f"{startdate}..{enddate}"))
         return [
@@ -475,14 +501,17 @@ def test_fetch_activities_stores_raw(client: FakeClient, db: Database) -> None:
     row = db.conn.execute(
         "SELECT * FROM activities WHERE activity_id=1001"
     ).fetchone()
-    # Raw-only: no typed projection columns, just the raw payload + details.
+    # Raw-only: no typed projection columns, just the raw payload + details
+    # (+ weather, which is fetched best-effort for new activities).
     assert list(row.keys()) == [
-        "activity_id", "raw_json", "fetched_at", "details_json", "details_fetched_at"
+        "activity_id", "raw_json", "fetched_at", "details_json",
+        "details_fetched_at", "weather_json", "weather_fetched_at",
     ]
     assert json.loads(row["raw_json"])["activityId"] == 1001
     assert json.loads(row["raw_json"])["activityName"] == "Morning Run"
     assert json.loads(row["details_json"])["activityId"] == 1001
     assert json.loads(row["details_json"])["heartRateDTOs"][0]["heartRateValues"] == [80, 90, 100]
+    assert json.loads(row["weather_json"])["temp"] == 68.0
 
 
 def test_fetch_activities_details_dont_duplicate_calls(
@@ -651,3 +680,77 @@ def test_fetch_profile_none_skips(client: FakeClient, db: Database) -> None:
     fetcher = make_fetcher(client)
     assert fetcher.fetch_profile(db) is False
     assert db.get_profile("hr_zones") is None
+
+
+def test_fetch_race_predictions_stores_raw(client: FakeClient, db: Database) -> None:
+    fetcher = make_fetcher(client)
+    assert fetcher.fetch_race_predictions(db) is True
+    profile = db.get_profile("race_predictions")
+    assert profile is not None
+    payload = json.loads(profile["raw_json"])
+    assert payload["time5K"] == 1424
+    assert payload["timeMarathon"] == 15825
+    assert profile["fetched_at"]
+
+
+def test_fetch_race_predictions_none_skips(client: FakeClient, db: Database) -> None:
+    client.get_race_predictions = lambda: None
+    fetcher = make_fetcher(client)
+    assert fetcher.fetch_race_predictions(db) is False
+    assert db.get_profile("race_predictions") is None
+
+
+def test_fetch_activities_also_fetches_weather(
+    client: FakeClient, db: Database
+) -> None:
+    fetcher = make_fetcher(client)
+    assert fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db) == 2
+    row = db.conn.execute(
+        "SELECT weather_json FROM activities WHERE activity_id=1001"
+    ).fetchone()
+    assert json.loads(row["weather_json"])["temp"] == 68.0
+
+
+def test_backfill_activity_weather_fills_missing(
+    client: FakeClient, db: Database
+) -> None:
+    db.upsert_activity({
+        "activityId": 2001, "activityName": "Old Ride",
+        "activityType": {"typeKey": "cycling"}, "fetched_at": "t",
+    })
+    db.upsert_activity({
+        "activityId": 2002, "activityName": "Already Has Weather",
+        "activityType": {"typeKey": "running"}, "fetched_at": "t",
+    })
+    db.set_activity_weather(2002, {"temp": 50.0}, fetched_at="wt")
+
+    fetcher = make_fetcher(client)
+    assert fetcher.backfill_activity_weather(db) == 1
+    row = db.conn.execute(
+        "SELECT weather_json FROM activities WHERE activity_id=2001"
+    ).fetchone()
+    assert json.loads(row["weather_json"])["temp"] == 68.0
+    # 2002 kept its existing weather (not refetched).
+    assert json.loads(db.conn.execute(
+        "SELECT weather_json FROM activities WHERE activity_id=2002"
+    ).fetchone()["weather_json"])["temp"] == 50.0
+
+
+def test_backfill_activity_weather_none_missing(client: FakeClient, db: Database) -> None:
+    fetcher = make_fetcher(client)
+    assert fetcher.backfill_activity_weather(db) == 0
+
+
+def test_fetch_activity_weather_missing_payload_is_skipped(
+    client: FakeClient, db: Database
+) -> None:
+    client.get_activity_weather = lambda _id: None
+    db.upsert_activity({
+        "activityId": 3001, "activityName": "No Weather Data",
+        "activityType": {"typeKey": "hiking"}, "fetched_at": "t",
+    })
+    fetcher = make_fetcher(client)
+    assert fetcher.backfill_activity_weather(db) == 0
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM activities WHERE weather_json IS NOT NULL"
+    ).fetchone()[0] == 0

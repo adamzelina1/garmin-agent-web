@@ -44,15 +44,16 @@ Garmin Connect ──▶ fetcher ──▶ SQLite (raw JSON, source of truth) �
 | `metrics` | Raw Garmin JSON payloads, keyed by `(data_type, calendar_date)` — the single source of truth |
 | `daily_metrics` | Parsed daily projection, one wide row per date; columns auto-created on demand |
 | `activities` | Raw activity summaries + intra-activity detail payloads, keyed by `activityId` |
-| `activity_summaries` | Parsed activity projection (durations, HR, zones, elevation, power, cadence, body-battery drain, estimated sweat, PR flag) |
+| `activity_summaries` | Parsed activity projection (durations, HR, zones, elevation, power, cadence, body-battery drain, estimated sweat, PR flag, observed weather) |
 | `activity_detail_series` | Parsed intra-activity time series (HR / cadence / power / speed / elevation / GPS per tick) |
 | `hr_zones` | Derived per-sport heart-rate zone ranges from the device profile |
-| `user_profile` | Raw profile snapshots (e.g. HR-zone config) |
+| `race_predictions` | Current race-prediction snapshot (5k/10k/half/full finish times) |
+| `user_profile` | Raw profile snapshots (HR-zone config, race predictions) |
 
 Data types supported: heart rate, sleep, HRV, stress, respiration, SpO2,
 steps, body battery, VO2max / fitness age, intensity minutes, floors,
-training status, lactate threshold / FTP, plus full activity summaries and
-detail series.
+training status, lactate threshold / FTP, race predictions, plus full activity
+summaries (with observed weather) and detail series.
 
 ## Agent tools
 

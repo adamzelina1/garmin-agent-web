@@ -734,3 +734,127 @@ def build_hr_zones(db: Any) -> dict[str, int]:
     for row in rows:
         row["fetched_at"] = profile["fetched_at"]
     return {"hr_zones": db.replace_hr_zones(rows)}
+
+
+# --- Race predictions ---------------------------------------------------------
+#
+# Garmin's race predictor is a current-fitness snapshot (predicted finish times
+# for 5k/10k/half/full), not day-keyed history. It's fetched as a profile-style
+# payload under user_profile('race_predictions') and projected into the single
+# ``race_predictions`` row. Times arrive in seconds; they're stored as minutes.
+
+
+def parse_race_predictions(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project the race-predictor payload into minute-based predicted times.
+
+    Returns ``{}`` when none of the four predicted times is present.
+    """
+    out: dict[str, Any] = {}
+    for src, name in (
+        ("time5K", "time_5k_min"),
+        ("time10K", "time_10k_min"),
+        ("timeHalfMarathon", "time_half_marathon_min"),
+        ("timeMarathon", "time_marathon_min"),
+    ):
+        seconds = payload.get(src)
+        if isinstance(seconds, (int, float)):
+            out[name] = round(seconds / 60, 2)
+    if not out:
+        return {}
+    calendar_date = payload.get("calendarDate")
+    if isinstance(calendar_date, str) and calendar_date:
+        out["calendar_date"] = calendar_date
+    return out
+
+
+def build_race_predictions(db: Any) -> dict[str, int]:
+    """Project the stored race-predictor snapshot into ``race_predictions``.
+
+    Replaces the single row from the latest stored payload (user_profile key
+    'race_predictions'). Returns {"race_predictions": rows}.
+    """
+    profile = db.get_profile("race_predictions")
+    if not profile:
+        return {"race_predictions": 0}
+    payload = json.loads(profile["raw_json"])
+    if not isinstance(payload, dict):
+        return {"race_predictions": 0}
+    row = parse_race_predictions(payload)
+    if not row:
+        return {"race_predictions": 0}
+    row["fetched_at"] = profile["fetched_at"]
+    return {"race_predictions": db.replace_race_predictions(row)}
+
+
+# --- Activity weather ---------------------------------------------------------
+#
+# Each activity's weather payload (observed conditions at the activity site)
+# is stored raw on the ``activities`` row (``weather_json``) and projected into
+# the curated ``activity_summaries`` columns below. Values arrive in imperial
+# units (degF, mph); they're converted to metric (degC, km/h) to match the rest
+# of the projection.
+
+
+def _f_to_c(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return round((value - 32) * 5 / 9, 2)
+    return None
+
+
+def _mph_to_kmh(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return round(value * 1.609344, 2)
+    return None
+
+
+def parse_activity_weather(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project one activity weather payload into metric summary columns.
+
+    Returns ``{}`` for a payload with no usable data.
+    """
+    out: dict[str, Any] = {}
+    temp = _f_to_c(payload.get("temp"))
+    if temp is not None:
+        out["weather_temp_c"] = temp
+    apparent = _f_to_c(payload.get("apparentTemp"))
+    if apparent is not None:
+        out["weather_apparent_c"] = apparent
+    humidity = payload.get("relativeHumidity")
+    if isinstance(humidity, (int, float)):
+        out["weather_humidity"] = humidity
+    wind = _mph_to_kmh(payload.get("windSpeed"))
+    if wind is not None:
+        out["weather_wind_kmh"] = wind
+    gust = _mph_to_kmh(payload.get("windGust"))
+    if gust is not None:
+        out["weather_wind_gust_kmh"] = gust
+    station = _get(payload, "weatherStationDTO", "name")
+    if isinstance(station, str) and station:
+        out["weather_station"] = station
+    description = _get(payload, "weatherTypeDTO", "desc")
+    if isinstance(description, str) and description:
+        out["weather_description"] = description
+    return out
+
+
+def build_activity_weather(db: Any) -> dict[str, int]:
+    """Project each stored activity's weather payload into its summary row.
+
+    Reads the raw ``weather_json`` column on ``activities`` and merges the
+    derived weather scalars into ``activity_summaries``. Returns
+    {"activities": rows_parsed}.
+    """
+    rows = db.conn.execute(
+        "SELECT activity_id, weather_json, weather_fetched_at FROM activities "
+        "WHERE weather_json IS NOT NULL AND weather_json != ''"
+    ).fetchall()
+    count = 0
+    for row in rows:
+        parsed = parse_activity_weather(json.loads(row["weather_json"]))
+        if not parsed:
+            continue
+        db.upsert_activity_summary(
+            row["activity_id"], parsed, row["weather_fetched_at"]
+        )
+        count += 1
+    return {"activities": count}

@@ -54,7 +54,10 @@ _MAX_ROWS = 200
 
 #: Tables the agent may see and query. Everything else (raw ``metrics``,
 #: ``activities``, ``user_profile``, ``sync_state``) stays invisible to the model.
-_ALLOWED_TABLES = ("daily_metrics", "activity_summaries", "activity_detail_series", "hr_zones")
+_ALLOWED_TABLES = (
+    "daily_metrics", "activity_summaries", "activity_detail_series", "hr_zones",
+    "race_predictions",
+)
 
 #: How the model should interpret the stored metrics (units, NULL semantics).
 _SYSTEM_PROMPT = """\
@@ -63,10 +66,15 @@ Garmin health data. Today is {today}. Answer the user's questions by inspecting
 the schema and running read-only SELECT queries. You may run several queries.
 You can never write.
 
-Only four tables are available and you may only query these:
+Only five tables are available and you may only query these:
 - daily_metrics: one row per calendar_date, wide columns.
   calendar_date is YYYY-MM-DD.
 - activity_summaries: one row per activity (activity_id), curated summary fields.
+  Also carries per-activity observed weather when Garmin recorded it:
+  weather_temp_c / weather_apparent_c (degC), weather_humidity (0-100),
+  weather_wind_kmh / weather_wind_gust_kmh (km/h), weather_station, and
+  weather_description (e.g. "Fair"). Indoor or weatherless activities have
+  NULLs here.
 - activity_detail_series: the intra-activity time series, one row per tick
   (activity_id + tick). Columns: heart_rate, cadence, power_w, speed_mps,
   elevation_m, distance_m (cumulative metres), latitude, longitude, ts_ms
@@ -77,6 +85,10 @@ Only four tables are available and you may only query these:
   sport (sport: DEFAULT/RUNNING/CYCLING/...). zoneN_min..zoneN_max give each
   zone's bpm range (e.g. zone2_min..zone2_max is the user's Zone 2). This is
   the *current* device configuration snapshot, not historical.
+- race_predictions: a single current-fitness snapshot row with Garmin's
+  predicted race times, in MINUTES: time_5k_min, time_10k_min,
+  time_half_marathon_min, time_marathon_min (NULL when a prediction is
+  unavailable). calendar_date is when the prediction was made.
 
 Units and semantics:
 - Sleep durations (sleep_time_hours, nap_time_hours, deep_sleep_hours,

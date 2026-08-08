@@ -11,17 +11,21 @@ from garmin_fetch.db import Database
 from garmin_fetch.parser import (
     build_activity_details,
     build_activity_summaries,
+    build_activity_weather,
     build_daily_rows,
     build_hr_zones,
+    build_race_predictions,
     parse_activity_detail_series,
     parse_activity_details,
     parse_activity_summary,
+    parse_activity_weather,
     parse_body_battery,
     parse_heart_rate,
     parse_hrv,
     parse_hr_zones,
     parse_lactate_threshold,
     parse_max_metrics,
+    parse_race_predictions,
     parse_rhr,
     parse_sleep,
     parse_stats,
@@ -693,3 +697,115 @@ def test_build_hr_zones_replaces_previous_snapshot(db: Database) -> None:
         for r in db.conn.execute("SELECT sport FROM hr_zones ORDER BY sport")
     ]
     assert sports == ["CYCLING", "DEFAULT"]
+
+
+def test_parse_race_predictions_to_minutes() -> None:
+    out = parse_race_predictions({
+        "calendarDate": "2026-08-08",
+        "time5K": 1424,
+        "time10K": 3093,
+        "timeHalfMarathon": 7008,
+        "timeMarathon": 15825,
+    })
+    assert out == {
+        "calendar_date": "2026-08-08",
+        "time_5k_min": pytest.approx(1424 / 60, abs=0.01),
+        "time_10k_min": pytest.approx(3093 / 60, abs=0.01),
+        "time_half_marathon_min": pytest.approx(7008 / 60, abs=0.01),
+        "time_marathon_min": pytest.approx(15825 / 60, abs=0.01),
+    }
+
+
+def test_parse_race_predictions_empty_on_no_times() -> None:
+    assert parse_race_predictions({"calendarDate": "2026-08-08"}) == {}
+    assert parse_race_predictions({}) == {}
+
+
+def test_build_race_predictions_projects_snapshot(db: Database) -> None:
+    db.upsert_profile("race_predictions", json.dumps({
+        "calendarDate": "2026-08-08",
+        "time5K": 1424,
+        "time10K": 3093,
+        "timeHalfMarathon": 7008,
+        "timeMarathon": 15825,
+    }), fetched_at="t")
+    assert build_race_predictions(db) == {"race_predictions": 1}
+    row = db.conn.execute("SELECT * FROM race_predictions").fetchone()
+    assert row["time_5k_min"] == pytest.approx(1424 / 60, abs=0.01)
+    assert row["time_marathon_min"] == pytest.approx(15825 / 60, abs=0.01)
+    assert row["fetched_at"] == "t"
+
+
+def test_build_race_predictions_replaces_and_empty(db: Database) -> None:
+    assert build_race_predictions(db) == {"race_predictions": 0}
+    db.upsert_profile("race_predictions", json.dumps({
+        "calendarDate": "2026-08-08", "time5K": 1424,
+    }), fetched_at="t1")
+    build_race_predictions(db)
+    db.upsert_profile("race_predictions", json.dumps({
+        "calendarDate": "2026-08-09", "time5K": 1400,
+    }), fetched_at="t2")
+    build_race_predictions(db)
+    rows = db.conn.execute("SELECT * FROM race_predictions").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["calendar_date"] == "2026-08-09"
+    assert rows[0]["time_5k_min"] == pytest.approx(1400 / 60, abs=0.01)
+
+
+def test_parse_activity_weather_converts_to_metric() -> None:
+    out = parse_activity_weather({
+        "temp": 68.0,
+        "apparentTemp": 66.0,
+        "relativeHumidity": 60,
+        "windSpeed": 10.0,
+        "windGust": 15.0,
+        "weatherStationDTO": {"id": "LZIB", "name": "Bratislava Ivanka"},
+        "weatherTypeDTO": {"desc": "Fair"},
+    })
+    assert out["weather_temp_c"] == pytest.approx((68 - 32) * 5 / 9, rel=1e-2)
+    assert out["weather_apparent_c"] == pytest.approx((66 - 32) * 5 / 9, rel=1e-2)
+    assert out["weather_humidity"] == 60
+    assert out["weather_wind_kmh"] == pytest.approx(10 * 1.609344, rel=1e-2)
+    assert out["weather_wind_gust_kmh"] == pytest.approx(15 * 1.609344, rel=1e-2)
+    assert out["weather_station"] == "Bratislava Ivanka"
+    assert out["weather_description"] == "Fair"
+
+
+def test_parse_activity_weather_empty_on_blank() -> None:
+    assert parse_activity_weather({}) == {}
+    assert parse_activity_weather({"temp": "not-a-number"}) == {}
+
+
+def test_build_activity_weather_projects_summary_columns(db: Database) -> None:
+    db.upsert_activity({
+        "activityId": 1001,
+        "activityName": "Morning Run",
+        "activityType": {"typeKey": "running"},
+        "fetched_at": "t",
+    })
+    db.set_activity_weather(1001, {
+        "temp": 68.0,
+        "relativeHumidity": 60,
+        "windSpeed": 10.0,
+        "weatherStationDTO": {"name": "LZIB"},
+        "weatherTypeDTO": {"desc": "Fair"},
+    }, fetched_at="wt")
+    assert build_activity_weather(db) == {"activities": 1}
+    row = db.conn.execute(
+        "SELECT * FROM activity_summaries WHERE activity_id=1001"
+    ).fetchone()
+    assert row["weather_temp_c"] == pytest.approx((68 - 32) * 5 / 9, rel=1e-2)
+    assert row["weather_wind_kmh"] == pytest.approx(10 * 1.609344, rel=1e-2)
+    assert row["weather_station"] == "LZIB"
+    assert row["weather_description"] == "Fair"
+    assert row["fetched_at"] == "wt"
+
+
+def test_build_activity_weather_ignores_missing(db: Database) -> None:
+    db.upsert_activity({
+        "activityId": 1002,
+        "activityName": "No Weather",
+        "activityType": {"typeKey": "cycling"},
+        "fetched_at": "t",
+    })
+    assert build_activity_weather(db) == {"activities": 0}

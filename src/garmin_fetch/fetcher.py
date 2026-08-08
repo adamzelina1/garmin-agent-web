@@ -46,6 +46,9 @@ def _nonfinal_dates(stored: dict[str, str]) -> set[str]:
 _PROFILE_HR_ZONES = "hr_zones"
 """user_profile key for the configured heart-rate zone boundaries."""
 
+_PROFILE_RACE_PREDICTIONS = "race_predictions"
+"""user_profile key for the current race-prediction snapshot."""
+
 
 class DataFetcher:
     """Authenticated client that fetches daily data of several types."""
@@ -114,12 +117,46 @@ class DataFetcher:
             payload["fetched_at"] = _now_iso()
             db.upsert_activity(payload)
             db.set_activity_details(activity_id, details, _now_iso())
+            self._fetch_activity_weather(activity_id, db)
             stored.add(activity_id)
             fetched += 1
             logger.info(
                 "Stored activity %s (%s, %s) with details",
                 activity_id, activity.get("activityName"), activity.get("startTimeLocal"),
             )
+        return fetched
+
+    def _fetch_activity_weather(self, activity_id: int, db: Database) -> bool:
+        """Best-effort: fetch and store one activity's observed weather.
+
+        Weather is an enrichment, not part of the atomic summary+details store:
+        a failure only logs a warning and leaves the activity without weather
+        (it can be backfilled later). Returns True when weather was stored.
+        """
+        try:
+            weather = self.client.get_activity_weather(str(activity_id))
+        except Exception:
+            logger.debug(
+                "No weather for activity %s (will backfill later)", activity_id
+            )
+            return False
+        if not isinstance(weather, dict):
+            return False
+        db.set_activity_weather(activity_id, weather, _now_iso())
+        return True
+
+    def backfill_activity_weather(self, db: Database) -> int:
+        """Fetch weather for every activity that still lacks it.
+
+        Returns the number of activities whose weather was newly stored.
+        """
+        self._ensure_logged_in()
+        missing = db.activities_missing_weather()
+        fetched = 0
+        for activity_id in missing:
+            if self._fetch_activity_weather(activity_id, db):
+                fetched += 1
+                logger.info("Backfilled weather for activity %s", activity_id)
         return fetched
 
     def fetch_profile(self, db: Database) -> bool:
@@ -137,6 +174,25 @@ class DataFetcher:
             return False
         db.upsert_profile(_PROFILE_HR_ZONES, json.dumps(payload), _now_iso())
         logger.info("Stored heart-rate zone profile (%d sport(s))", len(payload))
+        return True
+
+    def fetch_race_predictions(self, db: Database) -> bool:
+        """Fetch the current race-prediction snapshot and store it raw.
+
+        Race predictions are a current-fitness snapshot (like HR zones), so this
+        is a single no-arg call stored under the fixed ``user_profile`` key
+        ``race_predictions`` (overwriting the previous snapshot). Returns True
+        when a payload was stored.
+        """
+        self._ensure_logged_in()
+        payload = self.client.get_race_predictions()
+        if payload is None:
+            logger.warning("get_race_predictions returned nothing; skipping")
+            return False
+        db.upsert_profile(_PROFILE_RACE_PREDICTIONS, json.dumps(payload), _now_iso())
+        logger.info(
+            "Stored race predictions (as of %s)", payload.get("calendarDate")
+        )
         return True
 
     def fetch_range(
@@ -230,15 +286,21 @@ def sync_data(
                 "synced activities: fetched %d new (%s to %s)",
                 counts["activities"], act_start, end,
             )
+            weather_count = fetcher.backfill_activity_weather(db)
+            if weather_count:
+                logger.info("backfilled weather for %d activity(ies)", weather_count)
         if include_profile:
             fetcher.fetch_profile(db)
-            logger.info("synced user profile: heart-rate zones")
+            fetcher.fetch_race_predictions(db)
+            logger.info("synced user profile: heart-rate zones + race predictions")
         if parse:
             from .parser import (
                 build_activity_details,
                 build_activity_summaries,
+                build_activity_weather,
                 build_daily_rows,
                 build_hr_zones,
+                build_race_predictions,
             )
 
             parsed = build_daily_rows(db, [t.name for t in selected_types])
@@ -249,19 +311,25 @@ def sync_data(
             if include_activities:
                 act_parsed = build_activity_summaries(db)
                 detail_parsed = build_activity_details(db)
+                weather_parsed = build_activity_weather(db)
                 logger.info(
                     "parsed %d activities into activity_summaries (+ %d detail "
-                    "series) across %.0f ticks.",
+                    "series, %d with weather) across %.0f ticks.",
                     act_parsed.get("activities", 0),
                     detail_parsed.get("activities", 0),
+                    weather_parsed.get("activities", 0),
                     detail_parsed.get("series", 0),
                 )
             if include_profile:
                 zone_parsed = build_hr_zones(db)
                 counts["hr_zones"] = zone_parsed.get("hr_zones", 0)
+                race_parsed = build_race_predictions(db)
+                counts["race_predictions"] = race_parsed.get("race_predictions", 0)
                 logger.info(
-                    "parsed %d sport(s) into hr_zones.",
+                    "parsed %d sport(s) into hr_zones and %d row(s) into "
+                    "race_predictions.",
                     zone_parsed.get("hr_zones", 0),
+                    race_parsed.get("race_predictions", 0),
                 )
     finally:
         db.close()
@@ -378,7 +446,8 @@ def main() -> None:
     import argparse
 
     options = ", ".join(
-        sorted(d.name for d in DEFAULT_TYPES) + ["activities", "profile"]
+        sorted(d.name for d in DEFAULT_TYPES)
+        + ["activities", "profile", "race_predictions"]
     )
     parser = argparse.ArgumentParser(
         description="Fetch daily Garmin Connect data into SQLite. By default "
@@ -409,7 +478,7 @@ def main() -> None:
         for data_type in DEFAULT_TYPES:
             print(f"  {data_type.name}")
         print("  activities")
-        print("  profile (hr_zones)")
+        print("  profile (hr_zones + race_predictions)")
         return
 
     logging.basicConfig(
@@ -422,18 +491,29 @@ def main() -> None:
             PARSERS,
             build_activity_details,
             build_activity_summaries,
+            build_activity_weather,
             build_daily_rows,
             build_hr_zones,
+            build_race_predictions,
         )
 
         names = [t.strip().lower() for t in args.parse_types]
         want_activities = "activities" in names or "activity" in names
-        want_profile = "profile" in names or "hr_zones" in names
+        want_weather = "weather" in names
+        want_profile = (
+            "profile" in names or "hr_zones" in names or "race_predictions" in names
+        )
         day_names = [
-            n for n in names if n not in ("activities", "activity", "profile", "hr_zones")
+            n for n in names
+            if n not in (
+                "activities", "activity", "profile", "hr_zones",
+                "race_predictions", "weather",
+            )
         ]
         unknown = [n for n in day_names if n not in PARSERS]
-        options = ", ".join(sorted(PARSERS) + ["activities", "profile"])
+        options = ", ".join(
+            sorted(PARSERS) + ["activities", "profile", "weather"]
+        )
         if unknown:
             parser.error(
                 f"Unknown parse type(s): {', '.join(unknown)}. Options: {options}"
@@ -445,8 +525,12 @@ def main() -> None:
                 counts.update(build_activity_summaries(db))
             if want_activities or not names:
                 counts.update(build_activity_details(db))
+            if want_weather or want_activities or not names:
+                counts.update(build_activity_weather(db))
             if want_profile or not names:
                 counts.update(build_hr_zones(db))
+            if want_profile or not names:
+                counts.update(build_race_predictions(db))
             counts.update(build_daily_rows(db, day_names or None))
         finally:
             db.close()
@@ -456,9 +540,13 @@ def main() -> None:
 
     arg_types = [t.strip().lower() for t in (args.types or [])]
     want_activities = "activities" in arg_types
-    want_profile = "profile" in arg_types or "hr_zones" in arg_types
+    want_profile = (
+        "profile" in arg_types or "hr_zones" in arg_types
+        or "race_predictions" in arg_types
+    )
     type_names = [
-        t for t in arg_types if t not in ("activities", "profile", "hr_zones")
+        t for t in arg_types
+        if t not in ("activities", "profile", "hr_zones", "race_predictions")
     ]
     types = resolve_types(type_names or None)
 
