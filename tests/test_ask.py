@@ -13,6 +13,8 @@ from garmin_fetch.ask import (
     _ask_session,
     _build_chart_figure,
     _chart_spec_error,
+    _schema_text,
+    _tool_error,
     build_agent,
 )
 
@@ -675,3 +677,58 @@ def test_agent_weather_tool_runs_offline(db_path: str) -> None:
     res = agent.run_sync("what's the weather tomorrow?")
     assert res.output == "done"
     assert fake.calls  # the model actually called the weather tool
+
+
+def test_schema_text_lists_columns(db_path: str) -> None:
+    db = ReadOnlyDB(db_path)
+    text = _schema_text(db)
+    assert "daily_metrics: calendar_date, sleep_time_hours, resting_hr" in text
+
+
+def test_system_prompt_injects_schema(db_path: str) -> None:
+    from pydantic_ai.models.test import TestModel
+
+    db = ReadOnlyDB(db_path)
+    agent = build_agent(
+        db,
+        model_name="test",
+        base_url=None,
+        api_key="x",
+        model=TestModel(call_tools=[], custom_output_text="ok"),
+    )
+    prompt = "\n".join(str(s) for s in agent._system_prompts)
+    assert "current database schema is given below" in prompt
+    assert "sleep_time_hours" in prompt  # schema columns are baked in
+
+
+def test_chart_error_not_double_prefixed(db_path: str) -> None:
+    from pydantic_ai.models.test import TestModel
+
+    db = ReadOnlyDB(db_path)
+    agent = build_agent(
+        db,
+        model_name="test",
+        base_url=None,
+        api_key="x",
+        model=TestModel(
+            call_tools=["chart"],
+            custom_output_text="done",
+        ),
+    )
+    # Run the chart tool with a spec that references a bogus column: the tool
+    # must return a single ERROR: prefix, not "ERROR: ERROR: ...".
+    tool = agent._function_toolset.tools["chart"]
+    result = tool.function(
+        '{"sql": "SELECT bogus_col FROM daily_metrics", '
+        '"traces": [{"type": "bar", "x": "bogus_col", "y": "bogus_col"}]}'
+    )
+    assert str(result).startswith("ERROR: ")
+    assert not str(result).startswith("ERROR: ERROR: ")
+
+
+def test_tool_error_dedupes_prefix() -> None:
+    class _MsgError(Exception):
+        pass
+
+    assert _tool_error(_MsgError("boom")) == "ERROR: boom"
+    assert _tool_error(_MsgError("ERROR: boom")) == "ERROR: boom"

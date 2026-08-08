@@ -639,6 +639,20 @@ def _float_or_none(value: str | None) -> float | None:
     return float(value)
 
 
+def _tool_error(exc: BaseException) -> str:
+    """Format a tool exception, avoiding a duplicated ``ERROR: `` prefix."""
+    msg = str(exc)
+    return msg if msg.startswith("ERROR: ") else f"ERROR: {msg}"
+
+
+def _schema_text(db: ReadOnlyDB) -> str:
+    """Render the agent-facing schema as ``table: col1, col2`` lines."""
+    return "\n".join(
+        f"{table}: {', '.join(c['name'] for c in db.columns(table))}"
+        for table in db.tables()
+    )
+
+
 def build_agent(
     db: ReadOnlyDB,
     *,
@@ -664,10 +678,16 @@ def build_agent(
             model_name,
             provider=OpenAIProvider(base_url=base_url, api_key=api_key),
         )
-    agent = Agent(
-        model,
-        system_prompt=_SYSTEM_PROMPT.format(today=date.today().isoformat()),
-    )
+    system_prompt = _SYSTEM_PROMPT.format(today=date.today().isoformat())
+    schema = _schema_text(db)
+    if schema:
+        system_prompt += (
+            "\n\nThe current database schema is given below. You do NOT need to "
+            "call table_schema for these tables — the columns are already listed "
+            "here. Write queries directly against these columns; if a column you "
+            "expect is missing, re-check with table_schema once.\n\n" + schema
+        )
+    agent = Agent(model, system_prompt=system_prompt)
 
     @agent.tool_plain
     def list_tables() -> str:
@@ -681,7 +701,7 @@ def build_agent(
         try:
             return json.dumps(db.columns(table))
         except ValueError as exc:
-            return f"ERROR: {exc}"
+            return _tool_error(exc)
 
     @agent.tool_plain
     def date_range() -> str:
@@ -699,7 +719,7 @@ def build_agent(
         try:
             result = db.run_sql(sql)
         except (ValueError, sqlite3.DatabaseError) as exc:
-            return f"ERROR: {exc}"
+            return _tool_error(exc)
         return json.dumps(result)
 
     @agent.tool_plain
@@ -740,7 +760,7 @@ def build_agent(
         try:
             _build_chart_figure(parsed, result)
         except ValueError as exc:
-            return f"ERROR: {exc}"
+            return _tool_error(exc)
         return "OK: " + _json.dumps(parsed, ensure_ascii=False)
 
     if weather is not None:
