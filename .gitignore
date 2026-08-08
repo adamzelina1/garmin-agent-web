@@ -1,0 +1,29 @@
+# Environment / secrets
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak-*
+*.db-wal.bak-*
+*.db-shm.bak-*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Garmin tokens
+.garminconnect/
+
+# Runtime aids (LLM-facing, contain personal health data - never commit)
+ask_trace.jsonl
+web_session.json
+agent_memory.json
+meta.json
+
+# Test cache
+.pytest_cache/
