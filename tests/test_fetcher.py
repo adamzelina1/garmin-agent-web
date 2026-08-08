@@ -232,18 +232,13 @@ def test_resolve_types_unknown_raises() -> None:
 
 
 def test_configured_types_empty_returns_all() -> None:
-    types = _configured_types({"data_types": ""})
+    types = _configured_types({})
     assert types == list(DEFAULT_TYPES)
-
-
-def test_configured_types_subset() -> None:
-    types = _configured_types({"data_types": "heart_rate, hrv ,steps"})
-    assert [t.name for t in types] == ["heart_rate", "hrv", "steps"]
 
 
 def test_configured_types_excluded_removed() -> None:
     types = _configured_types(
-        {"data_types": "", "excluded_data_types": "training_readiness, hrv"}
+        {"excluded_data_types": "training_readiness, hrv"}
     )
     names = [t.name for t in types]
     assert "training_readiness" not in names
@@ -251,27 +246,18 @@ def test_configured_types_excluded_removed() -> None:
     assert "heart_rate" in names
 
 
-def test_configured_types_excluded_applies_to_explicit() -> None:
-    types = _configured_types(
-        {"data_types": "hrv,steps", "excluded_data_types": "steps"}
-    )
-    assert [t.name for t in types] == ["hrv"]
-
-
 def test_configured_types_all_excluded_returns_all() -> None:
     excluded = ",".join(d.name for d in DEFAULT_TYPES)
-    types = _configured_types({"data_types": "", "excluded_data_types": excluded})
+    types = _configured_types({"excluded_data_types": excluded})
     assert types == list(DEFAULT_TYPES)
 
 
-def test_configured_types_skips_unknown() -> None:
-    types = _configured_types({"data_types": "heart_rate,bogus,hrv"})
-    assert [t.name for t in types] == ["heart_rate", "hrv"]
-
-
-def test_configured_types_all_unknown_returns_all() -> None:
-    types = _configured_types({"data_types": "bogus,also_bogus"})
-    assert types == list(DEFAULT_TYPES)
+def test_configured_types_ignores_unknown_excluded() -> None:
+    types = _configured_types({"excluded_data_types": "heart_rate,bogus,hrv"})
+    names = [t.name for t in types]
+    assert "heart_rate" not in names
+    assert "hrv" not in names
+    assert "bogus" not in names
 
 
 def test_all_registered_types_resolve() -> None:

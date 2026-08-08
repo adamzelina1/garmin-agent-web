@@ -23,7 +23,6 @@ def load_config() -> dict[str, str]:
     tokens_path = os.getenv("GARMIN_TOKENS_PATH", "")
     start_date = os.getenv("GARMIN_START_DATE", "")
     activity_freeze_days = os.getenv("GARMIN_ACTIVITY_FREEZE_DAYS", "7")
-    data_types = os.getenv("GARMIN_DATA_TYPES", "")
     excluded_data_types = os.getenv("GARMIN_EXCLUDED_DATA_TYPES", "")
     llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     llm_base_url = os.getenv("LLM_BASE_URL", "")
@@ -74,7 +73,6 @@ def load_config() -> dict[str, str]:
         "tokens_path": tokens_path,
         "start_date": start_date,
         "activity_freeze_days": freeze_days,
-        "data_types": data_types,
         "excluded_data_types": excluded_data_types,
         "llm_model": llm_model,
         "llm_base_url": llm_base_url,

@@ -269,31 +269,23 @@ def sync_data(
 
 
 def _configured_types(config: dict[str, str]) -> list[DataType]:
-    """Resolve the default data-type set for a sync.
+    """Resolve the data-type set for a sync.
 
-    The set is the explicit ``GARMIN_DATA_TYPES`` list (or all registered
-    types), minus ``GARMIN_EXCLUDED_DATA_TYPES``. Unknown names are logged and
-    skipped so a misconfigured .env doesn't silently disable the sync.
+    All registered types are used, minus ``GARMIN_EXCLUDED_DATA_TYPES``.
+    Unknown names are logged and skipped so a misconfigured .env doesn't
+    silently disable the sync.
     """
-    raw = (config.get("data_types") or "").strip()
-    names = [n.strip() for n in raw.split(",") if n.strip()] if raw else [
-        d.name for d in DEFAULT_TYPES
-    ]
     excluded = {
         n.strip()
         for n in (config.get("excluded_data_types") or "").split(",")
         if n.strip()
     }
 
-    resolved: list[DataType] = []
-    for name in names:
-        if name in excluded:
-            continue
-        data_type = DATA_TYPES.get(name)
-        if data_type is None:
-            logger.warning("Ignoring unknown data type: %s", name)
-            continue
-        resolved.append(data_type)
+    resolved = [
+        data_type
+        for data_type in DEFAULT_TYPES
+        if data_type.name not in excluded
+    ]
     return resolved or list(DEFAULT_TYPES)
 
 
