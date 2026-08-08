@@ -125,10 +125,9 @@ paste query data or Python code into your answer — only the spec.
 
 Weather: observed conditions during a workout are already stored per activity
 in activity_summaries (weather_temp_c, weather_apparent_c, weather_humidity,
-weather_wind_kmh, weather_wind_gust_kmh, weather_station,
-weather_description) — prefer those columns whenever a question is about the
-weather at the time/location of a stored activity. The `weather` tool is for
-what the stored data does NOT cover: (1) the short forecast (today/tomorrow),
+weather_wind_kmh, weather_station, weather_description) — prefer those columns
+whenever a question is about the weather at the time/location of a stored
+activity. The `weather` tool is for what the stored data does NOT cover: (1) the short forecast (today/tomorrow),
 (2) historical weather for days with no activity (e.g. correlate a restless
 night with the temperature), and (3) weather at any location via explicit
 `lat`/`lon` (default: GARMIN_HOME_LAT/GARMIN_HOME_LON). It returns per-day

@@ -267,9 +267,6 @@ def parse_max_metrics(payload: dict[str, Any]) -> dict[str, Any]:
 def parse_fitnessage(payload: dict[str, Any]) -> dict[str, Any]:
     return _leaf(payload, [
         ("fitness_age", "fitnessAge"),
-        ("chronological_age", "chronologicalAge"),
-        ("achievable_fitness_age", "achievableFitnessAge"),
-        ("previous_fitness_age", "previousFitnessAge"),
     ])
 
 
@@ -280,7 +277,6 @@ def parse_intensity_minutes(payload: dict[str, Any]) -> dict[str, Any]:
         ("weekly_moderate", "weeklyModerate"),
         ("weekly_vigorous", "weeklyVigorous"),
         ("weekly_total", "weeklyTotal"),
-        ("week_goal", "weekGoal"),
         ("day_of_goal_met", "dayOfGoalMet"),
     ])
 
@@ -825,9 +821,6 @@ def parse_activity_weather(payload: dict[str, Any]) -> dict[str, Any]:
     wind = _mph_to_kmh(payload.get("windSpeed"))
     if wind is not None:
         out["weather_wind_kmh"] = wind
-    gust = _mph_to_kmh(payload.get("windGust"))
-    if gust is not None:
-        out["weather_wind_gust_kmh"] = gust
     station = _get(payload, "weatherStationDTO", "name")
     if isinstance(station, str) and station:
         out["weather_station"] = station

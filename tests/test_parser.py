@@ -766,9 +766,10 @@ def test_parse_activity_weather_converts_to_metric() -> None:
     assert out["weather_apparent_c"] == pytest.approx((66 - 32) * 5 / 9, rel=1e-2)
     assert out["weather_humidity"] == 60
     assert out["weather_wind_kmh"] == pytest.approx(10 * 1.609344, rel=1e-2)
-    assert out["weather_wind_gust_kmh"] == pytest.approx(15 * 1.609344, rel=1e-2)
     assert out["weather_station"] == "Bratislava Ivanka"
     assert out["weather_description"] == "Fair"
+    # windGust arrives as null from Garmin and is intentionally not parsed.
+    assert "weather_wind_gust_kmh" not in out
 
 
 def test_parse_activity_weather_empty_on_blank() -> None:

@@ -79,7 +79,6 @@ CREATE TABLE IF NOT EXISTS activity_summaries (
     weather_apparent_c REAL,
     weather_humidity REAL,
     weather_wind_kmh REAL,
-    weather_wind_gust_kmh REAL,
     weather_station TEXT,
     weather_description TEXT,
     fetched_at TEXT
@@ -330,8 +329,7 @@ class Database:
         "body_battery_change", "water_estimated_ml", "is_pr",
         "avg_cadence", "max_cadence", "avg_power_w", "max_power_w",
         "weather_temp_c", "weather_apparent_c", "weather_humidity",
-        "weather_wind_kmh", "weather_wind_gust_kmh", "weather_station",
-        "weather_description",
+        "weather_wind_kmh", "weather_station", "weather_description",
     )
 
     def upsert_activity_summary(
