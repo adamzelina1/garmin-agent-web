@@ -387,12 +387,16 @@ def _forward_fill(parsed: dict[str, Any], carry: dict[str, Any]) -> dict[str, An
     return dict(carry)
 
 
-def build_daily_rows(db: Any, types: list[str] | None = None) -> dict[str, int]:
-    """Parse all stored raw metrics into ``daily_metrics``.
+def build_daily_rows(
+    db: Any, types: list[str] | None = None, force: bool = False
+) -> dict[str, int]:
+    """Parse stored raw metrics into ``daily_metrics``.
 
     Reads the raw ``metrics`` store, applies the matching parser for each
-    (data_type, date) row, and merges the scalars into the daily row.
-    Returns {data_type: dates_parsed}.
+    (data_type, date) row, and merges the scalars into the daily row. By
+    default only rows whose raw payload changed since last parsed are touched
+    (tracked via ``metrics.parsed_at``); pass ``force=True`` to re-parse
+    everything. Returns {data_type: dates_parsed}.
     """
     # Some registered types (e.g. training_readiness) are fetch-only and have
     # no projection; skip them rather than crash.
@@ -404,11 +408,32 @@ def build_daily_rows(db: Any, types: list[str] | None = None) -> dict[str, int]:
             "WHERE data_type = ? ORDER BY calendar_date",
             (name,),
         ).fetchall()
+        parsed_at = {} if force else db.metric_parsed_at(name)
+        if force:
+            dirty: set[str] | None = None
+        else:
+            changed = {
+                r["calendar_date"]
+                for r in rows
+                if parsed_at.get(r["calendar_date"]) != r["fetched_at"]
+            }
+            if name in _FFILL_TYPES:
+                # Carry semantics: a change anywhere recasts the whole chain, so
+                # re-parse the entire (sparse) type from scratch — cheap and exact.
+                if changed:
+                    dirty = {r["calendar_date"] for r in rows}
+                else:
+                    dirty = set()
+            else:
+                dirty = changed
         carry: dict[str, Any] = {}
         for row in rows:
+            if not force and row["calendar_date"] not in dirty:
+                continue
             parsed = PARSERS[name](json.loads(row["raw_json"]))
             if name in _FFILL_TYPES:
                 parsed = _forward_fill(parsed, carry)
+            db.mark_metric_parsed(name, row["calendar_date"])
             if not parsed:
                 continue
             db.merge_daily(row["calendar_date"], parsed, row["fetched_at"])
@@ -456,6 +481,10 @@ def parse_activity_summary(payload: dict[str, Any]) -> dict[str, Any]:
         ("body_battery_change", "differenceBodyBattery"),
         ("water_estimated_ml", "waterEstimated"),
         ("is_pr", "isPR"),
+        ("avg_stride_length_cm", "avgStrideLength"),
+        ("avg_vertical_oscillation_cm", "avgVerticalOscillation"),
+        ("avg_ground_contact_time_ms", "avgGroundContactTime"),
+        ("avg_vertical_ratio_pct", "avgVerticalRatio"),
     ])
     # activityType is a dict; pull the typeKey directly.
     activity_type = _get(payload, "activityType", "typeKey")
@@ -491,21 +520,28 @@ def parse_activity_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def build_activity_summaries(db: Any) -> dict[str, int]:
+def build_activity_summaries(db: Any, force: bool = False) -> dict[str, int]:
     """Parse stored activity summaries into ``activity_summaries``.
 
     Reads the raw ``activities`` store and projects each summary into one
-    curated row keyed by ``activityId``. Returns {"activities": rows_parsed}.
+    curated row keyed by ``activityId``. Only activities whose summary payload
+    changed since last parse are touched unless ``force``. Returns
+    {"activities": rows_parsed}.
     """
     rows = db.conn.execute(
         "SELECT activity_id, raw_json, fetched_at FROM activities"
     ).fetchall()
+    marker = "summary_parsed_at"
+    stamped = {} if force else db.activity_parsed_at(marker)
     count = 0
     for row in rows:
+        if not force and stamped.get(row["activity_id"]) == row["fetched_at"]:
+            continue
         parsed = parse_activity_summary(json.loads(row["raw_json"]))
         if not parsed:
             continue
         db.upsert_activity_summary(row["activity_id"], parsed, row["fetched_at"])
+        db.mark_activity_parsed(row["activity_id"], marker, "fetched_at")
         count += 1
     return {"activities": count}
 
@@ -647,21 +683,32 @@ def parse_activity_detail_series(payload: dict[str, Any]) -> list[dict[str, Any]
     return rows
 
 
-def build_activity_details(db: Any) -> dict[str, int]:
+def build_activity_details(db: Any, force: bool = False) -> dict[str, int]:
     """Parse stored activity detail payloads into the series + aggregates.
 
     For each stored activity with a detail payload: (1) merges the derived
     avg/max cadence + avg/max power into the activity summary row, and (2)
     replaces the per-tick row in ``activity_detail_series`` with a fresh
     projection. Returns {"activities": parsed, "series": ticks_written}.
+    Only activities whose details changed since last parse are touched unless
+    ``force``.
     """
     rows = db.conn.execute(
-        "SELECT activity_id, details_json, details_fetched_at FROM activities "
+        "SELECT activity_id, details_json, details_fetched_at, fetched_at "
+        "FROM activities "
         "WHERE details_json IS NOT NULL AND details_json != ''"
     ).fetchall()
+    marker = "details_parsed_at"
+    stamped = {} if force else db.activity_parsed_at(marker)
     activities = 0
     series = 0
     for row in rows:
+        if (
+            not force
+            and row["details_fetched_at"] is not None
+            and stamped.get(row["activity_id"]) == row["details_fetched_at"]
+        ):
+            continue
         payload = json.loads(row["details_json"])
         agg = parse_activity_details(payload)
         if agg:
@@ -670,6 +717,7 @@ def build_activity_details(db: Any) -> dict[str, int]:
         ticks = parse_activity_detail_series(payload)
         if ticks:
             series += db.replace_activity_series(row["activity_id"], ticks)
+        db.mark_activity_parsed(row["activity_id"], marker, "details_fetched_at")
     return {"activities": activities, "series": series}
 
 
@@ -837,24 +885,34 @@ def parse_activity_weather(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def build_activity_weather(db: Any) -> dict[str, int]:
+def build_activity_weather(db: Any, force: bool = False) -> dict[str, int]:
     """Project each stored activity's weather payload into its summary row.
 
     Reads the raw ``weather_json`` column on ``activities`` and merges the
-    derived weather scalars into ``activity_summaries``. Returns
-    {"activities": rows_parsed}.
+    derived weather scalars into ``activity_summaries``. Only activities whose
+    weather payload changed since last parse are touched unless ``force``.
+    Returns {"activities": rows_parsed}.
     """
     rows = db.conn.execute(
         "SELECT activity_id, weather_json, weather_fetched_at FROM activities "
         "WHERE weather_json IS NOT NULL AND weather_json != ''"
     ).fetchall()
+    marker = "weather_parsed_at"
+    stamped = {} if force else db.activity_parsed_at(marker)
     count = 0
     for row in rows:
+        if (
+            not force
+            and row["weather_fetched_at"] is not None
+            and stamped.get(row["activity_id"]) == row["weather_fetched_at"]
+        ):
+            continue
         parsed = parse_activity_weather(json.loads(row["weather_json"]))
         if not parsed:
             continue
         db.upsert_activity_summary(
             row["activity_id"], parsed, row["weather_fetched_at"]
         )
+        db.mark_activity_parsed(row["activity_id"], marker, "weather_fetched_at")
         count += 1
     return {"activities": count}

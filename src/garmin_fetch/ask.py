@@ -56,7 +56,7 @@ _MAX_ROWS = 200
 #: ``activities``, ``user_profile``, ``sync_state``) stays invisible to the model.
 _ALLOWED_TABLES = (
     "daily_metrics", "activity_summaries", "activity_detail_series", "hr_zones",
-    "race_predictions",
+    "race_predictions", "ml_forecast",
 )
 
 #: How the model should interpret the stored metrics (units, NULL semantics).
@@ -66,7 +66,7 @@ Garmin health data. Today is {today}. Answer the user's questions by inspecting
 the schema and running read-only SELECT queries. You may run several queries.
 You can never write.
 
-Only five tables are available and you may only query these:
+Only six tables are available and you may only query these:
 - daily_metrics: one row per calendar_date, wide columns.
   calendar_date is YYYY-MM-DD.
 - activity_summaries: one row per activity (activity_id), curated summary fields.
@@ -89,6 +89,18 @@ Only five tables are available and you may only query these:
   predicted race times, in MINUTES: time_5k_min, time_10k_min,
   time_half_marathon_min, time_marathon_min (NULL when a prediction is
   unavailable). calendar_date is when the prediction was made.
+- ml_forecast: machine-learning forecast rows written by ``garmin-ml`` (one
+  row per calendar_date). predicted_stress is the model's forecast of that
+  day's avg_stress (0-100, "how heavy today sits on the body"); baseline_stress
+  is the trailing 7-day mean; readiness_ms = baseline_stress - predicted_stress
+  (positive = expected to be LIGHTER than your recent stress normal, i.e.
+  readier to train; negative = heavier). readiness_score is the headline
+  "how ready am I" 0-100 number: the share of the user's last ~30 days whose
+  stress is at least as high as today's forecast (100 = lighter than any
+  recent day, 50 = exactly typical, 0 = heavier than all of them) — a
+  self-calibrating percentile, so it means the same for anyone. model is the
+  model id, created_at when written. These are model outputs, not raw
+  measurements — treat them as estimates.
 
 Units and semantics:
 - Sleep durations (sleep_time_hours, nap_time_hours, deep_sleep_hours,

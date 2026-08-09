@@ -29,7 +29,7 @@ def db_path(tmp_path: Path) -> str:
     return str(p)
 
 
-def test_append_turn_records_tool_steps(db_path: str, tmp_path) -> None:
+def _run_agent(db_path: str, question: str) -> object:
     db = ReadOnlyDB(db_path)
     agent = build_agent(
         db,
@@ -38,9 +38,19 @@ def test_append_turn_records_tool_steps(db_path: str, tmp_path) -> None:
         api_key="x",
         model=TestModel(call_tools=["date_range"], custom_output_text="1..2"),
     )
-    result = agent.run_sync("what range?")
+    return agent.run_sync(question)
+
+
+def test_append_turn_records_steps_and_usage(db_path: str, tmp_path) -> None:
+    result = _run_agent(db_path, "what range?")
     path = tmp_path / "trace.jsonl"
-    append_turn(str(path), "what range?", result.new_messages(), answer=str(result.output))
+    append_turn(
+        str(path),
+        "what range?",
+        result.new_messages(),
+        answer=str(result.output),
+        usage=result.usage,
+    )
 
     records = _iter_records(str(path))
     assert len(records) == 1
@@ -55,20 +65,21 @@ def test_append_turn_records_tool_steps(db_path: str, tmp_path) -> None:
     rtrn = next(s for s in rec["steps"] if s["kind"] == "tool_return")
     assert rtrn["tool"] == "date_range"
     assert rtrn["outcome"] == "success"
+    # Token usage is projected when provided.
+    assert "input_tokens" in rec["usage"]
+    assert "output_tokens" in rec["usage"]
+    assert "cache_read_tokens" in rec["usage"]
+    assert "cache_hit_ratio" in rec["usage"]
 
 
-def test_append_turn_appends_and_is_jsonl(db_path: str, tmp_path) -> None:
-    db = ReadOnlyDB(db_path)
-    agent = build_agent(
-        db,
-        model_name="test",
-        base_url=None,
-        api_key="x",
-        model=TestModel(call_tools=["date_range"], custom_output_text="x"),
-    )
+def test_append_turn_appends_jsonl_and_missing_file_is_empty(
+    db_path: str, tmp_path
+) -> None:
+    assert _iter_records(str(tmp_path / "nope.jsonl")) == []
+
     path = tmp_path / "trace.jsonl"
     for q in ("one", "two"):
-        result = agent.run_sync(q)
+        result = _run_agent(db_path, q)
         append_turn(str(path), q, result.new_messages(), answer=str(result.output))
 
     lines = Path(path).read_text(encoding="utf-8").splitlines()
@@ -78,15 +89,7 @@ def test_append_turn_appends_and_is_jsonl(db_path: str, tmp_path) -> None:
 
 
 def test_trace_main_renders(db_path: str, tmp_path, capsys) -> None:
-    db = ReadOnlyDB(db_path)
-    agent = build_agent(
-        db,
-        model_name="test",
-        base_url=None,
-        api_key="x",
-        model=TestModel(call_tools=["date_range"], custom_output_text="mock answer"),
-    )
-    result = agent.run_sync("what range?")
+    result = _run_agent(db_path, "what range?")
     path = tmp_path / "trace.jsonl"
     append_turn(str(path), "what range?", result.new_messages(), answer=str(result.output))
 
@@ -94,37 +97,7 @@ def test_trace_main_renders(db_path: str, tmp_path, capsys) -> None:
     out = capsys.readouterr().out
     assert "Q> what range?" in out
     assert "date_range" in out
-    assert "mock answer" in out
+    assert "1..2" in out
 
     assert trace_main(["--file", str(path), "--tool", "run_sql"]) == 0
     assert "Q>" not in capsys.readouterr().out
-
-
-def test_iter_records_missing_file_is_empty(tmp_path) -> None:
-    assert _iter_records(str(tmp_path / "nope.jsonl")) == []
-
-
-def test_append_turn_records_usage(db_path: str, tmp_path) -> None:
-    db = ReadOnlyDB(db_path)
-    agent = build_agent(
-        db,
-        model_name="test",
-        base_url=None,
-        api_key="x",
-        model=TestModel(call_tools=["date_range"], custom_output_text="mock"),
-    )
-    result = agent.run_sync("what range?")
-    path = tmp_path / "trace.jsonl"
-    append_turn(
-        str(path),
-        "what range?",
-        result.new_messages(),
-        answer=str(result.output),
-        usage=result.usage,
-    )
-    rec = _iter_records(str(path))[0]
-    assert "usage" in rec
-    assert "input_tokens" in rec["usage"]
-    assert "output_tokens" in rec["usage"]
-    assert "cache_read_tokens" in rec["usage"]
-    assert "cache_hit_ratio" in rec["usage"]

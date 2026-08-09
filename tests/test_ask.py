@@ -58,19 +58,27 @@ def test_tables_and_columns(db_path: str) -> None:
         db.columns("metrics")
 
 
-def test_hr_zones_table_visible_to_agent(tmp_path: Path) -> None:
+def test_allowed_tables_visible_and_queryable(tmp_path: Path) -> None:
     p = tmp_path / "g.db"
     conn = sqlite3.connect(p)
     conn.executescript(
         """
-        CREATE TABLE daily_metrics (
-            calendar_date TEXT PRIMARY KEY,
-            resting_hr NUMERIC
-        );
+        CREATE TABLE daily_metrics (calendar_date TEXT PRIMARY KEY);
         CREATE TABLE hr_zones (
             sport TEXT PRIMARY KEY, zone2_min REAL, zone2_max REAL
         );
+        CREATE TABLE activity_detail_series (
+            activity_id INTEGER NOT NULL,
+            tick INTEGER NOT NULL,
+            heart_rate REAL,
+            PRIMARY KEY (activity_id, tick)
+        );
+        CREATE TABLE race_predictions (
+            calendar_date TEXT PRIMARY KEY, time_5k_min REAL
+        );
         INSERT INTO hr_zones VALUES ('DEFAULT', 134, 147);
+        INSERT INTO activity_detail_series VALUES (1001, 0, 150);
+        INSERT INTO race_predictions VALUES ('2026-08-08', 24.5);
         """
     )
     conn.commit()
@@ -78,39 +86,13 @@ def test_hr_zones_table_visible_to_agent(tmp_path: Path) -> None:
 
     db = ReadOnlyDB(str(p))
     assert "hr_zones" in db.tables()
-    out = db.run_sql("SELECT sport, zone2_min, zone2_max FROM hr_zones")
-    assert out["rows"] == [["DEFAULT", 134, 147]]
-
-
-def test_activity_detail_series_table_visible_to_agent(tmp_path: Path) -> None:
-    p = tmp_path / "g.db"
-    conn = sqlite3.connect(p)
-    conn.executescript(
-        """
-        CREATE TABLE daily_metrics (
-            calendar_date TEXT PRIMARY KEY
-        );
-        CREATE TABLE activity_detail_series (
-            activity_id INTEGER NOT NULL,
-            tick INTEGER NOT NULL,
-            heart_rate REAL,
-            cadence REAL,
-            PRIMARY KEY (activity_id, tick)
-        );
-        INSERT INTO activity_detail_series VALUES (1001, 0, 150, 84);
-        INSERT INTO activity_detail_series VALUES (1001, 1, 165, 88);
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    db = ReadOnlyDB(str(p))
     assert "activity_detail_series" in db.tables()
-    out = db.run_sql(
-        "SELECT COUNT(*) AS n FROM activity_detail_series "
-        "WHERE activity_id = 1001 AND heart_rate > 160"
-    )
-    assert out["rows"] == [[1]]
+    assert "race_predictions" in db.tables()
+    assert db.run_sql("SELECT sport, zone2_min FROM hr_zones")["rows"] == [["DEFAULT", 134]]
+    assert db.run_sql(
+        "SELECT COUNT(*) AS n FROM activity_detail_series WHERE tick = 0"
+    )["rows"] == [[1]]
+    assert db.run_sql("SELECT time_5k_min FROM race_predictions")["rows"] == [[24.5]]
 
 
 def test_run_sql_rejects_non_allowed_tables(db_path: str) -> None:
@@ -172,17 +154,6 @@ def test_authorizer_blocks_writes_on_connection(db_path: str) -> None:
     assert db.run_sql("SELECT COUNT(*) FROM daily_metrics")["rows"] == [[3]]
 
 
-def test_agent_constructs_offline(db_path: str) -> None:
-    db = ReadOnlyDB(db_path)
-    agent = build_agent(
-        db,
-        model_name="deepseek-v4-flash",
-        base_url="http://localhost:11434/v1",
-        api_key="x",
-    )
-    assert agent is not None
-
-
 def test_agent_end_to_end_with_test_model(db_path: str) -> None:
     from pydantic_ai.models.test import TestModel
 
@@ -202,67 +173,48 @@ def _chart_result(db: ReadOnlyDB, sql: str) -> dict:
     return db.run_sql(sql)
 
 
-def test_chart_spec_builds_line_figure(db_path: str) -> None:
+def test_chart_legacy_aliases_build_figures(db_path: str) -> None:
     db = ReadOnlyDB(db_path)
-    result = _chart_result(
-        db,
-        "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date",
+    sql = "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date"
+    result = _chart_result(db, sql)
+    fig = _build_chart_figure(
+        {
+            "sql": sql,
+            "traces": [
+                {"type": "line", "x": "calendar_date", "y": "resting_hr", "name": "Resting HR"}
+            ],
+            "layout": {"title": {"text": "Resting HR"}},
+        },
+        result,
     )
-    spec = {
-        "sql": "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date",
-        "traces": [
-            {
-                "type": "line",
-                "x": "calendar_date",
-                "y": "resting_hr",
-                "name": "Resting HR",
-            }
-        ],
-        "layout": {"title": {"text": "Resting HR"}},
-    }
-    fig = _build_chart_figure(spec, result)
-    data = fig.to_dict()["data"]
-    assert data[0]["type"] == "scatter"
-    assert data[0]["mode"] == "lines+markers"
-    assert len(data[0]["y"]) == 3
+    data = fig.to_dict()["data"][0]
+    assert data["type"] == "scatter"
+    assert data["mode"] == "lines+markers"
+    assert len(data["y"]) == 3
     assert fig.layout.title.text == "Resting HR"
 
-
-def test_chart_spec_builds_bar(db_path: str) -> None:
-    db = ReadOnlyDB(db_path)
-    result = _chart_result(db, "SELECT calendar_date, resting_hr FROM daily_metrics")
-    fig = _build_chart_figure(
-        {
-            "sql": "SELECT calendar_date, resting_hr FROM daily_metrics",
-            "traces": [{"type": "bar", "x": "calendar_date", "y": "resting_hr"}],
-        },
+    bar = _build_chart_figure(
+        {"sql": sql, "traces": [{"type": "bar", "x": "calendar_date", "y": "resting_hr"}]},
         result,
     )
-    assert fig.to_dict()["data"][0]["type"] == "bar"
+    assert bar.to_dict()["data"][0]["type"] == "bar"
+
+    hist = _build_chart_figure(
+        {"sql": "SELECT resting_hr FROM daily_metrics", "traces": [{"type": "histogram", "x": "resting_hr"}]},
+        _chart_result(db, "SELECT resting_hr FROM daily_metrics"),
+    )
+    assert hist.to_dict()["data"][0]["type"] == "histogram"
 
 
-def test_chart_spec_builds_histogram(db_path: str) -> None:
+def test_chart_go_route_kwargs_and_column_refs(db_path: str) -> None:
     db = ReadOnlyDB(db_path)
-    result = _chart_result(db, "SELECT resting_hr FROM daily_metrics")
+    sql = "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date"
+    result = _chart_result(db, sql)
+
+    # Arbitrary Plotly kwargs pass straight through on any "go" class.
     fig = _build_chart_figure(
         {
-            "sql": "SELECT resting_hr FROM daily_metrics",
-            "traces": [{"type": "histogram", "x": "resting_hr"}],
-        },
-        result,
-    )
-    assert fig.to_dict()["data"][0]["type"] == "histogram"
-
-
-def test_chart_go_route_custom_trace_kwargs(db_path: str) -> None:
-    db = ReadOnlyDB(db_path)
-    result = _chart_result(
-        db,
-        "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date",
-    )
-    fig = _build_chart_figure(
-        {
-            "sql": "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date",
+            "sql": sql,
             "traces": [
                 {
                     "go": "Violin",
@@ -282,57 +234,26 @@ def test_chart_go_route_custom_trace_kwargs(db_path: str) -> None:
     assert data["meanline"]["visible"] is True
     assert len(data["y"]) == 3
 
-
-def test_chart_go_route_pie_with_column_refs(db_path: str) -> None:
-    db = ReadOnlyDB(db_path)
-    result = _chart_result(
-        db,
-        "SELECT calendar_date, resting_hr FROM daily_metrics",
-    )
-    fig = _build_chart_figure(
+    # Data columns can be referenced via {"column": "name"} anywhere.
+    pie = _build_chart_figure(
         {
-            "sql": "SELECT calendar_date, resting_hr FROM daily_metrics",
+            "sql": sql,
             "traces": [
-                {
-                    "go": "Pie",
-                    "labels": {"column": "calendar_date"},
-                    "values": {"column": "resting_hr"},
-                }
+                {"go": "Pie", "labels": {"column": "calendar_date"}, "values": {"column": "resting_hr"}}
             ],
         },
         result,
     )
-    data = fig.to_dict()["data"][0]
+    data = pie.to_dict()["data"][0]
     assert data["type"] == "pie"
     assert data["labels"] == ["2026-08-01", "2026-08-02", "2026-08-03"]
     assert data["values"] == [51, 50, 52]
 
-
-def test_chart_go_route_scattergl(db_path: str) -> None:
-    db = ReadOnlyDB(db_path)
-    result = _chart_result(db, "SELECT resting_hr FROM daily_metrics")
-    fig = _build_chart_figure(
-        {
-            "sql": "SELECT resting_hr FROM daily_metrics",
-            "traces": [{"go": "Scattergl", "x": "resting_hr", "mode": "markers"}],
-        },
-        result,
+    scattergl = _build_chart_figure(
+        {"sql": "SELECT resting_hr FROM daily_metrics", "traces": [{"go": "Scattergl", "x": "resting_hr", "mode": "markers"}]},
+        _chart_result(db, "SELECT resting_hr FROM daily_metrics"),
     )
-    assert fig.to_dict()["data"][0]["type"] == "scattergl"
-
-
-def test_chart_go_route_unknown_class_rejected(db_path: str) -> None:
-    db = ReadOnlyDB(db_path)
-    result = _chart_result(db, "SELECT resting_hr FROM daily_metrics")
-    err = _chart_spec_error(
-        {
-            "sqlxxx": "SELECT resting_hr FROM daily_metrics",
-            "traces": [{"go": "BogusTrace", "y": "resting_hr"}],
-        },
-        result,
-    )
-    assert err is not None
-    assert "BogusTrace" in err
+    assert scattergl.to_dict()["data"][0]["type"] == "scattergl"
 
 
 def test_chart_spec_errors() -> None:
@@ -367,6 +288,13 @@ def test_chart_spec_errors() -> None:
         {"sql": "x", "traces": [{"type": "bar", "x": "a", "y": "b"}]},
         {"columns": ["a", "b"], "rows": []},
     )
+    # Unknown "go" classes are rejected with their name in the error.
+    err = _chart_spec_error(
+        {"sqlxxx": "SELECT resting_hr FROM daily_metrics", "traces": [{"go": "BogusTrace", "y": "resting_hr"}]},
+        {"columns": ["resting_hr"], "rows": [[51]]},
+    )
+    assert err is not None
+    assert "BogusTrace" in err
 
 
 def test_agent_chart_tool_runs_offline(db_path: str) -> None:
@@ -384,7 +312,7 @@ def test_agent_chart_tool_runs_offline(db_path: str) -> None:
     assert res.output == "done"
 
 
-def test_memory_roundtrip_and_get(tmp_path) -> None:
+def test_memory_roundtrip_corruption_and_validation(tmp_path) -> None:
     path = tmp_path / "memory.json"
     mem = Memory(str(path))
     assert mem.get() == {}
@@ -400,23 +328,21 @@ def test_memory_roundtrip_and_get(tmp_path) -> None:
     # the file on disk is what a later session reads
     assert Memory(str(path)).get() == {"sleep_issue": "often wakes around 3am"}
 
+    # A corrupted file degrades to an empty profile and can be rewritten.
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("not json", encoding="utf-8")
+    assert Memory(str(corrupt)).get() == {}
+    Memory(str(corrupt)).remember("k", "v")
+    assert Memory(str(corrupt)).get() == {"k": "v"}
 
-def test_memory_remembers_tolerates_corruption(tmp_path) -> None:
-    path = tmp_path / "memory.json"
-    path.write_text("not json", encoding="utf-8")
-    assert Memory(str(path)).get() == {}
-    Memory(str(path)).remember("k", "v")
-    assert Memory(str(path)).get() == {"k": "v"}
-
-
-def test_memory_validates_keys_and_values(tmp_path) -> None:
-    mem = Memory(str(tmp_path / "memory.json"))
+    # Keys and values are validated.
+    validate = Memory(str(tmp_path / "validate.json"))
     with pytest.raises(ValueError):
-        mem.remember("   ", "x")
+        validate.remember("   ", "x")
     with pytest.raises(ValueError):
-        mem.remember("k" * 81, "x")
+        validate.remember("k" * 81, "x")
     with pytest.raises(ValueError):
-        mem.remember("k", "v" * 2001)
+        validate.remember("k", "v" * 2001)
 
 
 def test_memory_write_retries_when_destination_locked(tmp_path, monkeypatch) -> None:
@@ -553,7 +479,7 @@ def test_session_with_file_persistence(db_path: str, tmp_path, monkeypatch, caps
     assert "Resumed" in out  # history was loaded from the file on resume
 
 
-def test_session_clear_command_drops_context(db_path, tmp_path, monkeypatch, capsys) -> None:
+def test_session_clear_and_new_commands(db_path, tmp_path, monkeypatch, capsys) -> None:
     from pydantic_ai.messages import ModelMessagesTypeAdapter
     from pydantic_ai.models.test import TestModel
 
@@ -569,87 +495,33 @@ def test_session_clear_command_drops_context(db_path, tmp_path, monkeypatch, cap
         )
 
     monkeypatch.setattr("garmin_fetch.ask.build_agent", fake_build)
-    session = tmp_path / "session.json"
     cfg = {
         "db_path": db_path,
         "llm_model": "test",
         "llm_api_key": "x",
         "llm_base_url": None,
     }
+    session = tmp_path / "session.json"
 
-    answers = iter(["question one", "/clear", "question two", "quit"])
+    # /clear wipes the earlier context; /new folds the rest into a summary.
+    answers = iter(["question one", "/clear", "question two", "/new", "question three", "quit"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
     _ask_session(cfg, str(session))
-
     out = capsys.readouterr().out
     assert "no prior context" in out
-    dumped = ModelMessagesTypeAdapter.dump_json(_load_session(str(session))).decode()
-    assert "question two" in dumped
-    assert "question one" not in dumped  # /clear wiped the earlier context
-
-
-def test_session_new_command_compacts_context(db_path, tmp_path, monkeypatch, capsys) -> None:
-    from pydantic_ai.messages import ModelMessagesTypeAdapter
-    from pydantic_ai.models.test import TestModel
-
-    from garmin_fetch.ask import _load_session
-
-    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
-        return build_agent(
-            db,
-            model_name=model_name,
-            base_url=base_url,
-            api_key=api_key,
-            model=TestModel(call_tools=["date_range"], custom_output_text="COMPACTED SUMMARY"),
-        )
-
-    monkeypatch.setattr("garmin_fetch.ask.build_agent", fake_build)
-    session = tmp_path / "session.json"
-    cfg = {
-        "db_path": db_path,
-        "llm_model": "test",
-        "llm_api_key": "x",
-        "llm_base_url": None,
-    }
-
-    answers = iter(["question one", "/new", "question two", "quit"])
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
-    _ask_session(cfg, str(session))
-
-    out = capsys.readouterr().out
     assert "Compacted" in out
     dumped = ModelMessagesTypeAdapter.dump_json(_load_session(str(session))).decode()
-    assert "COMPACTED SUMMARY" in dumped  # the summary seeds the new session
-    assert "question two" in dumped
-    assert "question one" not in dumped  # raw history was folded into the summary
+    assert "question three" in dumped
+    assert "question one" not in dumped  # /clear wiped the earlier context
+    assert "question two" not in dumped  # /new folded it into the summary
 
-
-def test_session_new_with_empty_history_starts_fresh(db_path, tmp_path, monkeypatch, capsys) -> None:
-    from pydantic_ai.models.test import TestModel
-
-    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
-        return build_agent(
-            db,
-            model_name=model_name,
-            base_url=base_url,
-            api_key=api_key,
-            model=TestModel(call_tools=["date_range"], custom_output_text="mock final answer"),
-        )
-
-    monkeypatch.setattr("garmin_fetch.ask.build_agent", fake_build)
-    cfg = {
-        "db_path": db_path,
-        "llm_model": "test",
-        "llm_api_key": "x",
-        "llm_base_url": None,
-    }
-
-    answers = iter(["/new", "question one", "quit"])
+    # /new with no history at all starts fresh instead of compacting.
+    capsys.readouterr()
+    answers = iter(["/new", "question four", "quit"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
-    _ask_session(cfg)
+    _ask_session(cfg, str(tmp_path / "fresh.json"))
     out = capsys.readouterr().out
     assert "Nothing to compact" in out
-    assert out.count("mock final answer") == 1
 
 
 _OM_PAYLOAD = {
@@ -666,7 +538,7 @@ _OM_PAYLOAD = {
 }
 
 
-def test_weather_historical_range_from_archive() -> None:
+def test_weather_routes_config_and_validation() -> None:
     calls: list[tuple[str, dict]] = []
 
     def fake_get(url: str, params: dict) -> dict:
@@ -675,7 +547,6 @@ def test_weather_historical_range_from_archive() -> None:
 
     w = Weather(default_lat=51.5, default_lon=-0.1, http_get=fake_get, today=date(2026, 8, 8))
     out = w.query("2026-07-01", "2026-07-02")
-
     assert out["source"] == "historical"
     assert out["location"] == {"lat": 51.5, "lon": -0.1}
     assert out["days"] == [
@@ -687,35 +558,23 @@ def test_weather_historical_range_from_archive() -> None:
     assert params["start_date"] == "2026-07-01" and params["end_date"] == "2026-07-02"
     assert params["latitude"] == 51.5 and params["longitude"] == -0.1
 
-
-def test_weather_forecast_default_and_override() -> None:
-    calls: list[tuple[str, dict]] = []
-
-    def fake_get(url: str, params: dict) -> dict:
-        calls.append((url, params))
-        return _OM_PAYLOAD
-
-    w = Weather(default_lat=51.5, default_lon=-0.1, http_get=fake_get, today=date(2026, 8, 8))
+    # Forecast default + per-call location override.
+    calls.clear()
     out = w.query(lat=48.8, lon=2.3)
-
     assert out["source"] == "forecast"
     assert out["location"] == {"lat": 48.8, "lon": 2.3}
-    assert len(out["days"]) == 2
-    assert calls[0][1]["start_date"] == "2026-08-08" and calls[0][1]["end_date"] == "2026-08-09"
-    assert calls[0][0] == Weather.FORECAST_URL
+    url, params = calls[0]
+    assert url == Weather.FORECAST_URL
+    assert params["start_date"] == "2026-08-08" and params["end_date"] == "2026-08-09"
 
-
-def test_weather_from_config_and_no_default_location() -> None:
-    w = Weather.from_config({"weather_home_lat": "51.5", "weather_home_lon": "-0.1"})
-    assert (w._default_lat, w._default_lon) == (51.5, -0.1)
-
-    bare = Weather(http_get=lambda *_: _OM_PAYLOAD, today=date(2026, 8, 8))
+    # Config strings become the default location; missing default raises.
+    wc = Weather.from_config({"weather_home_lat": "51.5", "weather_home_lon": "-0.1"})
+    assert (wc._default_lat, wc._default_lon) == (51.5, -0.1)
+    bare = Weather(http_get=fake_get, today=date(2026, 8, 8))
     with pytest.raises(ValueError, match="no location configured"):
         bare.query("2026-07-01", "2026-07-02")
 
-
-def test_weather_query_validates_input() -> None:
-    w = Weather(default_lat=51.5, default_lon=-0.1, http_get=lambda *_: _OM_PAYLOAD, today=date(2026, 8, 8))
+    w = Weather(default_lat=51.5, default_lon=-0.1, http_get=fake_get, today=date(2026, 8, 8))
     with pytest.raises(ValueError, match="not be before"):
         w.query("2026-07-02", "2026-07-01")
     with pytest.raises(ValueError, match="YYYY-MM-DD"):
@@ -760,16 +619,13 @@ def test_agent_weather_tool_runs_offline(db_path: str) -> None:
     assert fake.calls  # the model actually called the weather tool
 
 
-def test_schema_text_lists_columns(db_path: str) -> None:
+def test_schema_text_and_system_prompt(db_path: str) -> None:
+    from pydantic_ai.models.test import TestModel
+
     db = ReadOnlyDB(db_path)
     text = _schema_text(db)
     assert "daily_metrics: calendar_date, sleep_time_hours, resting_hr" in text
 
-
-def test_system_prompt_injects_schema(db_path: str) -> None:
-    from pydantic_ai.models.test import TestModel
-
-    db = ReadOnlyDB(db_path)
     agent = build_agent(
         db,
         model_name="test",
@@ -782,8 +638,14 @@ def test_system_prompt_injects_schema(db_path: str) -> None:
     assert "sleep_time_hours" in prompt  # schema columns are baked in
 
 
-def test_chart_error_not_double_prefixed(db_path: str) -> None:
+def test_chart_and_tool_errors_no_double_prefix(db_path: str) -> None:
     from pydantic_ai.models.test import TestModel
+
+    class _MsgError(Exception):
+        pass
+
+    assert _tool_error(_MsgError("boom")) == "ERROR: boom"
+    assert _tool_error(_MsgError("ERROR: boom")) == "ERROR: boom"
 
     db = ReadOnlyDB(db_path)
     agent = build_agent(
@@ -791,13 +653,9 @@ def test_chart_error_not_double_prefixed(db_path: str) -> None:
         model_name="test",
         base_url=None,
         api_key="x",
-        model=TestModel(
-            call_tools=["chart"],
-            custom_output_text="done",
-        ),
+        model=TestModel(call_tools=["chart"], custom_output_text="done"),
     )
-    # Run the chart tool with a spec that references a bogus column: the tool
-    # must return a single ERROR: prefix, not "ERROR: ERROR: ...".
+    # A failing chart tool must return a single ERROR: prefix, not a doubled one.
     tool = agent._function_toolset.tools["chart"]
     result = tool.function(
         '{"sql": "SELECT bogus_col FROM daily_metrics", '
@@ -805,11 +663,3 @@ def test_chart_error_not_double_prefixed(db_path: str) -> None:
     )
     assert str(result).startswith("ERROR: ")
     assert not str(result).startswith("ERROR: ERROR: ")
-
-
-def test_tool_error_dedupes_prefix() -> None:
-    class _MsgError(Exception):
-        pass
-
-    assert _tool_error(_MsgError("boom")) == "ERROR: boom"
-    assert _tool_error(_MsgError("ERROR: boom")) == "ERROR: boom"

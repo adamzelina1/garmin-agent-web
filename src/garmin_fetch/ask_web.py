@@ -23,6 +23,8 @@ import json
 import re
 from typing import Any
 
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
 from .ask import (
     ReadOnlyDB,
     _build_agent,
@@ -119,6 +121,33 @@ def _parse_block(raw: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _recover_chart_specs(messages: list[Any]) -> list[dict[str, Any]]:
+    """Recover validated chart specs from a run's successful ``chart`` tool calls.
+
+    The model is told to embed each validated spec in ``<chart> ... </chart>``
+    but occasionally only *says* a chart exists and never emits the spec — the
+    tool call itself still holds the spec. This walks the turn's messages and
+    returns the spec of every successful ``chart`` return so a dropped chart can
+    still be drawn. Duplicate specs will be filtered by the caller.
+    """
+    rebuilt: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if getattr(part, "tool_name", None) != "chart":
+                continue
+            if getattr(part, "outcome", None) != "success":
+                continue
+            content = str(getattr(part, "content", "") or "")
+            if not content.startswith("OK: "):
+                continue
+            data = _parse_block(content[len("OK: ") :])
+            if isinstance(data, dict) and data.get("sql"):
+                rebuilt.append(data)
+    return rebuilt
+
+
 def _extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
     """Split an agent answer into (plain text, list of plotly figure dicts).
 
@@ -212,6 +241,15 @@ class ChatSession:
         )
         _record_turn(self.cfg, message, result)
         text, specs = _extract_charts(str(result.output))
+
+        # Fallback: the model may validate a chart via the tool but forget to
+        # embed the spec in <chart> tags. Recover any validated specs that were
+        # not embedded so the chart still renders.
+        embedded_sql = {spec.get("sql") for spec in specs}
+        for spec in _recover_chart_specs(result.new_messages()):
+            if spec["sql"] not in embedded_sql:
+                specs.append(spec)
+                embedded_sql.add(spec["sql"])
 
         if self.session_path:
             full = _history_to_messages(

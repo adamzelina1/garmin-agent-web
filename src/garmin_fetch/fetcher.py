@@ -468,7 +468,13 @@ def main() -> None:
     parser.add_argument(
         "--parse", dest="parse_types", action="store", nargs="*", metavar="NAME",
         help="Parse stored raw metrics into daily_metrics (optional names; "
-        "default: all parseable types)",
+        "default: all parseable types). Incremental: only rows whose raw "
+        "payload changed since last parse; combine with --full for a rebuild.",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="With --parse: force a full re-parse of every stored row, "
+        "ignoring incremental change markers.",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = parser.parse_args()
@@ -521,17 +527,18 @@ def main() -> None:
         db = Database(load_config()["db_path"])
         try:
             counts: dict[str, int] = {}
+            force = args.full
             if want_activities or not names:
-                counts.update(build_activity_summaries(db))
+                counts.update(build_activity_summaries(db, force=force))
             if want_activities or not names:
-                counts.update(build_activity_details(db))
+                counts.update(build_activity_details(db, force=force))
             if want_weather or want_activities or not names:
-                counts.update(build_activity_weather(db))
+                counts.update(build_activity_weather(db, force=force))
             if want_profile or not names:
                 counts.update(build_hr_zones(db))
             if want_profile or not names:
                 counts.update(build_race_predictions(db))
-            counts.update(build_daily_rows(db, day_names or None))
+            counts.update(build_daily_rows(db, day_names or None, force=force))
         finally:
             db.close()
         total = sum(counts.values())

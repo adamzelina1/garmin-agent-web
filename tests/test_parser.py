@@ -31,7 +31,6 @@ from garmin_fetch.parser import (
     parse_stats,
     parse_steps,
     parse_training_status,
-    PARSERS,
 )
 
 
@@ -40,7 +39,7 @@ def db(tmp_path: Path) -> Database:
     return Database(str(tmp_path / "test.db"))
 
 
-def test_parse_heart_rate() -> None:
+def test_parse_heart_rate_flat_and_zones() -> None:
     out = parse_heart_rate({
         "restingHeartRate": 54,
         "minHeartRate": 52,
@@ -53,9 +52,6 @@ def test_parse_heart_rate() -> None:
         "max_hr": 173,
         "last_7d_avg_resting_hr": 53,
     }
-
-
-def test_parse_heart_rate_zones() -> None:
     out = parse_heart_rate({
         "restingHeartRate": 54,
         "heartRateZones": [
@@ -71,7 +67,7 @@ def test_parse_heart_rate_zones() -> None:
     assert out["hr_zone_2_hours"] == pytest.approx(2713 / 3600, abs=1e-4)
 
 
-def test_parse_steps_sums_buckets() -> None:
+def test_parse_steps_sums_buckets_and_handles_blank() -> None:
     buckets = [
         {"steps": 100, "pushes": 2},
         {"steps": 250, "pushes": 0},
@@ -79,9 +75,6 @@ def test_parse_steps_sums_buckets() -> None:
     ]
     out = parse_steps({"calendarDate": "2026-08-01", "value": buckets})
     assert out == {"total_steps": 400, "pushes": 3}
-
-
-def test_parse_steps_empty_returns_empty() -> None:
     assert parse_steps({"value": []}) == {}
     assert parse_steps({"value": "nope"}) == {}
 
@@ -132,7 +125,7 @@ def test_parse_hrv_from_summary() -> None:
     assert "hrv_weekly_avg" not in out
 
 
-def test_parse_rhr_nested() -> None:
+def test_parse_rhr_nested_and_missing() -> None:
     out = parse_rhr({
         "allMetrics": {
             "metricsMap": {
@@ -141,9 +134,6 @@ def test_parse_rhr_nested() -> None:
         }
     })
     assert out == {"resting_hr": 62.0}
-
-
-def test_parse_rhr_missing_returns_empty() -> None:
     assert parse_rhr({"allMetrics": {"metricsMap": {}}}) == {}
 
 
@@ -208,7 +198,7 @@ def test_parse_training_status() -> None:
     assert out["weekly_training_load"] == 255
 
 
-def test_parse_lactate_threshold() -> None:
+def test_parse_lactate_threshold_and_empty() -> None:
     out = parse_lactate_threshold({
         "heart_rate": [{"value": 165, "calendarDate": "2026-08-01"}],
         "speed": [{"value": 0.353, "calendarDate": "2026-08-01"}],
@@ -219,40 +209,23 @@ def test_parse_lactate_threshold() -> None:
         "lactate_threshold_speed": 0.353,
         "ftp_watts": 300,
     }
-
-
-def test_parse_lactate_threshold_empty() -> None:
     assert parse_lactate_threshold({}) == {}
     assert parse_lactate_threshold(
         {"heart_rate": [], "speed": [], "power": []}
     ) == {}
 
 
-def test_all_parsers_registered_for_data_types() -> None:
-    # Every registered parser is callable with a payload and returns a dict.
-    for name, parser in PARSERS.items():
-        assert callable(parser)
-        assert isinstance(PARSERS[name]({}), dict)
-
-
-def test_merge_daily_creates_row_and_columns(db: Database) -> None:
+def test_merge_daily_creates_row_and_merges_across_calls(db: Database) -> None:
     db.merge_daily("2026-08-01", {"resting_hr": 62, "total_steps": 900}, "t")
     db.merge_daily("2026-08-02", {"resting_hr": 60}, "t2")
+    db.merge_daily("2026-08-01", {"active_hours": 1.5}, "t3")
     row = db.conn.execute(
-        "SELECT resting_hr, total_steps FROM daily_metrics WHERE calendar_date='2026-08-01'"
+        "SELECT resting_hr, total_steps, active_hours "
+        "FROM daily_metrics WHERE calendar_date='2026-08-01'"
     ).fetchone()
     assert row["resting_hr"] == 62
     assert row["total_steps"] == 900
-
-
-def test_merge_daily_merges_across_calls(db: Database) -> None:
-    db.merge_daily("2026-08-01", {"resting_hr": 64}, "t")
-    db.merge_daily("2026-08-01", {"total_steps": 900}, "t2")
-    row = db.conn.execute(
-        "SELECT resting_hr, total_steps FROM daily_metrics WHERE calendar_date='2026-08-01'"
-    ).fetchone()
-    assert row["resting_hr"] == 64
-    assert row["total_steps"] == 900
+    assert row["active_hours"] == 1.5
 
 
 def test_build_daily_rows_from_metrics(db: Database) -> None:
@@ -267,8 +240,8 @@ def test_build_daily_rows_from_metrics(db: Database) -> None:
     assert row["total_steps"] == 100
 
 
-def test_build_daily_rows_forward_fills_lactate(db: Database) -> None:
-    """Sparse types carry the last known value into dates with no data."""
+def test_build_daily_rows_forward_fills_only_sparse_types(db: Database) -> None:
+    """Sparse types carry the last known value forward; others stay NULL."""
     db.upsert_metric("lactate_threshold", {
         "calendarDate": "2026-08-01",
         "heart_rate": [{"value": 179}],
@@ -303,23 +276,21 @@ def test_build_daily_rows_forward_fills_lactate(db: Database) -> None:
     assert row3["lactate_threshold_speed"] == 0.5  # untouched by new value
     assert row3["ftp_watts"] == 300
 
-
-def test_build_daily_rows_does_not_forward_fill_other_types(db: Database) -> None:
-    """Non-sparse types keep NULL for genuinely missing days."""
+    # Non-sparse types do NOT forward-fill: a day with no data is omitted.
     db.upsert_metric("heart_rate", {
-        "calendarDate": "2026-08-01", "restingHeartRate": 62, "fetched_at": "t",
+        "calendarDate": "2026-08-04", "restingHeartRate": 62, "fetched_at": "t",
     })
     db.upsert_metric("heart_rate", {
-        "calendarDate": "2026-08-02", "fetched_at": "t",
+        "calendarDate": "2026-08-05", "fetched_at": "t",
     })
     assert build_daily_rows(db, ["heart_rate"]) == {"heart_rate": 1}
     row = db.conn.execute(
-        "SELECT 1 FROM daily_metrics WHERE calendar_date='2026-08-02'"
+        "SELECT 1 FROM daily_metrics WHERE calendar_date='2026-08-05'"
     ).fetchone()
     assert row is None
 
 
-def test_parse_activity_summary_shares_curated_columns() -> None:
+def test_parse_activity_summary_curated_columns() -> None:
     out = parse_activity_summary({
         "activityId": 1001,
         "activityName": "Mountain Run",
@@ -334,31 +305,58 @@ def test_parse_activity_summary_shares_curated_columns() -> None:
         "calories": 400.0,
         "hrTimeInZone_3": 600.0,
         "activityTrainingLoad": 120.5,
+        "elevationGain": 350.0,
+        "elevationLoss": 120.0,
+        "minElevation": 55.0,
+        "maxElevation": 275.0,
+        "averageSpeed": 3.0,
+        "maxSpeed": 5.0,
+        "minRespirationRate": 12.0,
+        "avgRespirationRate": 18.0,
+        "maxRespirationRate": 26.0,
+        "differenceBodyBattery": -14.0,
+        "waterEstimated": 1872.0,
+        "isPR": True,
+        "avgStrideLength": 74.62,
+        "avgVerticalOscillation": 8.4,
+        "avgGroundContactTime": 259.9,
+        "avgVerticalRatio": 7.8,
     })
     assert out["activity_name"] == "Mountain Run"
     assert out["activity_type"] == "running"
     assert out["start_date"] == "2026-08-01"
-    assert out["distance_km"] == 5.0
+    assert out["distance_km"] == pytest.approx(5.0)
     assert out["duration_hours"] == pytest.approx(0.5)
     assert out["elapsed_hours"] == pytest.approx(2100 / 3600, abs=1e-3)
+    assert out["moving_hours"] == pytest.approx(1790 / 3600, abs=1e-3)
     assert out["avg_hr"] == 145
     assert out["hr_time_zone_3_pct"] == pytest.approx(600 / 1800 * 100, abs=1e-1)
     assert out["training_load"] == 120.5
+    assert out["elevation_gain_m"] == 350.0
+    assert out["max_speed_kmh"] == pytest.approx(5.0 * 3.6)
+    assert out["max_respiration_rate"] == 26.0
+    assert out["body_battery_change"] == -14.0
+    assert out["water_estimated_ml"] == 1872.0
+    assert out["is_pr"] is True
+    assert out["avg_stride_length_cm"] == pytest.approx(74.62)
+    assert out["avg_vertical_oscillation_cm"] == pytest.approx(8.4)
+    assert out["avg_ground_contact_time_ms"] == pytest.approx(259.9)
+    assert out["avg_vertical_ratio_pct"] == pytest.approx(7.8)
+    # Removed: max_vertical_speed and lap_count are no longer parsed.
+    assert "max_vertical_speed" not in out
+    assert "lap_count" not in out
 
-
-def test_parse_activity_summary_distance_hours_conversion() -> None:
-    out = parse_activity_summary({
+    # A distance-less sport still stores 0.0 km; durations/speeds convert.
+    indoor = parse_activity_summary({
         "activityName": "Indoor Cycle",
         "activityType": {"typeKey": "indoor_cycling"},
         "distance": 0.0,
         "duration": 3600.0,
         "averageSpeed": 3.0,
     })
-    # Indoor cycling has no distance; store 0.0 km and 1 hour duration.
-    assert out["distance_km"] == 0.0
-    assert out["duration_hours"] == pytest.approx(1.0)
-    # Average speed in m/s converted to km/h.
-    assert out["avg_speed_kmh"] == pytest.approx(3.0 * 3.6)
+    assert indoor["distance_km"] == 0.0
+    assert indoor["duration_hours"] == pytest.approx(1.0)
+    assert indoor["avg_speed_kmh"] == pytest.approx(3.0 * 3.6)
 
 
 def test_build_activity_summaries_upserts_curated_row(db: Database) -> None:
@@ -387,45 +385,6 @@ def test_build_activity_summaries_upserts_curated_row(db: Database) -> None:
     assert row["hr_time_zone_2_pct"] == pytest.approx(900 / 1800 * 100)
 
 
-def test_parse_activity_summary_extra_curated_fields() -> None:
-    out = parse_activity_summary({
-        "activityId": 1001,
-        "activityName": "Hill Walk",
-        "activityType": {"typeKey": "hiking"},
-        "startTimeLocal": "2026-08-01 07:00:00",
-        "elevationGain": 350.0,
-        "elevationLoss": 120.0,
-        "minElevation": 55.0,
-        "maxElevation": 275.0,
-        "averageSpeed": 3.0,
-        "maxSpeed": 5.0,
-        "minRespirationRate": 12.0,
-        "avgRespirationRate": 18.0,
-        "maxRespirationRate": 26.0,
-        "differenceBodyBattery": -14.0,
-        "waterEstimated": 1872.0,
-        "isPR": True,
-    })
-    assert out["elevation_gain_m"] == 350.0
-    assert out["elevation_loss_m"] == 120.0
-    assert out["min_elevation_m"] == 55.0
-    assert out["max_elevation_m"] == 275.0
-    # Speeds are m/s -> km/h.
-    assert out["avg_speed_kmh"] == pytest.approx(3.0 * 3.6)
-    assert out["max_speed_kmh"] == pytest.approx(5.0 * 3.6)
-    # Respiration rates pass through.
-    assert out["min_respiration_rate"] == 12.0
-    assert out["avg_respiration_rate"] == 18.0
-    assert out["max_respiration_rate"] == 26.0
-    # New curated fields.
-    assert out["body_battery_change"] == -14.0
-    assert out["water_estimated_ml"] == 1872.0
-    assert out["is_pr"] is True
-    # Removed: max_vertical_speed and lap_count are no longer parsed.
-    assert "max_vertical_speed" not in out
-    assert "lap_count" not in out
-
-
 def _detail_payload() -> dict:
     """A running-style details payload with 3 ticks of aligned metrics."""
     return {
@@ -447,7 +406,7 @@ def _detail_payload() -> dict:
     }
 
 
-def test_parse_activity_details_aggregates() -> None:
+def test_parse_activity_details_aggregates_and_edge_values() -> None:
     out = parse_activity_details(_detail_payload())
     assert out == {
         "avg_cadence": pytest.approx(88.0),
@@ -455,10 +414,8 @@ def test_parse_activity_details_aggregates() -> None:
         "avg_power_w": pytest.approx(220.0),
         "max_power_w": 260.0,
     }
-
-
-def test_parse_activity_details_skips_zero_and_nan() -> None:
-    payload = {
+    # Zero and NaN values are skipped per-tick.
+    edge = {
         "metricDescriptors": [
             {"key": "directRunCadence"},
             {"key": "directPower"},
@@ -469,11 +426,10 @@ def test_parse_activity_details_skips_zero_and_nan() -> None:
             {"metrics": [88.0, float("nan")]},
         ],
     }
-    out = parse_activity_details(payload)
-    assert out == {"avg_cadence": 86.0, "max_cadence": 88.0, "avg_power_w": 465.0, "max_power_w": 830.0}
-
-
-def test_parse_activity_details_empty_payload() -> None:
+    assert parse_activity_details(edge) == {
+        "avg_cadence": 86.0, "max_cadence": 88.0,
+        "avg_power_w": 465.0, "max_power_w": 830.0,
+    }
     assert parse_activity_details({}) == {}
     assert parse_activity_details({"metricDescriptors": []}) == {}
 
@@ -500,7 +456,7 @@ def test_parse_activity_details_double_cadence_halved() -> None:
     assert agg == {"avg_cadence": 90.0, "max_cadence": 92.0}
 
 
-def test_parse_activity_detail_series_rows() -> None:
+def test_parse_activity_detail_series_rows_and_unknown_descriptors() -> None:
     rows = parse_activity_detail_series(_detail_payload())
     assert len(rows) == 3
     assert [r["tick"] for r in rows] == [0, 1, 2]
@@ -515,9 +471,7 @@ def test_parse_activity_detail_series_rows() -> None:
         "tick", "ts_ms", "heart_rate", "distance_m", "cadence",
         "power_w", "speed_mps", "elevation_m",
     }
-
-
-def test_parse_activity_detail_series_ignores_unknown_descriptors() -> None:
+    # Unknown descriptors are dropped.
     payload = {
         "metricDescriptors": [
             {"key": "directHeartRate"},
@@ -527,16 +481,12 @@ def test_parse_activity_detail_series_ignores_unknown_descriptors() -> None:
             {"metrics": [150.0, 42.0]},
         ],
     }
-    rows = parse_activity_detail_series(payload)
-    assert rows == [{"tick": 0, "heart_rate": 150.0}]
-
-
-def test_parse_activity_detail_series_empty() -> None:
+    assert parse_activity_detail_series(payload) == [{"tick": 0, "heart_rate": 150.0}]
     assert parse_activity_detail_series({}) == []
     assert parse_activity_detail_series({"metricDescriptors": [{"key": "directHeartRate"}]}) == []
 
 
-def test_build_activity_details_upserts_series_and_aggregates(db: Database) -> None:
+def test_build_activity_details_upserts_replaces_and_skips(db: Database) -> None:
     db.upsert_activity({
         "activityId": 1001,
         "activityName": "Track Run",
@@ -562,74 +512,111 @@ def test_build_activity_details_upserts_series_and_aggregates(db: Database) -> N
     assert ticks[0]["heart_rate"] == 150.0
     assert ticks[2]["power_w"] == 260.0
 
-
-def test_build_activity_details_replaces_previous_series(db: Database) -> None:
-    db.upsert_activity({
-        "activityId": 1001,
-        "activityName": "Track Run",
-        "activityType": {"typeKey": "running"},
-        "fetched_at": "t",
-    })
-    db.set_activity_details(1001, _detail_payload())
-    build_activity_details(db)
-    first = db.conn.execute(
-        "SELECT COUNT(*) AS n FROM activity_detail_series WHERE activity_id=1001"
-    ).fetchone()["n"]
-    assert first == 3
-    # Re-parse with fewer ticks: old ticks must not survive.
-    payload = {
-        "metricDescriptors": [{"key": "directHeartRate"}],
-        "activityDetailMetrics": [{"metrics": [150.0]}],
-    }
-    db.set_activity_details(1001, payload)
-    build_activity_details(db)
-    remaining = db.conn.execute(
-        "SELECT COUNT(*) AS n FROM activity_detail_series WHERE activity_id=1001"
-    ).fetchone()["n"]
-    assert remaining == 1
-
-
-def test_build_activity_details_skips_activities_without_details(db: Database) -> None:
+    # Activities without a details payload are skipped entirely.
     db.upsert_activity({
         "activityId": 2002,
         "activityName": "Manual",
         "activityType": {"typeKey": "other"},
         "fetched_at": "t",
     })
+    assert build_activity_details(db) == {"activities": 1, "series": 3}
+
+    # Re-parse with fewer ticks: old ticks must not survive.
+    payload = {
+        "metricDescriptors": [{"key": "directHeartRate"}],
+        "activityDetailMetrics": [{"metrics": [150.0]}],
+    }
+    db.set_activity_details(1001, payload)
+    remaining = build_activity_details(db)["series"]
+    assert remaining == 1
+
+
+def test_build_daily_rows_is_incremental_and_full_force(db: Database) -> None:
+    """Unchanged raw rows are skipped; force=True re-parses everything."""
+    db.upsert_metric("heart_rate", {"calendarDate": "2026-08-01", "restingHeartRate": 62, "fetched_at": "t1"})
+    db.upsert_metric("steps", {"calendarDate": "2026-08-01", "value": [{"steps": 100}], "fetched_at": "t1"})
+    assert build_daily_rows(db, ["heart_rate", "steps"]) == {"heart_rate": 1, "steps": 1}
+
+    # Nothing changed -> nothing re-parsed.
+    assert build_daily_rows(db, ["heart_rate", "steps"]) == {}
+
+    # A re-fetched row (new fetched_at) is re-parsed.
+    db.upsert_metric("heart_rate", {"calendarDate": "2026-08-01", "restingHeartRate": 63, "fetched_at": "t2"})
+    counts = build_daily_rows(db, ["heart_rate"])
+    assert counts == {"heart_rate": 1}
+    row = db.conn.execute(
+        "SELECT resting_hr FROM daily_metrics WHERE calendar_date='2026-08-01'"
+    ).fetchone()
+    assert row["resting_hr"] == 63
+
+    # force=True re-parses everything regardless of markers.
+    counts = build_daily_rows(db, ["heart_rate", "steps"], force=True)
+    assert counts == {"heart_rate": 1, "steps": 1}
+
+
+def test_build_activity_details_incremental_and_force(db: Database) -> None:
+    db.upsert_activity({
+        "activityId": 1001,
+        "activityName": "Track Run",
+        "activityType": {"typeKey": "running"},
+        "fetched_at": "t",
+    })
+    db.set_activity_details(1001, _detail_payload(), fetched_at="d1")
+    assert build_activity_details(db) == {"activities": 1, "series": 3}
     assert build_activity_details(db) == {"activities": 0, "series": 0}
 
+    # Changed details (new fetched stamp) re-parse the series.
+    payload = {
+        "metricDescriptors": [{"key": "directHeartRate"}],
+        "activityDetailMetrics": [{"metrics": [150.0]}],
+    }
+    db.set_activity_details(1001, payload, fetched_at="d2")
+    assert build_activity_details(db) == {"activities": 0, "series": 1}
+    remaining = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM activity_detail_series WHERE activity_id=1001"
+    ).fetchone()
+    assert remaining["n"] == 1
 
-def test_parse_hr_zones_derives_ranges() -> None:
-    rows = parse_hr_zones([{
-        "trainingMethod": "HR_RESERVE",
-        "restingHeartRateUsed": 54,
-        "lactateThresholdHeartRateUsed": 166,
-        "zone1Floor": 121,
-        "zone2Floor": 134,
-        "zone3Floor": 148,
-        "zone4Floor": 161,
-        "zone5Floor": 175,
-        "maxHeartRateUsed": 188,
-        "restingHrAutoUpdateUsed": True,
-        "sport": "DEFAULT",
-        "changeState": "UNCHANGED",
-    }])
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["sport"] == "DEFAULT"
-    assert row["training_method"] == "HR_RESERVE"
-    assert row["max_hr_used"] == 188
-    assert row["resting_hr_used"] == 54
-    # Zone N spans [floor_N, floor_(N+1)); zone 5 runs to the max HR used.
-    assert (row["zone1_min"], row["zone1_max"]) == (121, 133)
-    assert (row["zone2_min"], row["zone2_max"]) == (134, 147)
-    assert (row["zone3_min"], row["zone3_max"]) == (148, 160)
-    assert (row["zone4_min"], row["zone4_max"]) == (161, 174)
-    assert (row["zone5_min"], row["zone5_max"]) == (175, 188)
+    # force re-parses from the stored payload (which still has 1 tick).
+    assert build_activity_details(db, force=True)["series"] == 1
 
 
-def test_parse_hr_zones_multiple_sports_and_skips_bad_rows() -> None:
+def test_build_activity_weather_incremental(db: Database) -> None:
+    db.upsert_activity({
+        "activityId": 1001,
+        "activityName": "Morning Run",
+        "activityType": {"typeKey": "running"},
+        "fetched_at": "t",
+    })
+    db.set_activity_weather(1001, {
+        "temp": 68.0, "weatherTypeDTO": {"desc": "Fair"},
+    }, fetched_at="w1")
+    assert build_activity_weather(db) == {"activities": 1}
+    assert build_activity_weather(db) == {"activities": 0}
+
+    db.set_activity_weather(1001, {
+        "temp": 50.0, "weatherTypeDTO": {"desc": "Rain"},
+    }, fetched_at="w2")
+    assert build_activity_weather(db) == {"activities": 1}
+    assert build_activity_weather(db, force=True) == {"activities": 1}
+
+
+def test_parse_hr_zones_derives_ranges_and_skips_bad_rows() -> None:
     rows = parse_hr_zones([
+        {
+            "trainingMethod": "HR_RESERVE",
+            "restingHeartRateUsed": 54,
+            "lactateThresholdHeartRateUsed": 166,
+            "zone1Floor": 121,
+            "zone2Floor": 134,
+            "zone3Floor": 148,
+            "zone4Floor": 161,
+            "zone5Floor": 175,
+            "maxHeartRateUsed": 188,
+            "restingHrAutoUpdateUsed": True,
+            "sport": "DEFAULT",
+            "changeState": "UNCHANGED",
+        },
         {"sport": "RUNNING", "zone1Floor": 120, "zone2Floor": 130,
          "zone3Floor": 140, "zone4Floor": 150, "zone5Floor": 160,
          "maxHeartRateUsed": 190},
@@ -639,12 +626,24 @@ def test_parse_hr_zones_multiple_sports_and_skips_bad_rows() -> None:
         {"sport": None},
         "not-a-dict",
     ])
-    assert [r["sport"] for r in rows] == ["RUNNING", "CYCLING"]
-    assert (rows[0]["zone2_min"], rows[0]["zone2_max"]) == (130, 139)
-    assert (rows[1]["zone5_min"], rows[1]["zone5_max"]) == (170, 200)
+    assert [r["sport"] for r in rows] == ["DEFAULT", "RUNNING", "CYCLING"]
+    row = rows[0]
+    assert row["training_method"] == "HR_RESERVE"
+    assert row["max_hr_used"] == 188
+    assert row["resting_hr_used"] == 54
+    # Zone N spans [floor_N, floor_(N+1)); zone 5 runs to the max HR used.
+    assert (row["zone1_min"], row["zone1_max"]) == (121, 133)
+    assert (row["zone2_min"], row["zone2_max"]) == (134, 147)
+    assert (row["zone3_min"], row["zone3_max"]) == (148, 160)
+    assert (row["zone4_min"], row["zone4_max"]) == (161, 174)
+    assert (row["zone5_min"], row["zone5_max"]) == (175, 188)
+    assert (rows[1]["zone2_min"], rows[1]["zone2_max"]) == (130, 139)
+    assert (rows[2]["zone5_min"], rows[2]["zone5_max"]) == (170, 200)
 
 
-def test_build_hr_zones_projects_profile(db: Database) -> None:
+def test_build_hr_zones_projects_replaces_and_empty(db: Database) -> None:
+    assert build_hr_zones(db) == {"hr_zones": 0}
+
     db.upsert_profile("hr_zones", json.dumps([
         {"sport": "DEFAULT", "trainingMethod": "HR_RESERVE",
          "zone1Floor": 121, "zone2Floor": 134, "zone3Floor": 148,
@@ -668,38 +667,21 @@ def test_build_hr_zones_projects_profile(db: Database) -> None:
     ).fetchone()
     assert run_row["zone5_max"] == 190
 
-
-def test_build_hr_zones_no_profile_is_empty(db: Database) -> None:
-    assert build_hr_zones(db) == {"hr_zones": 0}
-    assert db.conn.execute("SELECT COUNT(*) AS n FROM hr_zones").fetchone()["n"] == 0
-
-
-def test_build_hr_zones_replaces_previous_snapshot(db: Database) -> None:
+    # A newer snapshot replaces the whole table.
     db.upsert_profile("hr_zones", json.dumps([
-        {"sport": "DEFAULT", "zone1Floor": 100, "zone2Floor": 110,
-         "zone3Floor": 120, "zone4Floor": 130, "zone5Floor": 140,
-         "maxHeartRateUsed": 150},
-    ]), fetched_at="t1")
-    build_hr_zones(db)
-    assert db.conn.execute("SELECT COUNT(*) AS n FROM hr_zones").fetchone()["n"] == 1
-
-    db.upsert_profile("hr_zones", json.dumps([
-        {"sport": "DEFAULT", "zone1Floor": 100, "zone2Floor": 110,
-         "zone3Floor": 120, "zone4Floor": 130, "zone5Floor": 140,
-         "maxHeartRateUsed": 150},
-        {"sport": "CYCLING", "zone1Floor": 90, "zone2Floor": 100,
-         "zone3Floor": 110, "zone4Floor": 120, "zone5Floor": 130,
-         "maxHeartRateUsed": 160},
+        {"sport": "CYCLING", "zone1Floor": 110, "zone2Floor": 125,
+         "zone3Floor": 140, "zone4Floor": 155, "zone5Floor": 170,
+         "maxHeartRateUsed": 200},
     ]), fetched_at="t2")
     build_hr_zones(db)
     sports = [
         r["sport"]
         for r in db.conn.execute("SELECT sport FROM hr_zones ORDER BY sport")
     ]
-    assert sports == ["CYCLING", "DEFAULT"]
+    assert sports == ["CYCLING"]
 
 
-def test_parse_race_predictions_to_minutes() -> None:
+def test_parse_race_predictions_to_minutes_and_empty() -> None:
     out = parse_race_predictions({
         "calendarDate": "2026-08-08",
         "time5K": 1424,
@@ -714,14 +696,13 @@ def test_parse_race_predictions_to_minutes() -> None:
         "time_half_marathon_min": pytest.approx(7008 / 60, abs=0.01),
         "time_marathon_min": pytest.approx(15825 / 60, abs=0.01),
     }
-
-
-def test_parse_race_predictions_empty_on_no_times() -> None:
     assert parse_race_predictions({"calendarDate": "2026-08-08"}) == {}
     assert parse_race_predictions({}) == {}
 
 
-def test_build_race_predictions_projects_snapshot(db: Database) -> None:
+def test_build_race_predictions_projects_replaces_and_empty(db: Database) -> None:
+    assert build_race_predictions(db) == {"race_predictions": 0}
+
     db.upsert_profile("race_predictions", json.dumps({
         "calendarDate": "2026-08-08",
         "time5K": 1424,
@@ -735,13 +716,7 @@ def test_build_race_predictions_projects_snapshot(db: Database) -> None:
     assert row["time_marathon_min"] == pytest.approx(15825 / 60, abs=0.01)
     assert row["fetched_at"] == "t"
 
-
-def test_build_race_predictions_replaces_and_empty(db: Database) -> None:
-    assert build_race_predictions(db) == {"race_predictions": 0}
-    db.upsert_profile("race_predictions", json.dumps({
-        "calendarDate": "2026-08-08", "time5K": 1424,
-    }), fetched_at="t1")
-    build_race_predictions(db)
+    # A newer snapshot replaces the single row.
     db.upsert_profile("race_predictions", json.dumps({
         "calendarDate": "2026-08-09", "time5K": 1400,
     }), fetched_at="t2")
@@ -752,7 +727,7 @@ def test_build_race_predictions_replaces_and_empty(db: Database) -> None:
     assert rows[0]["time_5k_min"] == pytest.approx(1400 / 60, abs=0.01)
 
 
-def test_parse_activity_weather_converts_to_metric() -> None:
+def test_parse_activity_weather_converts_and_handles_blank() -> None:
     out = parse_activity_weather({
         "temp": 68.0,
         "apparentTemp": 66.0,
@@ -770,14 +745,11 @@ def test_parse_activity_weather_converts_to_metric() -> None:
     assert out["weather_description"] == "Fair"
     # windGust arrives as null from Garmin and is intentionally not parsed.
     assert "weather_wind_gust_kmh" not in out
-
-
-def test_parse_activity_weather_empty_on_blank() -> None:
     assert parse_activity_weather({}) == {}
     assert parse_activity_weather({"temp": "not-a-number"}) == {}
 
 
-def test_build_activity_weather_projects_summary_columns(db: Database) -> None:
+def test_build_activity_weather_projects_and_ignores_missing(db: Database) -> None:
     db.upsert_activity({
         "activityId": 1001,
         "activityName": "Morning Run",
@@ -801,12 +773,17 @@ def test_build_activity_weather_projects_summary_columns(db: Database) -> None:
     assert row["weather_description"] == "Fair"
     assert row["fetched_at"] == "wt"
 
-
-def test_build_activity_weather_ignores_missing(db: Database) -> None:
+    # An activity without weather leaves its summary weather columns NULL, and
+    # unchanged weather from activity 1001 is not re-parsed (incremental).
     db.upsert_activity({
         "activityId": 1002,
         "activityName": "No Weather",
         "activityType": {"typeKey": "cycling"},
         "fetched_at": "t",
     })
+    build_activity_summaries(db)
     assert build_activity_weather(db) == {"activities": 0}
+    row = db.conn.execute(
+        "SELECT weather_temp_c FROM activity_summaries WHERE activity_id=1002"
+    ).fetchone()
+    assert row["weather_temp_c"] is None

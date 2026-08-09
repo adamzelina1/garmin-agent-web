@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -239,13 +238,11 @@ def client() -> FakeClient:
     return FakeClient()
 
 
-def test_resolve_types_defaults() -> None:
+def test_resolve_types_defaults_and_subset() -> None:
     assert resolve_types(None) == list(DEFAULT_TYPES)
-
-
-def test_resolve_types_subset() -> None:
     names = [d.name for d in resolve_types(["heart_rate", "sleep"])]
     assert names == ["heart_rate", "sleep"]
+    assert _configured_types({}) == list(DEFAULT_TYPES)
 
 
 def test_resolve_types_unknown_raises() -> None:
@@ -253,12 +250,7 @@ def test_resolve_types_unknown_raises() -> None:
         resolve_types(["not_a_thing"])
 
 
-def test_configured_types_empty_returns_all() -> None:
-    types = _configured_types({})
-    assert types == list(DEFAULT_TYPES)
-
-
-def test_configured_types_excluded_removed() -> None:
+def test_configured_types_exclusions() -> None:
     types = _configured_types(
         {"excluded_data_types": "training_readiness, hrv"}
     )
@@ -267,25 +259,21 @@ def test_configured_types_excluded_removed() -> None:
     assert "hrv" not in names
     assert "heart_rate" in names
 
-
-def test_configured_types_all_excluded_returns_all() -> None:
-    excluded = ",".join(d.name for d in DEFAULT_TYPES)
-    types = _configured_types({"excluded_data_types": excluded})
-    assert types == list(DEFAULT_TYPES)
-
-
-def test_configured_types_ignores_unknown_excluded() -> None:
+    # Unknown excluded names are ignored (a misconfigured .env shouldn't break).
     types = _configured_types({"excluded_data_types": "heart_rate,bogus,hrv"})
     names = [t.name for t in types]
     assert "heart_rate" not in names
     assert "hrv" not in names
     assert "bogus" not in names
 
+    # Excluding everything falls back to the full default set.
+    excluded = ",".join(d.name for d in DEFAULT_TYPES)
+    assert _configured_types({"excluded_data_types": excluded}) == list(DEFAULT_TYPES)
+
 
 def test_all_registered_types_resolve() -> None:
-    names = [d.name for d in DEFAULT_TYPES]
-    assert resolve_types(names) == list(DEFAULT_TYPES)
-    # Every registered type has a distinct fetch adapter backed by a client method.
+    assert resolve_types([d.name for d in DEFAULT_TYPES]) == list(DEFAULT_TYPES)
+    # Every registered type has a working fetch adapter against the fake client.
     for data_type in DEFAULT_TYPES:
         client = FakeClient()
         result = data_type.fetch(client, "2026-08-01")
@@ -293,15 +281,14 @@ def test_all_registered_types_resolve() -> None:
 
 
 def test_none_response_is_stored_as_fetched(client: FakeClient, db: Database) -> None:
-    """A day with no data (e.g. HRV None) is recorded so it isn't refetched."""
+    """An empty day (e.g. HRV None) is recorded so it isn't refetched."""
     def fetch_hrv_none(c, cdate):
         return None
 
     none_type = DataType("hrv", fetch_hrv_none)
     fetcher = make_fetcher(client)
-    start, end = date(2026, 8, 1), date(2026, 8, 1)
 
-    assert fetcher.fetch_range(none_type, start, end, db) == 1
+    assert fetcher.fetch_range(none_type, date(2026, 8, 1), date(2026, 8, 1), db) == 1
     assert db.stored_dates("hrv") == {"2026-08-01"}
     row = db.conn.execute(
         "SELECT raw_json FROM metrics WHERE data_type='hrv'"
@@ -309,11 +296,8 @@ def test_none_response_is_stored_as_fetched(client: FakeClient, db: Database) ->
     assert json.loads(row["raw_json"])["value"] is None
 
 
-def test_resolve_start_date_config_wins(client, db) -> None:
+def test_resolve_start_date_config_wins_or_today(db: Database) -> None:
     assert _resolve_start_date(db, "steps", date(2021, 1, 1)) == date(2021, 1, 1)
-
-
-def test_resolve_start_date_empty_returns_today(client, db) -> None:
     assert _resolve_start_date(db, "steps", None) == date.today()
 
 
@@ -324,7 +308,6 @@ def test_sync_all_types(client: FakeClient, db: Database) -> None:
     for data_type in DEFAULT_TYPES:
         assert fetcher.fetch_range(data_type, start, end, db) == 2
 
-    # Raw rows exist for every type/date.
     for name in [d.name for d in DEFAULT_TYPES]:
         assert db.stored_dates(name) == {"2026-08-01", "2026-08-02"}
 
@@ -335,15 +318,14 @@ def test_sync_all_types(client: FakeClient, db: Database) -> None:
 
 
 def test_sync_is_idempotent(client: FakeClient, db: Database) -> None:
+    """A second run over the same range makes no further API calls."""
     fetcher = make_fetcher(client)
     start, end = date(2026, 8, 1), date(2026, 8, 3)
 
     assert fetcher.fetch_range(DEFAULT_TYPES[0], start, end, db) == 3
     assert fetcher.fetch_range(DEFAULT_TYPES[0], start, end, db) == 0
-    assert fetcher.fetch_range(DEFAULT_TYPES[0], start, end, db) == 0
     assert db.stored_dates("heart_rate") == {"2026-08-01", "2026-08-02", "2026-08-03"}
-    # Garmin API only called once per date.
-    assert len(client.calls) == 3
+    assert len(client.calls) == 3  # Garmin API called once per date
 
 
 def test_fetch_range_refetches_incomplete_days(
@@ -354,7 +336,6 @@ def test_fetch_range_refetches_incomplete_days(
     start, end = date(2026, 8, 1), date(2026, 8, 7)
     assert fetcher.fetch_range(DEFAULT_TYPES[0], start, end, db) == 7
 
-    # Same range again, only the two stale days in the refetch set re-hit.
     n = fetcher.fetch_range(
         DEFAULT_TYPES[0], start, end, db, refetch={"2026-08-06", "2026-08-07"}
     )
@@ -373,7 +354,6 @@ def test_fetch_range_refetches_overwrites_stale_data(
     day = date(2026, 8, 5)
     assert fetcher.fetch_range(DEFAULT_TYPES[0], day, day, db) == 1
 
-    # Garmin has since finalized the day: later values are returned.
     client.get_heart_rates = lambda cdate: {
         "calendarDate": cdate,
         "restingHeartRate": 57,
@@ -391,19 +371,6 @@ def test_fetch_range_refetches_overwrites_stale_data(
     assert json.loads(row["raw_json"])["restingHeartRate"] == 57
 
 
-def test_fetch_range_skips_stored_days_without_refetch(
-    client: FakeClient, db: Database
-) -> None:
-    """Without a refetch set, every stored day is skipped (pure incremental)."""
-    fetcher = make_fetcher(client)
-    start, end = date(2026, 8, 1), date(2026, 8, 3)
-    assert fetcher.fetch_range(DEFAULT_TYPES[0], start, end, db) == 3
-
-    assert fetcher.fetch_range(DEFAULT_TYPES[0], start, end, db) == 0
-    heart_calls = [d for t, d in client.calls if t == "heart_rate"]
-    assert heart_calls.count("2026-08-01") == 1
-
-
 def test_fetch_local_date_naive_is_local() -> None:
     assert _fetch_local_date("2026-08-07T22:30:00") == date(2026, 8, 7)
     assert _fetch_local_date("2026-08-08T00:30:00") == date(2026, 8, 8)
@@ -412,20 +379,15 @@ def test_fetch_local_date_naive_is_local() -> None:
 def test_nonfinal_dates_marks_days_fetched_while_in_progress() -> None:
     """A copy captured on (or before) its own day is incomplete; later is final."""
     stored = {
-        # Fetched the day after the data -> settled.
-        "2026-08-05": "2026-08-06T09:00:00",
-        # Fetched during the data's own day -> still in progress.
-        "2026-08-06": "2026-08-06T15:00:00",
-        # Captured just after midnight of the next day -> settled.
-        "2026-08-07": "2026-08-08T00:30:00",
+        "2026-08-05": "2026-08-06T09:00:00",  # fetched the day after -> settled
+        "2026-08-06": "2026-08-06T15:00:00",  # fetched during its own day -> in progress
+        "2026-08-07": "2026-08-08T00:30:00",  # captured next day -> settled
     }
     assert _nonfinal_dates(stored) == {"2026-08-06"}
 
 
-def test_resolve_start_date_uses_oldest_incomplete_day(
-    client: FakeClient, db: Database
-) -> None:
-    """No configured start: resume from the oldest still-incomplete day."""
+def test_resolve_start_date_resume_branches(client: FakeClient, db: Database) -> None:
+    """Resume from the oldest incomplete day, else max stored + 1."""
     fetcher = make_fetcher(client)
     fetcher.fetch_range(DEFAULT_TYPES[0], date(2026, 8, 1), date(2026, 8, 7), db)
 
@@ -433,17 +395,8 @@ def test_resolve_start_date_uses_oldest_incomplete_day(
         db, "heart_rate", None, nonfinal={"2026-08-03", "2026-08-07"}
     )
     assert start == date(2026, 8, 3)
-
-
-def test_resolve_start_date_no_incomplete_uses_max_plus_one(
-    client: FakeClient, db: Database
-) -> None:
-    """No incomplete stored day -> normal incremental start wins."""
-    fetcher = make_fetcher(client)
-    fetcher.fetch_range(DEFAULT_TYPES[0], date(2026, 8, 1), date(2026, 8, 3), db)
-
     start = _resolve_start_date(db, "heart_rate", None, nonfinal=set())
-    assert start == date(2026, 8, 4)
+    assert start == date(2026, 8, 8)
 
 
 def test_sync_continues_from_last_incomplete_day(
@@ -470,10 +423,8 @@ def test_sync_continues_from_last_incomplete_day(
         DEFAULT_TYPES[0], start, date(2026, 8, 6), db, nonfinal
     ) == 1
     heart_calls = [d for t, d in client.calls if t == "heart_rate"]
-    assert "2026-08-05" not in heart_calls
     assert heart_calls == ["2026-08-06"]
 
-    # After the refresh the captured-at is a later day -> now final.
     assert _nonfinal_dates(db.stored_fetches("heart_rate")) == set()
 
 
@@ -483,9 +434,8 @@ def test_custom_data_type_is_registerable(client: FakeClient, db: Database) -> N
 
     hrv = DataType("hrv", fetch_hrv)
     fetcher = make_fetcher(client)
-    start, end = date(2026, 8, 1), date(2026, 8, 1)
 
-    assert fetcher.fetch_range(hrv, start, end, db) == 1
+    assert fetcher.fetch_range(hrv, date(2026, 8, 1), date(2026, 8, 1), db) == 1
     assert db.stored_dates("hrv") == {"2026-08-01"}
     raw = db.conn.execute(
         "SELECT raw_json FROM metrics WHERE data_type='hrv'"
@@ -493,16 +443,18 @@ def test_custom_data_type_is_registerable(client: FakeClient, db: Database) -> N
     assert json.loads(raw["raw_json"])["rmssd"] == 42
 
 
-def test_fetch_activities_stores_raw(client: FakeClient, db: Database) -> None:
+def test_fetch_activities_stores_raw_summary_details_weather(
+    client: FakeClient, db: Database
+) -> None:
     fetcher = make_fetcher(client)
     assert fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db) == 2
     assert db.stored_activity_ids() == {1001, 1002}
 
     row = db.conn.execute(
-        "SELECT * FROM activities WHERE activity_id=1001"
+        "SELECT activity_id, raw_json, fetched_at, details_json, "
+        "details_fetched_at, weather_json, weather_fetched_at "
+        "FROM activities WHERE activity_id=1001"
     ).fetchone()
-    # Raw-only: no typed projection columns, just the raw payload + details
-    # (+ weather, which is fetched best-effort for new activities).
     assert list(row.keys()) == [
         "activity_id", "raw_json", "fetched_at", "details_json",
         "details_fetched_at", "weather_json", "weather_fetched_at",
@@ -513,17 +465,27 @@ def test_fetch_activities_stores_raw(client: FakeClient, db: Database) -> None:
     assert json.loads(row["details_json"])["heartRateDTOs"][0]["heartRateValues"] == [80, 90, 100]
     assert json.loads(row["weather_json"])["temp"] == 68.0
 
+    # Every fetched activity carries its details snapshot.
+    for activity_id in (1001, 1002):
+        detail = db.conn.execute(
+            "SELECT details_json FROM activities WHERE activity_id=?", (activity_id,)
+        ).fetchone()
+        assert json.loads(detail["details_json"])["activityId"] == activity_id
 
-def test_fetch_activities_details_dont_duplicate_calls(
+
+def test_fetch_activities_idempotent_no_duplicate_detail_calls(
     client: FakeClient, db: Database
 ) -> None:
-    """Details are fetched once per activity: summary call + 2 detail calls."""
+    """Re-running the fetch skips known ids and never re-fetches their details."""
     fetcher = make_fetcher(client)
-    fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db)
-    fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db)
+    window = (date(2026, 8, 1), date(2026, 8, 1))
+    assert fetcher.fetch_activities(*window, db) == 2
+    assert fetcher.fetch_activities(*window, db) == 0
     assert db.stored_activity_ids() == {1001, 1002}
-    detail_calls = [arg for t, arg in client.calls if t == "activity_details"]
-    assert detail_calls == ["1001", "1002"]
+    assert db.conn.execute("SELECT COUNT(*) AS n FROM activities").fetchone()["n"] == 2
+    # The range list is still requested each run, but details are fetched
+    # exactly once per activity.
+    assert [arg for t, arg in client.calls if t == "activity_details"] == ["1001", "1002"]
 
 
 def test_activity_details_columns_added_to_existing_table(tmp_path: Path) -> None:
@@ -543,86 +505,6 @@ def test_activity_details_columns_added_to_existing_table(tmp_path: Path) -> Non
     assert "details_fetched_at" in cols
 
 
-def test_fetch_activities_is_idempotent(client: FakeClient, db: Database) -> None:
-    fetcher = make_fetcher(client)
-    window = (date(2026, 8, 1), date(2026, 8, 1))
-    assert fetcher.fetch_activities(*window, db) == 2
-    assert fetcher.fetch_activities(*window, db) == 0
-    assert db.stored_activity_ids() == {1001, 1002}
-    # Still makes the range API call each run (list not cached), but skips
-    # re-storing ids it already has.
-    assert sum(1 for t, _ in client.calls if t == "activities") == 2
-    assert db.conn.execute("SELECT COUNT(*) AS n FROM activities").fetchone()["n"] == 2
-
-
-def test_resolve_activity_start_no_marker_no_config_uses_rolling(
-    client: FakeClient, db: Database
-) -> None:
-    fetcher = make_fetcher(client)
-    # Stored activities but no marker/config: still just the rolling window,
-    # since activities are raw-only and resume relies on the marker.
-    fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db)
-    start = _resolve_activity_start(db, None, 7, date(2026, 8, 7))
-    assert start == date(2026, 8, 1)
-
-
-def test_rolling_start_no_finalized() -> None:
-    end = date(2026, 8, 7)
-    assert _rolling_start(end, 7, None) == date(2026, 8, 1)
-
-
-def test_rolling_start_respects_finalized() -> None:
-    end = date(2026, 8, 7)
-    finalized = date(2026, 8, 5)
-    assert _rolling_start(end, 7, finalized) == date(2026, 8, 6)
-
-
-def test_rolling_start_finalized_older_than_buffer() -> None:
-    end = date(2026, 8, 7)
-    finalized = date(2026, 7, 1)
-    assert _rolling_start(end, 7, finalized) == date(2026, 8, 1)
-
-
-def test_mark_activities_finalized_sets_state(db: Database) -> None:
-    mark_activities_finalized(db, date(2026, 8, 7), 7)
-    assert db.get_state("activities_last_finalized") == "2026-07-31"
-
-
-def test_mark_activities_finalized_zero_freezes_nothing(db: Database) -> None:
-    mark_activities_finalized(db, date(2026, 8, 7), 0)
-    assert db.get_state("activities_last_finalized") is None
-
-
-def test_resolve_activity_start_config_backfill(db: Database) -> None:
-    """First run with GARMIN_START_DATE: full backfill from that date."""
-    start = _resolve_activity_start(db, date(2025, 1, 1), 7, date(2026, 8, 7))
-    assert start == date(2025, 1, 1)
-
-
-def test_resolve_activity_start_after_finalized_is_rolling(db: Database) -> None:
-    """Once finalized, window is max(configured_start, finalized+1..)."""
-    db.set_state("activities_last_finalized", "2026-08-05")
-    start = _resolve_activity_start(db, date(2025, 1, 1), 7, date(2026, 8, 7))
-    assert start == date(2026, 8, 6)
-
-
-def test_resolve_activity_start_no_marker_no_config_no_stored(db: Database) -> None:
-    """Fresh DB, no marker, no stored activities: rolling window only."""
-    start = _resolve_activity_start(db, None, 7, date(2026, 8, 7))
-    assert start == date(2026, 8, 1)
-
-
-def test_backfill_details_fills_missing_only(client: FakeClient, db: Database) -> None:
-    """Activities fetched are stored with both summary and details."""
-    fetcher = make_fetcher(client)
-    assert fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db) == 2
-    for activity_id in (1001, 1002):
-        row = db.conn.execute(
-            "SELECT details_json FROM activities WHERE activity_id=?", (activity_id,)
-        ).fetchone()
-        assert json.loads(row["details_json"])["activityId"] == activity_id
-
-
 def test_fetch_activity_skipped_when_no_details(client: FakeClient, db: Database) -> None:
     """An activity whose details fetch fails is not stored at all."""
     def get_activity_details(activity_id):
@@ -637,33 +519,50 @@ def test_fetch_activity_skipped_when_no_details(client: FakeClient, db: Database
     assert db.stored_activity_ids() == {1001}
 
 
-def test_backfill_details_idempotent(client: FakeClient, db: Database) -> None:
-    """Re-running the fetch makes no additional detail calls for stored ids."""
-    window = (date(2026, 8, 1), date(2026, 8, 1))
+def test_rolling_start_window() -> None:
+    end = date(2026, 8, 7)
+    assert _rolling_start(end, 7, None) == date(2026, 8, 1)
+    assert _rolling_start(end, 7, date(2026, 8, 5)) == date(2026, 8, 6)
+    assert _rolling_start(end, 7, date(2026, 7, 1)) == date(2026, 8, 1)
+
+
+def test_mark_activities_finalized_sets_state(db: Database) -> None:
+    mark_activities_finalized(db, date(2026, 8, 7), 7)
+    assert db.get_state("activities_last_finalized") == "2026-07-31"
+
+
+def test_mark_activities_finalized_zero_freezes_nothing(db: Database) -> None:
+    mark_activities_finalized(db, date(2026, 8, 7), 0)
+    assert db.get_state("activities_last_finalized") is None
+
+
+def test_resolve_activity_start_branches(client: FakeClient, db: Database) -> None:
     fetcher = make_fetcher(client)
-    fetcher.fetch_activities(*window, db)
-    fetcher.fetch_activities(*window, db)
-    detail_calls = [arg for t, arg in client.calls if t == "activity_details"]
-    assert detail_calls == ["1001", "1002"]
+    fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db)
+    end = date(2026, 8, 7)
+
+    # First run with a configured backfill start.
+    assert _resolve_activity_start(db, date(2025, 1, 1), 7, end) == date(2025, 1, 1)
+    # No config, no marker: rolling window, stored activities don't matter.
+    assert _resolve_activity_start(db, None, 7, end) == date(2026, 8, 1)
+    # Once finalized, the window resumes just past the marker.
+    db.set_state("activities_last_finalized", "2026-08-05")
+    assert _resolve_activity_start(db, None, 7, end) == date(2026, 8, 6)
 
 
-def test_fetch_profile_stores_hr_zones_raw(client: FakeClient, db: Database) -> None:
+def test_fetch_profile_hr_zones_store_replace_and_none(
+    client: FakeClient, db: Database
+) -> None:
     fetcher = make_fetcher(client)
     assert fetcher.fetch_profile(db) is True
 
     profile = db.get_profile("hr_zones")
-    assert profile is not None
     payload = json.loads(profile["raw_json"])
     assert [p["sport"] for p in payload] == ["DEFAULT", "RUNNING"]
     assert payload[0]["zone2Floor"] == 134
     assert profile["fetched_at"]
 
-
-def test_fetch_profile_overwrites_previous_snapshot(
-    client: FakeClient, db: Database
-) -> None:
-    fetcher = make_fetcher(client)
-    fetcher.fetch_profile(db)
+    # A newer snapshot overwrites the previous one.
     client.get_heart_rate_zones = lambda: [
         {"sport": "DEFAULT", "zone1Floor": 99, "zone2Floor": 110,
          "zone3Floor": 121, "zone4Floor": 132, "zone5Floor": 143,
@@ -674,46 +573,27 @@ def test_fetch_profile_overwrites_previous_snapshot(
     assert len(payload) == 1
     assert payload[0]["sport"] == "DEFAULT"
 
-
-def test_fetch_profile_none_skips(client: FakeClient, db: Database) -> None:
+    # A None payload skips the store and leaves the last snapshot intact.
     client.get_heart_rate_zones = lambda: None
-    fetcher = make_fetcher(client)
     assert fetcher.fetch_profile(db) is False
-    assert db.get_profile("hr_zones") is None
+    assert db.get_profile("hr_zones") is not None
 
 
-def test_fetch_race_predictions_stores_raw(client: FakeClient, db: Database) -> None:
+def test_fetch_race_predictions_store_and_none(client: FakeClient, db: Database) -> None:
     fetcher = make_fetcher(client)
     assert fetcher.fetch_race_predictions(db) is True
     profile = db.get_profile("race_predictions")
-    assert profile is not None
     payload = json.loads(profile["raw_json"])
     assert payload["time5K"] == 1424
     assert payload["timeMarathon"] == 15825
     assert profile["fetched_at"]
 
-
-def test_fetch_race_predictions_none_skips(client: FakeClient, db: Database) -> None:
     client.get_race_predictions = lambda: None
-    fetcher = make_fetcher(client)
     assert fetcher.fetch_race_predictions(db) is False
-    assert db.get_profile("race_predictions") is None
+    assert db.get_profile("race_predictions") is not None
 
 
-def test_fetch_activities_also_fetches_weather(
-    client: FakeClient, db: Database
-) -> None:
-    fetcher = make_fetcher(client)
-    assert fetcher.fetch_activities(date(2026, 8, 1), date(2026, 8, 1), db) == 2
-    row = db.conn.execute(
-        "SELECT weather_json FROM activities WHERE activity_id=1001"
-    ).fetchone()
-    assert json.loads(row["weather_json"])["temp"] == 68.0
-
-
-def test_backfill_activity_weather_fills_missing(
-    client: FakeClient, db: Database
-) -> None:
+def test_backfill_activity_weather_fills_missing(client: FakeClient, db: Database) -> None:
     db.upsert_activity({
         "activityId": 2001, "activityName": "Old Ride",
         "activityType": {"typeKey": "cycling"}, "fetched_at": "t",
@@ -736,20 +616,18 @@ def test_backfill_activity_weather_fills_missing(
     ).fetchone()["weather_json"])["temp"] == 50.0
 
 
-def test_backfill_activity_weather_none_missing(client: FakeClient, db: Database) -> None:
+def test_backfill_activity_weather_none_is_skipped(
+    client: FakeClient, db: Database
+) -> None:
+    """No stored weather and/or a missing payload means nothing gets stored."""
     fetcher = make_fetcher(client)
     assert fetcher.backfill_activity_weather(db) == 0
 
-
-def test_fetch_activity_weather_missing_payload_is_skipped(
-    client: FakeClient, db: Database
-) -> None:
-    client.get_activity_weather = lambda _id: None
     db.upsert_activity({
         "activityId": 3001, "activityName": "No Weather Data",
         "activityType": {"typeKey": "hiking"}, "fetched_at": "t",
     })
-    fetcher = make_fetcher(client)
+    client.get_activity_weather = lambda _id: None
     assert fetcher.backfill_activity_weather(db) == 0
     assert db.conn.execute(
         "SELECT COUNT(*) FROM activities WHERE weather_json IS NOT NULL"

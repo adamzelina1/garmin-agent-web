@@ -87,7 +87,8 @@ cp .env.example .env
 ```sh
 uv run garmin-fetch                        # incremental sync of all data types + activities
 uv run garmin-fetch --type heart_rate      # sync a subset (repeatable)
-uv run garmin-fetch --parse activities     # reparse stored activity data
+uv run garmin-fetch --parse activities     # incremental reparse of stored activity data
+uv run garmin-fetch --parse --full         # force a full re-parse of every stored row
 uv run garmin-ask "avg sleep last week?"   # one-shot question
 uv run garmin-ask                          # interactive session (/clear, /new)
 uv run garmin-ask-web                      # browser chat UI (auto-persists sessions)

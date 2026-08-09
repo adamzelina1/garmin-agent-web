@@ -75,6 +75,10 @@ CREATE TABLE IF NOT EXISTS activity_summaries (
     max_cadence REAL,
     avg_power_w REAL,
     max_power_w REAL,
+    avg_stride_length_cm REAL,
+    avg_vertical_oscillation_cm REAL,
+    avg_ground_contact_time_ms REAL,
+    avg_vertical_ratio_pct REAL,
     weather_temp_c REAL,
     weather_apparent_c REAL,
     weather_humidity REAL,
@@ -165,6 +169,10 @@ class Database:
         _ensure_columns(self.conn, "activities", ["details_json", "details_fetched_at"])
         _ensure_columns(self.conn, "activities", ["weather_json", "weather_fetched_at"])
         _ensure_columns(self.conn, "activity_summaries", list(self._ACTIVITY_SUMMARY_COLUMNS))
+        _ensure_columns(self.conn, "metrics", ["parsed_at"])
+        _ensure_columns(self.conn, "activities", [
+            "summary_parsed_at", "details_parsed_at", "weather_parsed_at",
+        ])
         self.conn.commit()
 
     # -- Generic raw storage -------------------------------------------------
@@ -314,6 +322,52 @@ class Database:
             for row in self.conn.execute("SELECT calendar_date FROM daily_metrics")
         }
 
+    # -- Parse markers --------------------------------------------------------
+    #
+    # Incremental parsing: each raw row records the ``fetched_at`` it was last
+    # parsed as, so an unchanged row is skipped on the next run. A NULL marker
+    # always means "not parsed yet" (first run after the column was added).
+
+    def metric_parsed_at(self, data_type: str) -> dict[str, str | None]:
+        """Map each stored date to its last-parsed fetched_at (None = never)."""
+        return {
+            row["calendar_date"]: row["parsed_at"]
+            for row in self.conn.execute(
+                "SELECT calendar_date, parsed_at FROM metrics WHERE data_type = ?",
+                (data_type,),
+            )
+        }
+
+    def mark_metric_parsed(self, data_type: str, calendar_date: str) -> None:
+        """Record the raw row's current fetched_at as the parse stamp."""
+        self.conn.execute(
+            "UPDATE metrics SET parsed_at = fetched_at "
+            "WHERE data_type = ? AND calendar_date = ?",
+            (data_type, calendar_date),
+        )
+
+    def activity_parsed_at(self, column: str) -> dict[int, str]:
+        """Map each activity id to its last parsed stamp for ``column``."""
+        return {
+            row["activity_id"]: row[column]
+            for row in self.conn.execute(
+                f"SELECT activity_id, {column} FROM activities"
+            )
+        }
+
+    def mark_activity_parsed(
+        self, activity_id: int, marker: str, raw_col: str
+    ) -> None:
+        """Record the activity's raw ``raw_col`` fetch stamp into ``marker``.
+
+        ``marker`` is one of summary/details/weather parse stamps; ``raw_col``
+        is the raw ``activities`` column whose value becomes the marker.
+        """
+        self.conn.execute(
+            f"UPDATE activities SET {marker} = {raw_col} WHERE activity_id = ?",
+            (activity_id,),
+        )
+
     # -- Activity summaries ---------------------------------------------------
 
     _ACTIVITY_SUMMARY_COLUMNS = (
@@ -328,6 +382,8 @@ class Database:
         "min_respiration_rate", "avg_respiration_rate", "max_respiration_rate",
         "body_battery_change", "water_estimated_ml", "is_pr",
         "avg_cadence", "max_cadence", "avg_power_w", "max_power_w",
+        "avg_stride_length_cm", "avg_vertical_oscillation_cm",
+        "avg_ground_contact_time_ms", "avg_vertical_ratio_pct",
         "weather_temp_c", "weather_apparent_c", "weather_humidity",
         "weather_wind_kmh", "weather_station", "weather_description",
     )
