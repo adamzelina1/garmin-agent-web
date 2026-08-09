@@ -258,6 +258,31 @@ def predict_today(df: pd.DataFrame, model: xgb.XGBRegressor) -> pd.DataFrame:
     }])
 
 
+def refresh_forecast(db_path: str | Path) -> int:
+    """Train, predict today, and write the forecast (post-sync hook).
+
+    This is the quiet entrypoint ``garmin-fetch`` calls at the end of a sync so
+    the ``ml_forecast`` row is fresh without a separate ``garmin-ml --write``
+    run. Like ``main``, the model is retrained from scratch on the current
+    ``daily_metrics``. Thin data is not an error: it returns 0 and the caller
+    logs it, it never raises.
+    """
+    try:
+        df = load_daily_frame(db_path)
+        if df.empty:
+            return 0
+    except sqlite3.OperationalError:
+        # No daily_metrics yet (fresh DB / first sync) — nothing to train on.
+        return 0
+    try:
+        result = evaluate(df)
+    except ValueError:
+        return 0
+    model = result.pop("model")
+    today = predict_today(df, model)
+    return write_forecast(db_path, today, "xgb_stress_v1")
+
+
 def write_forecast(
     db_path: str | Path, forecast: pd.DataFrame, model_name: str
 ) -> int:

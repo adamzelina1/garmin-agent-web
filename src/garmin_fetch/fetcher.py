@@ -241,6 +241,7 @@ def sync_data(
     include_activities: bool = True,
     include_profile: bool = True,
     parse: bool = True,
+    forecast: bool = False,
 ) -> dict[str, int]:
     """Incremental sync of one or more data types from Garmin into SQLite.
 
@@ -249,8 +250,10 @@ def sync_data(
     backfills activity summaries for the same window. If ``include_profile``
     (default True), refreshes the heart-rate zone profile snapshot. After
     fetching, the newly stored raw metrics are parsed into ``daily_metrics``
-    (unless ``parse`` is False). Returns {type_name: dates_fetched} plus
-    optional {"activities": count} and {"hr_zones": rows}.
+    (unless ``parse`` is False). If ``forecast`` (default False), retrains the
+    readiness model and writes today's prediction into ``ml_forecast``.
+    Returns {type_name: dates_fetched} plus optional {"activities": count} and
+    {"hr_zones": rows}.
     """
     config = load_config()
     db = Database(config["db_path"])
@@ -331,6 +334,22 @@ def sync_data(
                     zone_parsed.get("hr_zones", 0),
                     race_parsed.get("race_predictions", 0),
                 )
+        if forecast:
+            # Retrain the readiness model on the freshly parsed data and write
+            # today's prediction. Non-fatal: thin/incomplete data is logged and
+            # the sync still succeeds.
+            from .ml import refresh_forecast
+
+            try:
+                forecast_rows = refresh_forecast(config["db_path"])
+            except Exception:
+                logger.exception("ML forecast refresh failed")
+                forecast_rows = 0
+            counts["ml_forecast"] = forecast_rows
+            logger.info(
+                "refreshed ML forecast: wrote %d row(s) to ml_forecast",
+                forecast_rows,
+            )
     finally:
         db.close()
     return counts
@@ -476,6 +495,11 @@ def main() -> None:
         help="With --parse: force a full re-parse of every stored row, "
         "ignoring incremental change markers.",
     )
+    parser.add_argument(
+        "--no-forecast", action="store_true",
+        help="After syncing, do NOT retrain the readiness model and refresh the "
+        "ml_forecast row (which is the default).",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -558,17 +582,20 @@ def main() -> None:
     types = resolve_types(type_names or None)
 
     include_activities = want_activities or not type_names or want_profile
+    forecast = not args.no_forecast
     if args.range:
         counts = sync_data(
             types=types, start=args.range[0], end=args.range[1],
             include_activities=include_activities,
             include_profile=want_profile or not type_names,
+            forecast=forecast,
         )
     else:
         counts = sync_data(
             types=types,
             include_activities=include_activities,
             include_profile=want_profile or not type_names,
+            forecast=forecast,
         )
 
     total = sum(counts.values())

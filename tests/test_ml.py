@@ -13,6 +13,7 @@ from garmin_fetch.ml import (
     evaluate,
     predict_today,
     load_daily_frame,
+    refresh_forecast,
     write_forecast,
 )
 
@@ -151,3 +152,23 @@ def test_write_forecast_upserts_and_is_idempotent(tmp_path: Path) -> None:
     ).fetchall()
     assert rows == [("2026-09-01", "xgb_test"), ("2026-09-02", "xgb_test")]
     conn.close()
+
+
+def test_refresh_forecast_trains_and_writes_one_row(tmp_path: Path) -> None:
+    db = _seed_db(tmp_path / "g.db", n_days=100)
+    assert refresh_forecast(db) == 1
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT calendar_date, model FROM ml_forecast ORDER BY calendar_date"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][1] == "xgb_stress_v1"
+    conn.close()
+
+
+def test_refresh_forecast_is_safe_on_thin_or_empty_data(tmp_path: Path) -> None:
+    # No table at all → 0, never raises.
+    assert refresh_forecast(tmp_path / "empty.db") == 0
+    # Too few usable rows → 0, never raises.
+    db = _seed_db(tmp_path / "g.db", n_days=10)
+    assert refresh_forecast(db) == 0
