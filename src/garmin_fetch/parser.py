@@ -15,7 +15,7 @@ Design rules for every extractor:
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 
@@ -45,9 +45,16 @@ def _hours(seconds: Any) -> float | None:
 
 
 def _local_time(epoch_ms: Any) -> str | None:
-    """Epoch-millis timestamp as a local ``HH:MM`` time, or None."""
+    """Epoch-millis 'Local' timestamp as a wall-clock ``HH:MM``, or None.
+
+    Garmin's ``*TimestampLocal`` fields are epoch millis with the UTC offset
+    already applied (``sleepStartTimestampLocal`` == the local wall-clock time
+    encoded as if it were UTC). Interpreting the value in UTC recovers that
+    wall clock; ``datetime.fromtimestamp`` without a tz would apply the host
+    timezone's offset on top, shifting it by the UTC offset again.
+    """
     if isinstance(epoch_ms, (int, float)):
-        return datetime.fromtimestamp(epoch_ms / 1000).strftime("%H:%M")
+        return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC).strftime("%H:%M")
     return None
 
 

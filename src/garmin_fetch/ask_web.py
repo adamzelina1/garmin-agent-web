@@ -93,7 +93,12 @@ def _messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
 
 
 def _parse_block(raw: str) -> dict[str, Any] | None:
-    """Parse a fenced/plain JSON figure block, or None if malformed."""
+    """Parse a fenced/plain JSON figure block, or None if malformed.
+
+    Tolerates trailing filler after the JSON object (the chart tool appends a
+    ``(query returned N rows)`` note, which a model may echo inside the tags):
+    first a strict parse, then a raw JSON-prefix decode.
+    """
     raw = raw.strip()
     if raw.startswith(("```", "~~~")):
         raw = raw.strip("`~")
@@ -106,7 +111,11 @@ def _parse_block(raw: str) -> dict[str, Any] | None:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return None
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(raw[raw.find("{"):])
+        except (json.JSONDecodeError, ValueError):
+            return None
+        data = obj
     return data if isinstance(data, dict) else None
 
 

@@ -27,6 +27,7 @@ def load_config() -> dict[str, str]:
     llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     llm_base_url = os.getenv("LLM_BASE_URL", "")
     llm_api_key = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    llm_reasoning_effort = os.getenv("LLM_REASONING_EFFORT", "high")
 
     weather_home_lat = os.getenv("GARMIN_HOME_LAT", "")
     weather_home_lon = os.getenv("GARMIN_HOME_LON", "")
@@ -77,6 +78,7 @@ def load_config() -> dict[str, str]:
         "llm_model": llm_model,
         "llm_base_url": llm_base_url,
         "llm_api_key": llm_api_key,
+        "llm_reasoning_effort": llm_reasoning_effort,
         "memory_file": memory_file,
         "weather_home_lat": weather_home_lat,
         "weather_home_lon": weather_home_lon,

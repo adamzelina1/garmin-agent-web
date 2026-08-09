@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,22 @@ _DEFAULT_FILE = Path(_trace_env) if _trace_env else PROJECT_ROOT / "ask_trace.js
 
 def _clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[:n] + f"…(+{len(text) - n} more)"
+
+
+def _utf8_console() -> None:
+    """Reconfigure stdout/stderr to UTF-8 so emoji in traces render anywhere.
+
+    Windows consoles default to the OEM/cp1252 codepage; printing trace content
+    (charts, emoji) then raises UnicodeEncodeError. Overriding the stream's
+    encoding sidesteps the console codepage entirely.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
 
 
 def summarize(messages: list[Any]) -> list[dict[str, Any]]:
@@ -222,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    _utf8_console()
     path = args.file or str(_DEFAULT_FILE)
     records = _iter_records(path)
     if args.tool:

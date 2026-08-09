@@ -133,6 +133,25 @@ def test_extract_charts_accepts_unclosed_block() -> None:
     assert "trailing filler after the JSON" in text
 
 
+def test_extract_charts_tolerates_row_count_note_in_closed_block() -> None:
+    """A model piping the tool's ``OK: <spec> (query returned N rows)`` reply
+    verbatim must still render: the JSON prefix survives the trailing note."""
+    figure = {
+        "sql": "SELECT calendar_date FROM daily_metrics",
+        "traces": [{"go": "Bar", "x": "calendar_date"}],
+        "layout": {},
+    }
+    raw = (
+        "<chart>"
+        f"  {json.dumps(figure)} (4 rows)"
+        "</chart>"
+    )
+    text, charts = _extract_charts(raw)
+    assert text == ""
+    assert len(charts) == 1
+    assert charts[0]["sql"] == figure["sql"]
+
+
 def test_extract_charts_accepts_fenced_unclosed_block() -> None:
     figure = {"data": []}
     raw = (

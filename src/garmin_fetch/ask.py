@@ -112,16 +112,24 @@ full aggregation.
 
 When asked for a chart or visualization: call the chart tool to validate a
 spec. The spec is a JSON object of your OWN design (you write the graph, not
-the data): {{"sql": "SELECT ...", "traces": [{{"type": "...", "x": "...", "y":
-"...", "name": "..."}}], "layout": {{"title": {{"text": "..."}}}}}}. The `sql`
-must return the plotted data itself (column names x/y reference its result).
-Keep points to at most ~200 by aggregating (GROUP BY week/month/weekday) and
-ORDER BY time columns. The chart tool runs the query, checks your columns
-exist, and returns "OK: <spec>" if valid. Embed that returned spec JSON
-VERBATIM in the final answer wrapped in <chart> ... </chart> (one per chart)
-and add a short one-sentence description of what it shows as normal text.
-Available trace types: line, scatter, area, bar, pie, histogram, box. Do NOT
-paste query data or Python code into your answer — only the spec.
+the data): {{"sql": "SELECT ...", "traces": [{{...}}], "layout": {{"title":
+{{"text": "..."}}}}}}. The `sql` must return the plotted data itself (column
+names in the traces reference its result). You are free to draw ANY Plotly
+figure: each trace names a plotly.graph_objects class via "go" (e.g. "Scatter",
+"Scattergl", "Violin", "Heatmap", "Pie", "Bar", "Candlestick") — the compact
+aliases line / scatter / area / bar / pie / histogram / box also work. Data
+columns are referenced by name in x / y / z, and any other numeric trace
+argument can reference a column as {{"column": "<name>"}} (e.g. for a pie:
+{{"labels": {{"column": "sport_type"}}, "values": {{"column": "hours"}}}}).
+Every remaining key in a trace is passed straight to the Plotly constructor
+(mode, marker, line, opacity, orientation, colorscale, text, ...). Keep points
+to at most ~200 by aggregating (GROUP BY week/month/weekday) and ORDER BY time
+columns. The chart tool runs the query, checks every referenced column exists
+and the trace can be built, and returns "OK: <spec> (query returned N rows)" if
+valid. Embed only the spec JSON — the object after "OK: " — VERBATIM in the
+final answer wrapped in <chart> ... </chart> (one per chart) and add a short
+one-sentence description of what it shows as normal text. Do NOT paste query
+data or Python code into your answer — only the spec.
 
 Weather: observed conditions during a workout are already stored per activity
 in activity_summaries (weather_temp_c, weather_apparent_c, weather_humidity,
@@ -202,12 +210,71 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-_CHART_TYPES = ("line", "scatter", "bar", "pie", "histogram", "area", "box")
+_CHART_TYPES = (
+    "line", "scatter", "area", "bar", "pie", "histogram", "box",
+)
+
+#: Legacy trace aliases mapped to plotly.graph_objects classes, with the default
+#: styling the old hand-built builder chose. New specs may pass any Plotly trace
+#: class via the "go" key; these aliases just keep the compact shorthand working.
+_LEGACY_TRACES: dict[str, dict[str, Any]] = {
+    "line": {"go": "Scatter", "defaults": {"mode": "lines+markers"}},
+    "scatter": {"go": "Scatter", "defaults": {"mode": "markers"}},
+    "area": {"go": "Scatter", "defaults": {"mode": "lines", "fill": "tozeroy"}},
+    "bar": {"go": "Bar"},
+    "pie": {"go": "Pie"},
+    "histogram": {"go": "Histogram"},
+    "box": {"go": "Box"},
+}
+
+
+def _go_class_name(go: Any, name: str) -> str | None:
+    """Return a valid plotly.graph_objects trace class name for ``name`` or None.
+
+    Plotly's trace classes are CamelCase and lazily exposed as attributes, so
+    accept the exact name or a lowercase variant (``scatter`` -> ``Scatter``).
+    """
+    for candidate in (name, name[:1].upper() + name[1:]):
+        cls = getattr(go, candidate, None)
+        if isinstance(cls, type):
+            return candidate
+    return None
+
+
+def _trace_column_refs(trace: dict[str, Any]) -> list[str]:
+    """Collect the result columns a trace references.
+
+    ``x``/``y``/``z`` set to a column name are references; every nested value
+    written as ``{"column": "col"}`` is one too (how data reaches arbitrary
+    trace params, e.g. ``{"labels": {"column": "sport"}}``).
+    """
+    refs: list[str] = []
+    for key in ("x", "y", "z"):
+        value = trace.get(key)
+        if isinstance(value, str):
+            refs.append(value)
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if set(value) == {"column"} and isinstance(value.get("column"), str):
+                refs.append(value["column"])
+            else:
+                for child in value.values():
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for value in trace.values():
+        walk(value)
+    return refs
 
 
 def _chart_spec_error(spec: dict[str, Any], result: dict[str, Any]) -> str | None:
-    """Validate a chart spec against an executed query; return an error string
+    """Validate a chart spec against an executed result; return an error string
     or None if the spec is usable."""
+    import plotly.graph_objects as go
+
     columns = result["columns"]
     rows = result["rows"]
     if not rows:
@@ -218,22 +285,22 @@ def _chart_spec_error(spec: dict[str, Any], result: dict[str, Any]) -> str | Non
     for i, tr in enumerate(traces):
         if not isinstance(tr, dict):
             return f"ERROR: trace {i} must be an object"
-        kind = tr.get("type")
-        if kind not in _CHART_TYPES:
+        name = tr.get("go") if isinstance(tr.get("go"), str) else tr.get("type")
+        if not isinstance(name, str) or not name:
+            return f"ERROR: trace {i} needs a 'go' or a 'type' name"
+        if name not in _LEGACY_TRACES and _go_class_name(go, name) is None:
             return (
-                f"ERROR: trace {i} type must be one of: {', '.join(_CHART_TYPES)}"
+                f"ERROR: trace {i} class {name!r} is not a valid chart type. "
+                f"Use one of: {', '.join(_CHART_TYPES)} "
+                "or a plotly.graph_objects class name "
+                "(e.g. Scatter, Scattergl, Violin, Heatmap, Pie)"
             )
-        for col in (tr.get("x"), tr.get("y")):
-            if col is not None and col not in columns:
+        for col in _trace_column_refs(tr):
+            if col not in columns:
                 return (
                     f"ERROR: trace {i} references column {col!r} which is not in "
                     f"the query result columns {columns}"
                 )
-        if kind == "histogram":
-            if not tr.get("x"):
-                return f"ERROR: trace {i} (histogram) needs an 'x' column"
-        elif not tr.get("x") or not tr.get("y"):
-            return f"ERROR: trace {i} needs both 'x' and 'y' columns"
     layout = spec.get("layout")
     if layout is not None and not isinstance(layout, dict):
         return "ERROR: 'layout' must be a JSON object"
@@ -259,30 +326,48 @@ def _build_chart_figure(
     def _data(col: str) -> list[Any]:
         return [r[columns.index(col)] for r in rows]
 
+    def _resolve(value: Any) -> Any:
+        """Replace data references with their column values, pass rest through.
+
+        A dict of the exact shape ``{"column": "name"}`` becomes that column's
+        data; everything else (raw strings, numbers, marker/line/color config
+        dicts, arrays) is passed verbatim to the Plotly constructor.
+        """
+        if isinstance(value, dict):
+            if set(value) == {"column"} and isinstance(value.get("column"), str):
+                return _data(value["column"])
+            return {k: _resolve(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_resolve(v) for v in value]
+        return value
+
     traces: list[Any] = []
     for tr in spec["traces"]:
-        kind = tr["type"]
-        name = tr.get("name")
-        if kind == "line":
-            traces.append(
-                go.Scatter(x=_data(tr["x"]), y=_data(tr["y"]), mode="lines+markers", name=name)
-            )
-        elif kind == "scatter":
-            traces.append(
-                go.Scatter(x=_data(tr["x"]), y=_data(tr["y"]), mode="markers", name=name)
-            )
-        elif kind == "area":
-            traces.append(
-                go.Scatter(x=_data(tr["x"]), y=_data(tr["y"]), mode="lines", fill="tozeroy", name=name)
-            )
-        elif kind == "bar":
-            traces.append(go.Bar(x=_data(tr["x"]), y=_data(tr["y"]), name=name))
-        elif kind == "pie":
-            traces.append(go.Pie(labels=_data(tr["x"]), values=_data(tr["y"]), name=name))
-        elif kind == "histogram":
-            traces.append(go.Histogram(x=_data(tr["x"]), name=name))
-        elif kind == "box":
-            traces.append(go.Box(x=_data(tr["x"]), y=_data(tr["y"]), name=name))
+        if isinstance(tr.get("go"), str):
+            legacy = None
+            go_name = tr["go"]
+        else:
+            name = tr.get("type")
+            legacy = _LEGACY_TRACES.get(name) if isinstance(name, str) else None
+            go_name = name if legacy is None else legacy["go"]
+        kwargs: dict[str, Any] = {}
+        for key, value in tr.items():
+            if key in ("type", "go"):
+                continue
+            if key in ("x", "y", "z") and isinstance(value, str) and value in columns:
+                kwargs[key] = _data(value)
+            else:
+                kwargs[key] = _resolve(value)
+        if legacy is not None:
+            for key, value in legacy.get("defaults", {}).items():
+                kwargs.setdefault(key, value)
+            if legacy["go"] == "Pie":
+                if "labels" not in kwargs and "x" in kwargs:
+                    kwargs["labels"] = kwargs.pop("x")
+                if "values" not in kwargs and "y" in kwargs:
+                    kwargs["values"] = kwargs.pop("y")
+        cls = getattr(go, go_name, None) or getattr(go, _go_class_name(go, go_name))
+        traces.append(cls(**kwargs))
 
     fig = go.Figure(data=traces)
     layout = spec.get("layout")
@@ -677,6 +762,7 @@ def build_agent(
     model_name: str,
     base_url: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
     model: Any = None,
     memory: Memory | None = None,
     weather: "Weather | None" = None,
@@ -684,17 +770,25 @@ def build_agent(
     """Build the Pydantic AI agent wired to ``db`` tools.
 
     Pass ``model`` (e.g. ``TestModel``) to override the transport for tests.
-    Pass ``memory`` to give the agent get/remember/forget tools over a durable
-    user profile (long-term memory between sessions).
+    Pass ``reasoning_effort`` to request a reasoning effort level from the
+    underlying model (``low``/``medium``/``high``). Pass ``memory`` to give
+    the agent get/remember/forget tools over a durable user profile (long-term
+    memory between sessions).
     """
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
     if model is None:
+        model_settings = (
+            {"openai_reasoning_effort": reasoning_effort}
+            if reasoning_effort
+            else None
+        )
         model = OpenAIChatModel(
             model_name,
             provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+            settings=model_settings,
         )
     system_prompt = _SYSTEM_PROMPT.format(today=date.today().isoformat())
     schema = _schema_text(db)
@@ -746,19 +840,29 @@ def build_agent(
 
         ``spec`` is a JSON object describing a Plotly figure:
           {
-            "sql": "SELECT ...",                     # read-only; must return the data
-            "traces": [                            # one or more traces
-              {"type": "bar",         # line|scatter|area|bar|pie|histogram|box
-               "x": "<result column>",
-               "y": "<numeric result column>",     # omit y for histogram
-               "name": "optional legend label"}
+            "sql": "SELECT ...",              # read-only; must return the data
+            "traces": [                      # one or more traces
+              {
+                "go": "Scatter",   # any plotly.graph_objects class name
+                                   # ("Scattergl", "Violin", "Heatmap", "Pie",
+                                   #  "Bar", "Candlestick", ...) or the compact
+                                   #  alias "type": line|scatter|area|bar|pie|
+                                   #  histogram|box
+                "x": "<result column>",      # column: use x / y / z by name
+                "y": "<numeric result column>",
+                "mode": "markers",           # any other key is passed straight
+                "marker": {"color": "red"}   # to the Plotly constructor
+              }
             ],
             "layout": {"title": {"text": "..."}, ...}   # optional Plotly layout
           }
-        This runs ``sql`` to confirm it works and columns exist, then returns the
-        same spec (with your title layout) for you to embed VERBATIM in the
-        final answer wrapped in <chart> ... </chart> tags. It never returns the
-        data itself — the UI reruns the query to draw the chart.
+        Any numeric trace argument may also reference a column explicitly as
+        {"column": "<name>"} (e.g. pie labels/values). This runs ``sql`` to
+        confirm it works and that every referenced column exists, builds the
+        figure to check the trace is constructible, then returns the same spec
+        (with your title layout) for you to embed VERBATIM in the final answer
+        wrapped in <chart> ... </chart> tags. It never returns the data
+        itself — the UI reruns the query to draw the chart.
         """
         try:
             import json as _json
@@ -779,7 +883,11 @@ def build_agent(
             _build_chart_figure(parsed, result)
         except ValueError as exc:
             return _tool_error(exc)
-        return "OK: " + _json.dumps(parsed, ensure_ascii=False)
+        rows = result.get("rows") or []
+        return (
+            "OK: " + _json.dumps(parsed, ensure_ascii=False)
+            + f" (query returned {len(rows)} rows)"
+        )
 
     if weather is not None:
 
@@ -858,6 +966,7 @@ def _build_agent(cfg: dict[str, str], db: ReadOnlyDB) -> Any:
         model_name=cfg["llm_model"],
         base_url=base_url,
         api_key=api_key,
+        reasoning_effort=cfg.get("llm_reasoning_effort") or None,
         memory=memory,
         weather=weather,
     )

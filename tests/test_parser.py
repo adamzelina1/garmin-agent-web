@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -108,10 +108,10 @@ def test_parse_sleep_flat_and_score() -> None:
     assert out["hrv_status"] == "BALANCED"
     assert re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", out["sleep_start_local"])
     assert out["sleep_start_local"] == datetime.fromtimestamp(
-        1737158617000 / 1000
+        1737158617000 / 1000, tz=UTC
     ).strftime("%H:%M")
     assert out["sleep_end_local"] == datetime.fromtimestamp(
-        1737169417000 / 1000
+        1737169417000 / 1000, tz=UTC
     ).strftime("%H:%M")
     assert "sleep_time_seconds" not in out
     assert "avg_overnight_hrv" not in out

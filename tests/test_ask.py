@@ -254,6 +254,87 @@ def test_chart_spec_builds_histogram(db_path: str) -> None:
     assert fig.to_dict()["data"][0]["type"] == "histogram"
 
 
+def test_chart_go_route_custom_trace_kwargs(db_path: str) -> None:
+    db = ReadOnlyDB(db_path)
+    result = _chart_result(
+        db,
+        "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date",
+    )
+    fig = _build_chart_figure(
+        {
+            "sql": "SELECT calendar_date, resting_hr FROM daily_metrics ORDER BY calendar_date",
+            "traces": [
+                {
+                    "go": "Violin",
+                    "y": "resting_hr",
+                    "name": "RHR",
+                    "box_visible": True,
+                    "meanline": {"visible": True},
+                    "marker": {"color": "rgba(0,0,0,0.6)"},
+                }
+            ],
+        },
+        result,
+    )
+    data = fig.to_dict()["data"][0]
+    assert data["type"] == "violin"
+    assert data["box"]["visible"] is True
+    assert data["meanline"]["visible"] is True
+    assert len(data["y"]) == 3
+
+
+def test_chart_go_route_pie_with_column_refs(db_path: str) -> None:
+    db = ReadOnlyDB(db_path)
+    result = _chart_result(
+        db,
+        "SELECT calendar_date, resting_hr FROM daily_metrics",
+    )
+    fig = _build_chart_figure(
+        {
+            "sql": "SELECT calendar_date, resting_hr FROM daily_metrics",
+            "traces": [
+                {
+                    "go": "Pie",
+                    "labels": {"column": "calendar_date"},
+                    "values": {"column": "resting_hr"},
+                }
+            ],
+        },
+        result,
+    )
+    data = fig.to_dict()["data"][0]
+    assert data["type"] == "pie"
+    assert data["labels"] == ["2026-08-01", "2026-08-02", "2026-08-03"]
+    assert data["values"] == [51, 50, 52]
+
+
+def test_chart_go_route_scattergl(db_path: str) -> None:
+    db = ReadOnlyDB(db_path)
+    result = _chart_result(db, "SELECT resting_hr FROM daily_metrics")
+    fig = _build_chart_figure(
+        {
+            "sql": "SELECT resting_hr FROM daily_metrics",
+            "traces": [{"go": "Scattergl", "x": "resting_hr", "mode": "markers"}],
+        },
+        result,
+    )
+    assert fig.to_dict()["data"][0]["type"] == "scattergl"
+
+
+def test_chart_go_route_unknown_class_rejected(db_path: str) -> None:
+    db = ReadOnlyDB(db_path)
+    result = _chart_result(db, "SELECT resting_hr FROM daily_metrics")
+    err = _chart_spec_error(
+        {
+            "sqlxxx": "SELECT resting_hr FROM daily_metrics",
+            "traces": [{"go": "BogusTrace", "y": "resting_hr"}],
+        },
+        result,
+    )
+    assert err is not None
+    assert "BogusTrace" in err
+
+
 def test_chart_spec_errors() -> None:
     spec = {
         "sql": "SELECT calendar_date, resting_hr FROM daily_metrics",
@@ -387,7 +468,7 @@ def test_agent_memory_get_tool_offline(db_path: str, tmp_path) -> None:
 def test_session_loop_keeps_context(db_path: str, monkeypatch, capsys) -> None:
     from pydantic_ai.models.test import TestModel
 
-    def fake_build(db, *, model_name, base_url=None, api_key=None, model=None, memory=None, weather=None):
+    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
         return build_agent(
             db,
             model_name=model_name,
@@ -439,7 +520,7 @@ def test_session_with_file_persistence(db_path: str, tmp_path, monkeypatch, caps
 
     from garmin_fetch.ask import _ask_session
 
-    def fake_build(db, *, model_name, base_url=None, api_key=None, model=None, memory=None, weather=None):
+    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
         return build_agent(
             db,
             model_name=model_name,
@@ -478,7 +559,7 @@ def test_session_clear_command_drops_context(db_path, tmp_path, monkeypatch, cap
 
     from garmin_fetch.ask import _load_session
 
-    def fake_build(db, *, model_name, base_url=None, api_key=None, model=None, memory=None, weather=None):
+    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
         return build_agent(
             db,
             model_name=model_name,
@@ -513,7 +594,7 @@ def test_session_new_command_compacts_context(db_path, tmp_path, monkeypatch, ca
 
     from garmin_fetch.ask import _load_session
 
-    def fake_build(db, *, model_name, base_url=None, api_key=None, model=None, memory=None, weather=None):
+    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
         return build_agent(
             db,
             model_name=model_name,
@@ -546,7 +627,7 @@ def test_session_new_command_compacts_context(db_path, tmp_path, monkeypatch, ca
 def test_session_new_with_empty_history_starts_fresh(db_path, tmp_path, monkeypatch, capsys) -> None:
     from pydantic_ai.models.test import TestModel
 
-    def fake_build(db, *, model_name, base_url=None, api_key=None, model=None, memory=None, weather=None):
+    def fake_build(db, *, model_name, base_url=None, api_key=None, reasoning_effort=None, model=None, memory=None, weather=None):
         return build_agent(
             db,
             model_name=model_name,
