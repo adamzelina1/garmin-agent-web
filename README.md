@@ -34,7 +34,7 @@ Garmin Connect ──▶ fetcher ──▶ SQLite (raw JSON, source of truth) �
 - **Token-efficient by design.** The schema is baked into the system prompt so
   the model writes correct SQL instead of guessing column names, tool errors are
   deduplicated, and prompt caching is surfaced per turn via `garmin-trace`.
-- **Fully tested.** 136 tests run offline (fake Garmin client + a scripted
+- **Fully tested.** 88 tests run offline (fake Garmin client + a scripted
   test model) — no API keys or network needed.
 
 ## Data model
