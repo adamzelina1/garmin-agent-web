@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS activity_summaries (
     weather_apparent_c REAL,
     weather_humidity REAL,
     weather_wind_kmh REAL,
-    weather_station TEXT,
     weather_description TEXT,
     fetched_at TEXT
 );
@@ -385,7 +384,7 @@ class Database:
         "avg_stride_length_cm", "avg_vertical_oscillation_cm",
         "avg_ground_contact_time_ms", "avg_vertical_ratio_pct",
         "weather_temp_c", "weather_apparent_c", "weather_humidity",
-        "weather_wind_kmh", "weather_station", "weather_description",
+        "weather_wind_kmh", "weather_description",
     )
 
     def upsert_activity_summary(

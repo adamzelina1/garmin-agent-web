@@ -741,7 +741,6 @@ def test_parse_activity_weather_converts_and_handles_blank() -> None:
     assert out["weather_apparent_c"] == pytest.approx((66 - 32) * 5 / 9, rel=1e-2)
     assert out["weather_humidity"] == 60
     assert out["weather_wind_kmh"] == pytest.approx(10 * 1.609344, rel=1e-2)
-    assert out["weather_station"] == "Bratislava Ivanka"
     assert out["weather_description"] == "Fair"
     # windGust arrives as null from Garmin and is intentionally not parsed.
     assert "weather_wind_gust_kmh" not in out
@@ -769,7 +768,6 @@ def test_build_activity_weather_projects_and_ignores_missing(db: Database) -> No
     ).fetchone()
     assert row["weather_temp_c"] == pytest.approx((68 - 32) * 5 / 9, rel=1e-2)
     assert row["weather_wind_kmh"] == pytest.approx(10 * 1.609344, rel=1e-2)
-    assert row["weather_station"] == "LZIB"
     assert row["weather_description"] == "Fair"
     assert row["fetched_at"] == "wt"
 

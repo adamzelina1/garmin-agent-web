@@ -876,9 +876,6 @@ def parse_activity_weather(payload: dict[str, Any]) -> dict[str, Any]:
     wind = _mph_to_kmh(payload.get("windSpeed"))
     if wind is not None:
         out["weather_wind_kmh"] = wind
-    station = _get(payload, "weatherStationDTO", "name")
-    if isinstance(station, str) and station:
-        out["weather_station"] = station
     description = _get(payload, "weatherTypeDTO", "desc")
     if isinstance(description, str) and description:
         out["weather_description"] = description

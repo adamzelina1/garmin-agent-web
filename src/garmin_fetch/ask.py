@@ -72,7 +72,7 @@ Only six tables are available and you may only query these:
 - activity_summaries: one row per activity (activity_id), curated summary fields.
   Also carries per-activity observed weather when Garmin recorded it:
   weather_temp_c / weather_apparent_c (degC), weather_humidity (0-100),
-  weather_wind_kmh / weather_wind_gust_kmh (km/h), weather_station, and
+  weather_wind_kmh / weather_wind_gust_kmh (km/h), and
   weather_description (e.g. "Fair"). Indoor or weatherless activities have
   NULLs here.
 - activity_detail_series: the intra-activity time series, one row per tick
@@ -145,7 +145,7 @@ data or Python code into your answer — only the spec.
 
 Weather: observed conditions during a workout are already stored per activity
 in activity_summaries (weather_temp_c, weather_apparent_c, weather_humidity,
-weather_wind_kmh, weather_station, weather_description) — prefer those columns
+weather_wind_kmh, weather_description) — prefer those columns
 whenever a question is about the weather at the time/location of a stored
 activity. The `weather` tool is for what the stored data does NOT cover: (1) the short forecast (today/tomorrow),
 (2) historical weather for days with no activity (e.g. correlate a restless
