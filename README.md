@@ -2,20 +2,24 @@
 
 Fetch Garmin Connect data into Postgres, then ask a read-only AI agent
 questions about it — sleep, resting HR, HRV, training load, activity zones —
-and get answers with charts and weather context.
-
-**Phase 3 made it multi-user:** accounts authenticate with email+password
-(JWT), bind their own Garmin account (encrypted AES-GCM credentials), sync in
-background worker threads, and every data row is scoped per account by
-Postgres Row-Level Security. The LLM agent runs as a SELECT-only PG role, so
-it is provably confined to one user's rows even if its statement gate is ever
-removed.
+and get answers with charts and weather context. A self-hosted web app
+(Chat · Readiness · ACWR · Training Plan · Settings) keeps the derived
+metrics and plan in the same database the agent queries, so the UI and the AI
+always agree.
 
 ```
 Garmin Connect ──▶ sync worker ──▶ Postgres (raw JSON, source of truth) ──▶ parser ──▶ typed tables
                                        ▲  (user_id + RLS on every row)        │
     JS frontend ─▶ FastAPI (JWT) ──▶ garmin-ask agent (read-only role) ◀──────┘
+                                           │
+                                     derived_metrics (readiness, ACWR)
 ```
+
+Accounts authenticate with email+password (JWT), bind their own Garmin account
+(credentials encrypted AES-GCM), and sync in background worker threads. Every
+data row is scoped per account by Postgres Row-Level Security; the LLM agent
+runs as a SELECT-only PG role, so it is provably confined to one user's rows
+even if its statement gate is ever removed.
 
 ## What it does
 
@@ -25,19 +29,36 @@ Garmin Connect ──▶ sync worker ──▶ Postgres (raw JSON, source of tru
   env). `POST /sync` triggers the caller's own sync; a cron endpoint iterates
   all active users. Syncs run on a bounded worker pool so one account never
   blocks another.
+- **Web dashboard.** A same-origin JS frontend with tabs: **Chat** (the agent),
+  **Readiness** and **ACWR** (custom derived scores with history charts),
+  **Training Plan** (a weekly workout calendar you and the agent can edit), and
+  **Settings** (sync + per-account LLM/weather/data-type config).
+- **Custom derived metrics.** Computed once per sync and stored in
+  `derived_metrics`, visible to both the UI and the agent:
+  - **Training readiness** (0-100): a weighted composite of nightly HRV
+    (rmssd), resting HR and sleep-score z-scores against a rolling 28-day
+    baseline (`min_samples=7`, HRV clamped at +2.0), auto-scaled through a
+    rolling 90-day calibration so the score always reflects recent context.
+    Categories: Prime / Moderate / Low / Depleted.
+  - **ACWR** (acute-to-chronic workload ratio): `EMA₇(daily load) /
+    EMA₂₈(daily load)`, where daily load is the sum of each day's activity
+    training load. Categories: Sweet Spot (0.8-1.3) / Elevated (1.3-1.5) /
+    Danger (>1.5) / Detraining (<0.8).
 - **RLS-isolated data.** `user_id` is the leading key on every data table and
-  Row-Level Security filters every read/write by `current_setting('app.user_id')`.
-  The agent connects as a `garmin_readonly` role with SELECT only on the
-  agent-facing tables — the raw stores are a real REVOKE.
-- **Read-only AI agent.** `garmin-ask` is a Pydantic AI agent over the same
-  per-user tables. Safety is by construction: read-only PG role + RLS scoping,
-  plus a statement gate (SELECT/WITH/EXPLAIN only) as a second layer.
-- **Tool-calling agent.** The model inspects the schema, runs read-only SQL,
-  validates and embeds Plotly chart specs (the UI re-runs the query to draw
-  them), and consults a stateless weather tool (Open-Meteo). Long-term memory
-  and the conversation history are per-user, in Postgres.
-- **Operation hardening (Phase 4).** Per-account exponential backoff on the
-  sync worker protects against Garmin's informal API and ban risk; tokens are
+  Row-Level Security filters every read/write by
+  `current_setting('app.user_id')`. The agent connects as a `garmin_readonly`
+  role with SELECT only on the agent-facing tables — the raw stores are a real
+  REVOKE.
+- **Read-only AI agent.** A Pydantic AI agent over the same per-user tables.
+  Safety is by construction: read-only PG role + RLS scoping, plus a statement
+  gate (SELECT/WITH/EXPLAIN only) as a second layer.
+- **Tool-calling agent.** The model inspects the schema, runs read-only SQL
+  (including the `derived_metrics` table), validates and embeds Plotly chart
+  specs (the UI re-runs the query to draw them), consults a stateless weather
+  tool (Open-Meteo), keeps long-term memory, and can read/edit the training
+  plan. Conversation and memory are per-user, in Postgres.
+- **Operation hardening.** Per-account exponential backoff on the sync worker
+  protects against Garmin's informal API and ban risk; tokens are
   auto-refreshed and re-encrypted; signup fails fast and clearly whenever
   Garmin blocks or rate-limits the login.
 
@@ -62,6 +83,8 @@ sync status).
 | `user_profile` | Raw profile snapshots (HR zones, power zones, race predictions, gear, devices) |
 | `gear` | Current gear snapshot (bikes, shoes, ...) with cumulative stats — replaced each sync, no history |
 | `devices` | Current Garmin devices (model + which is primary) — replaced each sync, no history |
+| `derived_metrics` | Computed daily metrics — one row per `(calendar_date, metric)`; `readiness` (+ `readiness_*` components) and `acwr` (+ acute/chronic/daily load). Replaced wholesale each sync |
+| `training_plan` | Per-user planned workouts (editable in the UI and by the agent) |
 | `user_state` | Per-user agent state: long-term memory, conversation history, tool-call trace |
 
 ## Setup
@@ -69,12 +92,12 @@ sync status).
 Requirements: Python 3.14, [`uv`](https://docs.astral.sh/uv/) and Docker.
 
 ```sh
-git clone https://github.com/adamzelina1/garmin_agent.git
-cd garmin_agent
+git clone https://github.com/adamzelina1/garmin-agent-web.git
+cd garmin-agent-web
 uv sync
 
-# 1. Start Postgres (roles garmin_app / garmin_readonly are bootstrapped on a
-#    fresh volume by docker/initdb/01-roles.sh)
+# 1. Start Postgres + server (roles garmin_app / garmin_readonly are
+#    bootstrapped on a fresh volume by docker/initdb/01-roles.sh)
 docker compose up -d
 
 # 2. Configure secrets in .env (see .env.example): GARMIN_ENC_KEY,
@@ -98,8 +121,11 @@ uv run garmin-server --port 8000        # open http://127.0.0.1:8000
 The page handles register/login (a single-step Garmin bind: signup logs into
 Garmin once to verify the credentials — MFA, wrong password, or a
 rate-limit/Cloudflare block all fail signup with a clear message), a
-"Sync now" button with status, and a chat box that renders charts. Every
-request carries the JWT; the agent only ever sees the authenticated user's rows.
+"Sync now" button with status, a chat box that renders charts, and the
+derived-metric tabs. Readiness and ACWR are recomputed automatically on every
+sync once enough data has landed, so the tabs need no manual refresh beyond a
+sync. Every request carries the JWT; the agent only ever sees the
+authenticated user's rows.
 
 Direct API examples:
 
@@ -109,6 +135,8 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/login \
   -d '{"email":"you@example.com","password":"password123"}' | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
 
 curl -s -X POST http://127.0.0.1:8000/sync -H "Authorization: Bearer $TOKEN"
+curl -s http://127.0.0.1:8000/readiness -H "Authorization: Bearer $TOKEN"   # readiness series + today + scale
+curl -s http://127.0.0.1:8000/acwr -H "Authorization: Bearer $TOKEN"        # ACWR series + today
 curl -s -X POST http://127.0.0.1:8000/ask -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"question":"avg sleep last week?"}'
 
@@ -116,7 +144,7 @@ curl -s -X POST http://127.0.0.1:8000/ask -H "Authorization: Bearer $TOKEN" \
 curl -s -X POST http://127.0.0.1:8000/cron/sync -H "Authorization: Bearer $GARMIN_CRON_TOKEN"
 ```
 
-Single-user CLI (optional): `uv run garmin-fetch` syncs
+Single-user CLI (optional, legacy): `uv run garmin-fetch` syncs
 `GARMIN_LOCAL_USER_ID`; `uv run garmin-ask "…"` asks the same agent locally.
 
 ## Configuration
@@ -152,14 +180,31 @@ per type, so you can toggle off the ones you don't have or want (e.g. "Cycling
 FTP" unless you ride with a power meter; "Pulse Ox" without an SpO2 watch).
 Note that running FTP lives under `lactate_threshold` (`running_ftp_watts`,
 running power) and is a different number from cycling FTP (`cycling_ftp_watts`).
-Changing these takes effect retroactively on the next
-sync: dates before the start date are deleted, and newly-excluded types have
-their raw rows removed and their exclusive `daily_metrics` columns NULLed
-(shared columns kept).
+Changing these takes effect retroactively on the next sync: dates before the
+start date are deleted, and newly-excluded types have their raw rows removed
+and their exclusive `daily_metrics` columns NULLed (shared columns kept).
 
 The legacy single-user CLI (`garmin-fetch` / `garmin-ask`) can still read
 `GARMIN_EMAIL` / `GARMIN_PASSWORD` / `GARMIN_TOKENS_PATH` and LLM settings from
 the environment, but the server ignores them.
+
+## Derived metrics
+
+Both scores are derived in `src/garmin_fetch/derived.py` and stored in
+`derived_metrics` once per sync (after parsing), so the agent can answer
+questions about them from the same table the UI renders.
+
+- **Training readiness** (`readiness.py`) — 28-day trailing baselines
+  (`min_samples=7`) for nightly HRV, resting HR and sleep score; z-scores
+  (HRV clamped at `+2.0`, resting HR inverted); composite
+  `0.50·Z_HRV + 0.30·Z_RHR + 0.20·Z_Sleep`; then auto-scaled to 0-100 via
+  `SCORE_ANCHORS` calibrated against the trailing 90 days of composites (per
+  day, never including the day itself, so no future leakage). Adjust
+  `SCORE_ANCHORS` / `SCALE_WINDOW_DAYS` in `readiness.py` to reshape.
+- **ACWR** (`workload.py`) — daily training load summed from
+  `activity_summaries.training_load`; `acute = EMA₇`, `chronic = EMA₂₈`,
+  `ACWR = acute/chronic`. Rest days count as zero load, so tapers show up as a
+  falling ratio.
 
 ## Security
 
@@ -171,33 +216,16 @@ the environment, but the server ignores them.
   `user_id` with a FORCED RLS policy on `current_setting('app.user_id')`.
 - The agent's statement gate + `_ALLOWED_TABLES` list remain as a second layer;
   the read-only role's REVOKEs are the real enforcement.
-- Background syncs back off exponentially per account on failure (Phase 4), and
-  signup verifies the Garmin credentials by logging in once — any login failure
+- Background syncs back off exponentially per account on failure, and signup
+  verifies the Garmin credentials by logging in once — any login failure
   (invalid creds, MFA, rate-limit/Cloudflare) fails signup and creates nothing.
 - Run the server behind TLS for anything beyond localhost.
-
-## Tests
-
-Tests are Postgres-backed and **destructive to the app tables** (they drop and
-recreate them per fixture) — so they must run against a **separate test
-database**, never the live one. No Garmin/LLM access is needed (fake client +
-scripted model):
-
-```sh
-# one-time: create the test DB (as superuser) + grants
-#   psql -U garmin -c "CREATE DATABASE garmin_test"
-#   psql -U garmin -d garmin_test -c "GRANT CONNECT, CREATE ON DATABASE garmin_test TO garmin_app; GRANT USAGE, CREATE ON SCHEMA public TO garmin_app; GRANT USAGE ON SCHEMA public TO garmin_readonly;"
-
-$env:GARMIN_TEST_PG_URL="postgresql://garmin_app:garmin_app@localhost:5432/garmin_test"
-$env:GARMIN_TEST_RO_URL="postgresql://garmin_readonly:garmin_readonly@localhost:5432/garmin_test"
-uv run --no-sync pytest -q
-```
 
 ## Tech stack
 
 Python 3.14 · `uv` · PostgreSQL 17 (RLS) · FastAPI · APScheduler · Pydantic AI ·
-Gradio (legacy CLI UI) · Plotly · Open-Meteo · garminconnect · PyJWT · bcrypt ·
-`cryptography` (AES-GCM) · pytest
+Gradio (legacy single-user CLI UI) · Plotly · Open-Meteo · garminconnect ·
+PyJWT · bcrypt · `cryptography` (AES-GCM)
 
 ## Project layout
 
@@ -207,6 +235,9 @@ src/garmin_fetch/
   fetcher.py    # Garmin Connect sync (per-user, token-string store)
   parser.py     # raw JSON -> typed table projections
   datatypes.py  # data-type registry
+  derived.py    # rebuilds all derived metrics (readiness + ACWR) into derived_metrics
+  readiness.py  # custom training-readiness score (z-composite + rolling auto-scale)
+  workload.py   # ACWR (7d/28d EMA of daily training load)
   ask.py        # read-only AI agent (ReadOnlyDB, statement gate, RLS-scoped)
   ask_web.py    # legacy single-user Gradio UI
   trace.py      # per-turn tool-call tracing
@@ -216,8 +247,8 @@ src/garmin_fetch/
     crypto.py     # AES-GCM for Garmin credentials/tokens
     sync_worker.py# background sync pool + APScheduler cron + backoff
     setup_db.py   # garmin_app / garmin_readonly role bootstrap
-    static/       # index.html (login/register, sync, chat)
+    state.py      # per-user memory/session + training-plan store
+    static/       # index.html (Chat · Readiness · ACWR · Training Plan · Settings)
 docker/
   initdb/       # 01-roles.sh (creates non-superuser roles on fresh volume)
-tests/          # PG-backed test suite (fake client, scripted model)
 ```
