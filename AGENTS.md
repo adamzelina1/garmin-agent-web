@@ -2,55 +2,67 @@
 
 ## Project
 
-Fetches daily Garmin Connect data into SQLite. Python 3.14, managed with `uv`. Windows environment — **no system `python`/`pip`**, always use `uv run`.
+Postgres-backed multi-user Garmin Connect fetcher + FastAPI server (JWT auth, background sync, read-only AI agent). Python 3.14, `uv` only (no system python). **Windows.**
 
 ## Commands
 
 ```sh
-uv run garmin-fetch                        # incremental sync of all data types + activities + auto-parse
-uv run garmin-fetch --type heart_rate      # sync subset (repeatable); 'activities' works too
-uv run garmin-fetch --type activities      # activities only (skip day-keyed types)
-uv run garmin-fetch --type profile         # refresh HR-zone profile snapshot only (hr_zones)
-uv run garmin-fetch --parse                # incremental parse: only rows whose raw payload changed since last parsed
-uv run garmin-fetch --parse hrv steps      # incremental parse of specific types only
-uv run garmin-fetch --parse activities     # parse stored activity summaries + detail series/aggregates incrementally
-uv run garmin-fetch --parse --full         # forced full re-parse of every stored row (ignore change markers)
-uv run garmin-fetch --list-types
-uv run garmin-fetch --range 2026-01-01 2026-01-07
-uv run garmin-ask "avg sleep last week?"   # LLM agent over daily_metrics (read-only SQL)
-uv run garmin-ask                          # interactive session; conversation context kept across questions
-uv run garmin-ask --session meta.json      # same, but history persists to a file and resumes on next run
-uv run garmin-ask-web                      # browser chat UI (Gradio) over the same read-only agent
-uv run garmin-ask-web --port 8000          # serve the UI on a custom port; --share for a public link
-# web auto-persists and resumes the last session (web_session.json); --session FILE overrides it
-uv run garmin-trace                         # print the recorded agent tool-call trace (ask_trace.jsonl)
-uv run garmin-trace --full                  # no truncation of long args/outputs
-uv run garmin-trace --tail 5 --tool run_sql # last 5 turns that used run_sql
-uv run pytest -q                           # tests (fake client, no Garmin login; ask tests offline)
-uv add <pkg>                               # add deps; --dev for dev deps
+uv run garmin-server --port 8000   # FastAPI server (auth + sync + ask + JS frontend)
+uv run garmin-fetch --parse --full # single-user CLI sync/parse for GARMIN_LOCAL_USER_ID
+uv run garmin-ask "avg sleep last week?"
+uv add <pkg>                       # install deps into the managed venv
 ```
+
+## Reading the database (important)
+
+The live store is Postgres in the `garmin-db` container (roles `garmin_app`,
+`garmin_readonly`, admin `garmin`). **Every data table is RLS-scoped by
+`user_id` via `current_setting('app.user_id')`**, so a plain connection sees
+**zero rows**. To inspect data you MUST set the session user first, e.g.:
+
+```python
+import psycopg
+c = psycopg.connect("postgresql://garmin_app:garmin_app@localhost:5432/garmin")
+c.execute("SELECT set_config('app.user_id','1',false)")   # user_id 1 = adam.zelina20@gmail.com
+# now SELECT works and RLS scopes rows to that account
+```
+
+Notes:
+- `garmin_app` = writer (syncs + auth); `garmin_readonly` = SELECT-only agent
+  role (real REVOKEs, only the agent-facing tables); `garmin` = superuser (bypasses
+  RLS; never use at runtime). DSNs in `.env`.
+- `SET app.user_id` without the id string quoted as text (or a `'0'`/unset)
+  also yields 0 rows — an empty result usually means the session id is wrong,
+  not that the DB is empty.
+- Raw payloads live in `metrics` (daily, keyed `data_type+calendar_date`) and
+  `activities` (summary + details_json + weather_json + splits_json). Parsed
+  projections are in `daily_metrics`, `activity_summaries`,
+  `activity_detail_series`, `activity_splits`, `hr_zones`, `power_zones`,
+  `race_predictions`, `gear`, `devices`. Computed daily metrics (readiness,
+  ACWR, ...) live in `derived_metrics` (one row per `calendar_date`+`metric`,
+  replaced wholesale each sync).
+- `GARMIN_ADMIN_DB_URL` (`garmin:garmin`) is used only for role bootstrap.
+
+API (all JSON, `Authorization: Bearer <JWT>`): `POST /auth/register|login`, `GET /auth/me`, `POST /sync`, `GET /sync/status`, `POST /cron/sync` (daemon token), `GET /readiness`, `GET /acwr`, `POST /ask`, `POST /ask/chart`, `GET /`.
 
 ## Architecture
 
-- **Two-step design:** the fetcher stores raw JSON (the source of truth), and the parser projects it into typed daily tables. The parser is now built (`src/garmin_fetch/parser.py`); it runs automatically after each sync.
-- `src/garmin_fetch/datatypes.py` — registry for day-keyed types. A data type is a `DataType(name, fetch_fn)`. Adding a type = add a fetch adapter + one registry entry (test in `tests/test_fetcher.py::test_custom_data_type_is_registerable`).
-- `src/garmin_fetch/db.py` — SQLite. **`metrics` table (keyed `data_type + calendar_date`, stores `raw_json`) is the sole store and the source of truth for "what's fetched".** `daily_metrics` is the parsed projection (one wide row per `calendar_date`, columns auto-created on demand); `activities` stores raw activity summaries + details keyed by `activityId`; `activity_summaries` is the parsed activity projection (one row per `activityId`, **fixed/curated schema** of shared summary fields); `activity_detail_series` is the parsed intra-activity time series (one wide row per `(activity_id, tick)`, metrics the sport's device didn't record are NULL). **Profile settings** (same-snapshot data) live in `user_profile` (`profile_type` PK, `raw_json`, `fetched_at`) and project into `hr_zones` (one row per sport with derived `zoneN_min`/`zoneN_max` bpm ranges) and `race_predictions` (a single current snapshot row; predicted times stored in **minutes**, converted from Garmin's seconds).
-- `src/garmin_fetch/parser.py` — `PARSERS[type_name] = fn(payload) -> {column: scalar}`. Each extractor returns only leaf scalars, never containers, and never raises on malformed input. List-wrapped payloads (`steps`, `body_battery`, `max_metrics`) are unwrapped/aggregated. `build_daily_rows(db, types)` reads raw `metrics` and merges into `daily_metrics` in `ORDER BY calendar_date`; sparse types in `_FFILL_TYPES` (currently `lactate_threshold`) forward-fill — a date with no data keeps the last known value instead of NULL. **Intraday series (HR ticks, stress/respiration arrays, sleep levels, BB curves) stay in `metrics`** — they are not collapsed to the scalar daily row. **Activity summaries:** `parse_activity_summary` (flat summary scalars, incl. respiration/elevation/speed fields, speeds stored m/s→km/h) + `build_activity_summaries(db)` project each activity into `activity_summaries`. Durations stored in **hours**, distance in **km**, time-in-zone in **hours** (converted from the summary's seconds). Fields a type lacks (e.g. distance on indoor cycling) are NULL/0. **Activity details:** the stored `details_json` is projected by `parse_activity_details` (scalar aggregates: avg/max cadence + avg/max power merged into the summary row) and `parse_activity_detail_series` (wide per-tick rows) — `build_activity_details(db)` rebuilds both. Series descriptors are matched by key (`directHeartRate`, `directPower`, cadence via a per-sport priority list, `sumDistance`, ...); the FakeClient's test details only carries `heart_rate`/empty metrics so it yields no series. **HR zones:** `parse_hr_zones(payload)` + `build_hr_zones(db)` replace the whole `hr_zones` table from the `user_profile('hr_zones')` snapshot; zone N = `[floor_N, floor_(N+1))`, zone 5 runs to `maxHRUsed`.
-- **Activities do NOT use `metrics`.** They are keyed by `activityId` (multiple per day, have timestamps, returned as a list, not per-date dicts), stored in their own `activities` table (`activity_id`, `raw_json`, `fetched_at`, `details_json`, `details_fetched_at`, `weather_json`, `weather_fetched_at`), and fetched via `DataFetcher.fetch_activities()` using `get_activities_by_date()`. They can't fit the `DataType` registry — separate sync branch in `fetcher.py`.
-- **Activities are stored atomically: summary + details together.** In `fetch_activities()`, the detail payload (`get_activity_details(id)`) is fetched *before* storing; if details are unavailable the activity is skipped entirely — there are never summary-only (or details-only) rows. No backfill logic. `details_json` holds the per-activity detail payload (`metricDescriptors` + `activityDetailMetrics` arrays + `heartRateDTOs`). **Observed weather** is a best-effort enrichment: `_fetch_activity_weather(id)` runs for every new activity (and `backfill_activity_weather(db)` fills any that lack it); a missing/failed weather call only logs a warning — the activity is still stored. `parse_activity_weather` projects it into `activity_summaries` weather columns (imperial→metric: degF→degC, mph→km/h).
-- `src/garmin_fetch/fetcher.py` — `DataFetcher.fetch_range()` is the day-keyed sync loop: skip stored dates, fetch missing, write raw to `metrics`. `sync_data()` drives all day-keyed types + optionally the activities branch + the profile snapshots, then auto-parses the fetched types into `daily_metrics` (skip with `parse=False`). Activity resume uses a rolling window + `activities_last_finalized` marker in `sync_state` (see below). **Profile**: `DataFetcher.fetch_profile()` calls `get_heart_rate_zones()` once and stores the per-sport payload under `user_profile('hr_zones')` (overwrite each run); `fetch_race_predictions()` stores the single latest snapshot under `user_profile('race_predictions')`; `build_hr_zones(db)` / `build_race_predictions(db)` re-project both on every parse.
-- `src/garmin_fetch/ask.py` — `garmin-ask` CLI: a Pydantic AI agent with read-only DB tools (`list_tables`, `table_schema`, `date_range`, `run_sql`), a `chart` tool, a stateless `weather` tool (Open-Meteo: short forecast + historical weather for days/locations the stored activity weather doesn't cover; per-day degC/mm/km/h; home coords from `GARMIN_HOME_LAT`/`GARMIN_HOME_LON`, per-call `lat`/`lon` override), and — when a memory path is configured — long-term-memory tools (`get_memory`/`remember_memory`/`forget_memory`) over a JSON profile (`agent_memory.json`, env `GARMIN_MEMORY_FILE`; the agent stores only user-volunteered facts — anything queryable from the DB is forbidden). The interactive session also understands `/clear` (drop the conversation and start fresh) and `/new` (compact the conversation into one summary via the model and restart from it). Safety is by construction: connections open per-call with `PRAGMA query_only`, an authorizer denying write opcodes, and a statement gate (SELECT/WITH/EXPLAIN/PRAGMA only). `Weather` is stateless — each call is one HTTP request, nothing stored, so it can only ever contextualise, never substitute for DB facts. Model is OpenAI-compatible — default cloud via `OPENAI_API_KEY`/`LLM_MODEL`, or `LLM_BASE_URL` → local Ollama. Tests use Pydantic AI's `TestModel`, so they need no API key.
-- **Charts are spec-based, never data-passed.** The `chart(spec)` tool takes a model-written JSON spec — `{"sql": "...", "traces": [...], "layout": {...}}` — re-runs the read-only query to validate columns and that each trace is constructible, and returns `OK: <spec> (query returned N rows)` (it never returns the rows). Each trace is free-form: a `"go"` key names ANY `plotly.graph_objects` class (Scatter/Scattergl/Violin/Heatmap/Pie/Candlestick/...), with compact aliases `line`/`scatter`/`area`/`bar`/`pie`/`histogram`/`box` for the common cases (mapped via `_LEGACY_TRACES`); data columns are referenced by name via `x`/`y`/`z` or anywhere as `{"column": "<name>"}`, and every other key is passed verbatim to the Plotly constructor (`mode`, `marker`, `line`, `opacity`, `orientation`, `colorscale`, ...). E.g. `{"go": "Pie", "labels": {"column": "sport_type"}, "values": {"column": "hours"}}`. The model embeds the returned spec verbatim in `<chart>…</chart>`; `ask_web._render_chart` re-runs `spec["sql"]` through the same gate and calls `_build_chart_figure(spec, result)` (shared with the tool's validator, `_chart_spec_error`). The closing `</chart>` is optional — `_extract_charts` raw-decodes a JSON prefix. So the graph is entirely model-authored, but no raw data ever travels through the and reply; the DB stays the single source.
-- `src/garmin_fetch/ask_web.py` — `garmin-ask-web` browser chat (Gradio) over `_build_agent`. Each session auto-persists to `web_session.json` (env `GARMIN_WEB_SESSION_FILE`, overridable with `--session FILE`) after every turn and the last session is loaded back into the UI on startup (seeded `chatbot.value`); `_extract_charts` turns `<chart>` blocks into `gr.Plot`s by re-running the spec's SQL through the read-only gate.
-- `src/garmin_fetch/trace.py` — per-turn agent tracing (both `garmin-ask` and `garmin-ask-web`). `append_turn` appends one JSON line per turn to `ask_trace.jsonl` (env `GARMIN_TRACE_FILE`): question, model, ordered `steps` (tool calls w/ JSON args, token usage (`result.usage()`: input/output, cache read/write + `cache_hit_ratio`, requests, tool calls) — this surfaces DeepSeek's automatic prompt caching per turn), tool returns w/ outcome, retries, texts and final answer. `garmin-trace` renders it; `--tail N`, `--tool NAME` filter, `--full` disables truncation.
+- Fetcher stores raw JSON in `metrics` (source of truth); parser projects to typed tables.
+- **RLS is the security boundary** — every data table has `user_id` PK-leading; `FORCE ROW LEVEL SECURITY` + `user_isolation` policy reading `current_setting('app.user_id')`. `users` is exempt. Runtime connections use `garmin_app` (owner) / `garmin_readonly` (SELECT-only agent role, an actual REVOKE). Superusers bypass RLS → never run as superuser.
+- `db.py`: `Database(url, user_id=...)` bound to one user; `create_schema` idempotent; `merge_daily` auto-creates columns.
+- `fetcher.py`: `sync_data(...)`, never prompts MFA; **`widget+cffi` login strategy is always skipped** (falsely reports "MFA required" during Cloudflare/429 windows).
+- `ask.py`: read-only Pydantic AI agent via `garmin_readonly`; statement gate (SELECT/WITH/EXPLAIN) + `_ALLOWED_TABLES` regex as a second layer. Tools: list_tables, table_schema, date_range, run_sql, chart (spec only).
+- `server/`:
+  - `auth.py`: UserStore, bcrypt, JWT; signup verifies the Garmin credentials by logging in once — **any** login failure (invalid creds → 400, rate-limit/Cloudflare → 502) deletes the account and fails signup with a clear message. No deferred/"pending" bind is created anymore. Creds/tokens AES-GCM encrypted (`crypto.py`).
+  - `sync_worker.py`: thread pool + APScheduler cron; exponential backoff per account (`rate_limit_until`, 30min ×2^n cap 8h; ban detection jumps straight to 8h); marks `confirmed` on first success.
+  - `app.py`: `create_app(cfg)`; agent memory/session/trace live per user in the `user_state` table.
+- Config via `config.py` + `.env` (gitignored): `GARMIN_DB_URL`, `GARMIN_READONLY_DB_URL`, `GARMIN_ADMIN_DB_URL`, `GARMIN_ENC_KEY`, `GARMIN_JWT_SECRET`, `GARMIN_CRON_TOKEN`, `GARMIN_SYNC_INTERVAL_MIN`, `GARMIN_SYNC_MAX_WORKERS`, `GARMIN_LOCAL_USER_ID`. Never print secrets.
 
-## Gotchas / constraints
+## Constraints
 
-- **Do NOT add migration/backfill logic** (e.g. seeding `metrics` from typed tables, or rebuilding typed tables from `metrics`). User explicitly wants none — don't propose or add it. Parsing into typed tables is a separate later step (now built).
-- **Re-running a sync is idempotent** — but not byte-identical. Day-keyed types skip stored dates that are *final* (their `fetched_at` landed on a later calendar day than the data). A day still in progress when captured — `fetched_at` on the data's own day — is re-fetched (overwriting `metrics`) on the next run: the sync resumes from the oldest still-incomplete day via `_nonfinal_dates()`/`stored_fetches()`, so a day synced mid-day is refreshed once its data settles, and only those days are re-hit. Activities skip by id, but re-list the rolling `freeze_days` window (see below).
-- **Parsing is incremental, marker-tracked — not full every time.** Each raw row records the `fetched_at` it was last parsed as (`metrics.parsed_at`, `activities.summary_parsed_at`/`details_parsed_at`/`weather_parsed_at`). `build_daily_rows` / `build_activity_summaries` / `build_activity_details` / `build_activity_weather` re-parse only rows whose raw `fetched_at` changed since that stamp (a NULL stamp = never parsed → parsed on first run). Sparse `_FFILL_TYPES` (lactate_threshold) re-parse the whole *type* when any row changed — carry semantics chain forward. `force=True` (CLI `--parse --full`) ignores the markers and rebuilds everything, restamping as it goes. Markers are set even for rows that parse to nothing, so empty/fetch-only rows are not re-scanned; fetch-only types (`training_readiness`, `hydration`, …) have no parser and are never marked.
-- `.env` holds real credentials and is gitignored. Never print or commit them. `GARMIN_START_DATE` (currently `2025-01-01`) sets the backfill window; empty means "latest stored + 1" per type.
-- No commit policy needed — only commit when asked.
-- Auth: first run may prompt for MFA code interactively; tokens cached in `~/.garminconnect`.
-- DB file uses WAL mode; `garmin.db-shm/-wal` are runtime files.
-- `agent_memory.json` and `web_session.json` are runtime aids (LLM-facing, not DB tables) — fine to ignore/delete; never treat them as feature stores.
+- **No migration/backfill logic** — user explicitly wants none.
+- **No persisted tests** — consider the project test-free; only ephemeral one-off scripts in temp space when needed.
+- Sync is idempotent but not byte-identical (parsing is marker-tracked: `metrics.parsed_at` etc.; `--parse --full` forces rebuild).
+- Config changes take effect retroactively on the next config-driven full sync (`sync_data` with no `types`/`start`): `db.prune_dates_before(start)` deletes raw+projected rows before the account's start date, and `db.prune_excluded_types(excluded, enabled)` deletes raw rows of newly-excluded types and NULLs their exclusive `daily_metrics` columns (shared columns are kept — `TYPE_COLUMNS` in `parser.py` maps each type to the columns it can write). Explicit `--range` or `--type` syncs never prune.
+- MFA unsupported; Garmin rate-limit/Cloudflare blocks defer the bind, never block signup.
+- Token refresh: garminconnect auto-refreshes; worker re-encrypts changed tokens after sync.

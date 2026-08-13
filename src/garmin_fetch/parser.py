@@ -15,8 +15,18 @@ Design rules for every extractor:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+#: Garmin activity typeKeys for which ``pace_min_km`` (min/km) is meaningful.
+_RUNNING_TYPES = frozenset({
+    "running", "track_running", "trail_running", "indoor_running",
+    "treadmill_running", "virtual_run", "street_running", "ultra_run",
+    "running_treadmill", "running_street", "running_track", "running_trail",
+})
 
 
 def _get(obj: Any, *path: str, default: Any = None) -> Any:
@@ -35,6 +45,13 @@ def _leaf(d: dict[str, Any], pairs: list[tuple[str, str]]) -> dict[str, Any]:
         for out, src in pairs
         if (value := d.get(src)) is not None
     }
+
+
+def _num(value: Any) -> float | None:
+    """A numeric value, or None for anything else (incl. NaN)."""
+    if isinstance(value, (int, float)) and value == value:
+        return float(value)
+    return None
 
 
 def _hours(seconds: Any) -> float | None:
@@ -61,27 +78,14 @@ def _local_time(epoch_ms: Any) -> str | None:
 # --- Per-type extractors --------------------------------------------------
 
 def parse_heart_rate(payload: dict[str, Any]) -> dict[str, Any]:
-    out = _leaf(payload, [
+    # The daily heart-rate payload carries only the summary scalars (plus an
+    # intraday ``heartRateValues`` series); it has no per-day zone block. Zone
+    # boundaries are a profile setting projected separately into ``hr_zones``.
+    return _leaf(payload, [
         ("resting_hr", "restingHeartRate"),
         ("min_hr", "minHeartRate"),
         ("max_hr", "maxHeartRate"),
-        ("last_7d_avg_resting_hr", "lastSevenDaysAvgRestingHeartRate"),
     ])
-    # The daily payload carries each zone's lower/upper bound (bpm) and the
-    # time spent in it: {"zoneNumber": 2, "min": 125, "max": 140, ...}.
-    for zone in payload.get("heartRateZones") or []:
-        n = zone.get("zoneNumber")
-        if n is None:
-            continue
-        lo, hi = zone.get("min"), zone.get("max")
-        if isinstance(lo, (int, float)):
-            out[f"hr_zone_{n}_min"] = lo
-        if isinstance(hi, (int, float)):
-            out[f"hr_zone_{n}_max"] = hi
-        h = _hours(zone.get("secondsInZone"))
-        if h is not None:
-            out[f"hr_zone_{n}_hours"] = h
-    return out
 
 
 def parse_steps(payload: dict[str, Any]) -> dict[str, Any]:
@@ -190,7 +194,7 @@ def parse_rhr(payload: dict[str, Any]) -> dict[str, Any]:
     return {"resting_hr": value} if value is not None else {}
 
 
-def parse_stats(payload: dict[str, Any]) -> dict[str, Any]:
+def parse_daily_summary(payload: dict[str, Any]) -> dict[str, Any]:
     """The daily summary payload — rich set of scalar health/activity values."""
     out = _leaf(payload, [
         ("total_steps", "totalSteps"),
@@ -204,13 +208,10 @@ def parse_stats(payload: dict[str, Any]) -> dict[str, Any]:
         ("resting_hr", "restingHeartRate"),
         ("min_hr", "minHeartRate"),
         ("max_hr", "maxHeartRate"),
-        ("last_7d_avg_resting_hr", "lastSevenDaysAvgRestingHeartRate"),
         ("avg_stress", "averageStressLevel"),
         ("max_stress", "maxStressLevel"),
         ("moderate_intensity_minutes", "moderateIntensityMinutes"),
         ("vigorous_intensity_minutes", "vigorousIntensityMinutes"),
-        ("floors_ascended", "floorsAscended"),
-        ("floors_descended", "floorsDescended"),
         ("body_battery_charged", "bodyBatteryChargedValue"),
         ("body_battery_drained", "bodyBatteryDrainedValue"),
         ("body_battery_highest", "bodyBatteryHighestValue"),
@@ -242,19 +243,14 @@ def parse_body_battery(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(events, list):
         return {}
     impact = 0.0
-    slept = False
     for ev in events:
         event = ev.get("event") or {}
-        if event.get("eventType") == "SLEEP":
-            slept = True
         b = event.get("bodyBatteryImpact")
         if isinstance(b, (int, float)):
             impact += b
-    out: dict[str, Any] = {}
     if impact:
-        out["body_battery_net_change"] = round(impact, 2)
-    out["body_battery_slept"] = slept
-    return out
+        return {"body_battery_net_change": round(impact, 2)}
+    return {}
 
 
 def parse_max_metrics(payload: dict[str, Any]) -> dict[str, Any]:
@@ -265,8 +261,7 @@ def parse_max_metrics(payload: dict[str, Any]) -> dict[str, Any]:
     bucket = values[0] if isinstance(values[0], dict) else {}
     generic = bucket.get("generic") or {}
     return _leaf(generic, [
-        ("vo2max", "vo2MaxValue"),
-        ("vo2max_precise", "vo2MaxPreciseValue"),
+        ("vo2max", "vo2MaxPreciseValue"),
         ("fitness_age", "fitnessAge"),
     ])
 
@@ -288,15 +283,6 @@ def parse_intensity_minutes(payload: dict[str, Any]) -> dict[str, Any]:
     ])
 
 
-def parse_floors(payload: dict[str, Any]) -> dict[str, Any]:
-    """Floors arrive as a per-interval array; we report the raw count."""
-    values = payload.get("floorValuesArray")
-    if not isinstance(values, list):
-        return {}
-    total = sum(v for v in values if isinstance(v, (int, float)))
-    return {"floors": total} if total else {}
-
-
 def _first_bucket(mapping: Any) -> dict[str, Any] | None:
     """First dict value in a device-keyed map, or None."""
     if not isinstance(mapping, dict):
@@ -312,8 +298,7 @@ def parse_training_status(payload: dict[str, Any]) -> dict[str, Any]:
     # VO2Max appears only when data exists for the day.
     vo2 = _get(payload, "mostRecentVO2Max", "generic", default={})
     out.update(_leaf(vo2, [
-        ("vo2max", "vo2MaxValue"),
-        ("vo2max_precise", "vo2MaxPreciseValue"),
+        ("vo2max", "vo2MaxPreciseValue"),
     ]))
     # Load balance / status are keyed by device id (unknown at parse time).
     load = _first_bucket(_get(
@@ -329,7 +314,6 @@ def parse_training_status(payload: dict[str, Any]) -> dict[str, Any]:
     ))
     if status:
         out.update(_leaf(status, [
-            ("training_status", "trainingStatus"),
             ("weekly_training_load", "weeklyTrainingLoad"),
             ("training_status_feedback", "trainingStatusFeedbackPhrase"),
         ]))
@@ -337,12 +321,14 @@ def parse_training_status(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_lactate_threshold(payload: dict[str, Any]) -> dict[str, Any]:
-    """Running lactate threshold (HR/speed) plus FTP, from per-day range arrays."""
+    """Running lactate threshold (HR/speed) plus running power, from per-day
+    range arrays. Garmin detects lactate threshold from running sessions, so
+    the ``power`` entry is *running* power (running FTP), not cycling FTP."""
     out: dict[str, Any] = {}
     for key, column in (
         ("heart_rate", "lactate_threshold_hr"),
-        ("speed", "lactate_threshold_speed"),
-        ("power", "ftp_watts"),
+        ("speed", "lactate_threshold_speed_kmh"),
+        ("power", "running_ftp_watts"),
     ):
         entries = payload.get(key)
         if isinstance(entries, dict):
@@ -350,7 +336,128 @@ def parse_lactate_threshold(payload: dict[str, Any]) -> dict[str, Any]:
         if entries:
             value = entries[0].get("value")
             if value is not None:
-                out[column] = value
+                if column == "lactate_threshold_speed_kmh":
+                    # Garmin reports LT speed in 0.1 m/s -> km/h (x36).
+                    out[column] = round(value * 36, 2)
+                else:
+                    out[column] = value
+    return out
+
+
+def _first_entry(entries: Any) -> dict[str, Any] | None:
+    """First dict in a list (or a dict itself), or None."""
+    if isinstance(entries, dict):
+        return entries
+    if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+        return entries[0]
+    return None
+
+
+def parse_sweat_loss(payload: dict[str, Any]) -> dict[str, Any]:
+    """Estimated sweat loss from the daily hydration payload, in ml."""
+    return _leaf(payload, [
+        ("sweat_loss_ml", "sweatLossInML"),
+    ])
+
+
+def parse_weight(payload: dict[str, Any]) -> dict[str, Any]:
+    entry = _first_entry(payload.get("dateWeightList"))
+    if entry is None:
+        entry = payload.get("totalAverage") or {}
+    if not isinstance(entry, dict):
+        return {}
+    return _leaf(entry, [
+        ("weight_kg", "weight"),
+        ("bmi", "bmi"),
+        ("body_fat_pct", "bodyFat"),
+    ])
+
+
+def parse_body_composition(payload: dict[str, Any]) -> dict[str, Any]:
+    entry = _first_entry(payload.get("dateWeightList"))
+    if entry is None:
+        entry = payload.get("totalAverage") or {}
+    if not isinstance(entry, dict):
+        return {}
+    return _leaf(entry, [
+        ("weight_kg", "weight"),
+        ("bmi", "bmi"),
+        ("body_fat_pct", "bodyFat"),
+        ("body_water_pct", "bodyWater"),
+        ("bone_mass_kg", "boneMass"),
+        ("muscle_mass_kg", "muscleMass"),
+        ("physique_rating", "physiqueRating"),
+        ("visceral_fat", "visceralFat"),
+        ("metabolic_age", "metabolicAge"),
+    ])
+
+
+def parse_blood_pressure(payload: dict[str, Any]) -> dict[str, Any]:
+    entry = _first_entry(payload.get("measurementSummaries"))
+    if entry is None:
+        return {}
+    return _leaf(entry, [
+        ("systolic_bp", "systolic"),
+        ("diastolic_bp", "diastolic"),
+        ("pulse_bpm", "pulse"),
+    ])
+
+
+def parse_endurance_score(payload: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    dto = payload.get("enduranceScoreDTO")
+    if isinstance(dto, dict):
+        out.update(_leaf(dto, [
+            ("endurance_score", "enduranceScore"),
+            ("endurance_score_level", "level"),
+            ("endurance_score_vo2max", "vo2MaxValue"),
+        ]))
+    if not out:
+        out.update(_leaf(payload, [("endurance_score", "avg")]))
+    return out
+
+
+def parse_hill_score(payload: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    entries = payload.get("hillScoreDTOList")
+    if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+        out.update(_leaf(entries[0], [("hill_score", "hillScore")]))
+    if not out:
+        for value in (payload.get("periodAvgScore") or {}).values():
+            if value is not None:
+                out["hill_score"] = value
+                break
+    return out
+
+
+def parse_running_tolerance(payload: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(payload, list):
+        payload = {"value": payload}
+    entry = _first_entry(payload.get("value"))
+    if entry is None:
+        entry = _first_entry(payload)
+    if entry is None:
+        return {}
+    return _leaf(entry, [
+        ("running_tolerance", "runningTolerance"),
+        ("running_tolerance_value", "value"),
+    ])
+
+
+def parse_cycling_ftp(payload: dict[str, Any]) -> dict[str, Any]:
+    """Cycling functional threshold power (watts) from the FTP endpoint."""
+    if isinstance(payload, list):
+        payload = {"value": payload}
+    entry = _first_entry(payload.get("value"))
+    if entry is None:
+        entry = _first_entry(payload)
+    if entry is None:
+        return {}
+    out = _leaf(entry, [
+        ("cycling_ftp_watts", "ftp"),
+        ("cycling_ftp_watts", "functionalThresholdPower"),
+        ("cycling_ftp_watts", "value"),
+    ])
     return out
 
 
@@ -364,14 +471,87 @@ PARSERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "respiration": parse_respiration,
     "spo2": parse_spo2,
     "rhr": parse_rhr,
-    "stats": parse_stats,
+    "daily_summary": parse_daily_summary,
     "body_battery": parse_body_battery,
     "max_metrics": parse_max_metrics,
     "fitnessage": parse_fitnessage,
     "intensity_minutes": parse_intensity_minutes,
-    "floors": parse_floors,
     "training_status": parse_training_status,
     "lactate_threshold": parse_lactate_threshold,
+    "sweat_loss": parse_sweat_loss,
+    "weight": parse_weight,
+    "body_composition": parse_body_composition,
+    "blood_pressure": parse_blood_pressure,
+    "endurance_score": parse_endurance_score,
+    "hill_score": parse_hill_score,
+    "running_tolerance": parse_running_tolerance,
+    "cycling_ftp": parse_cycling_ftp,
+}
+
+#: daily_metrics columns each daily type's extractor can write. Kept in sync
+#: with the extractors above; used to prune a newly-excluded type's columns
+#: (a column is only NULLed when no *other enabled* type also writes it).
+TYPE_COLUMNS: dict[str, set[str]] = {
+    "heart_rate": {"resting_hr", "min_hr", "max_hr"},
+    "steps": {"total_steps", "pushes"},
+    "sleep": {
+        "sleep_time_hours", "nap_time_hours", "deep_sleep_hours",
+        "light_sleep_hours", "rem_sleep_hours", "awake_sleep_hours",
+        "unmeasurable_sleep_hours", "average_respiration", "awake_count",
+        "avg_sleep_stress", "sleep_start_local", "sleep_end_local",
+        "resting_hr", "hrv_status", "body_battery_change",
+        "restless_moments_count", "sleep_score", "sleep_score_qualifier",
+    },
+    "hrv": {"hrv_last_night_avg", "hrv_last_night_5min_high", "hrv_status"},
+    "stress": {"avg_stress", "max_stress"},
+    "respiration": {
+        "respiration_waking_avg", "respiration_sleep_avg",
+        "respiration_lowest", "respiration_highest",
+    },
+    "spo2": {
+        "spo2_avg", "spo2_lowest", "spo2_latest",
+        "spo2_avg_sleep", "spo2_last_7d_avg",
+    },
+    "rhr": {"resting_hr"},
+    "daily_summary": {
+        "total_steps", "total_distance_m", "total_kcal", "active_kcal",
+        "bmr_kcal", "burned_kcal", "consumed_kcal", "remaining_kcal",
+        "resting_hr", "min_hr", "max_hr",
+        "avg_stress", "max_stress", "moderate_intensity_minutes",
+        "vigorous_intensity_minutes",
+        "body_battery_charged", "body_battery_drained", "body_battery_highest",
+        "body_battery_lowest", "body_battery_most_recent",
+        "body_battery_at_wake", "average_spo2", "lowest_spo2", "latest_spo2",
+        "highest_respiration", "lowest_respiration", "avg_waking_respiration",
+        "highly_active_hours", "active_hours", "sedentary_hours",
+    },
+    "body_battery": {"body_battery_net_change"},
+    "max_metrics": {"vo2max", "fitness_age"},
+    "fitnessage": {"fitness_age"},
+    "intensity_minutes": {
+        "moderate_intensity_minutes", "vigorous_intensity_minutes",
+        "weekly_moderate", "weekly_vigorous", "weekly_total", "day_of_goal_met",
+    },
+    "training_status": {
+        "vo2max", "training_balance_feedback",
+        "weekly_training_load", "training_status_feedback",
+    },
+    "lactate_threshold": {
+        "lactate_threshold_hr", "lactate_threshold_speed_kmh", "running_ftp_watts",
+    },
+    "sweat_loss": {"sweat_loss_ml"},
+    "weight": {"weight_kg", "bmi", "body_fat_pct"},
+    "body_composition": {
+        "weight_kg", "bmi", "body_fat_pct", "body_water_pct", "bone_mass_kg",
+        "muscle_mass_kg", "physique_rating", "visceral_fat", "metabolic_age",
+    },
+    "blood_pressure": {"systolic_bp", "diastolic_bp", "pulse_bpm"},
+    "endurance_score": {
+        "endurance_score", "endurance_score_level", "endurance_score_vo2max",
+    },
+    "hill_score": {"hill_score"},
+    "running_tolerance": {"running_tolerance", "running_tolerance_value"},
+    "cycling_ftp": {"cycling_ftp_watts"},
 }
 
 
@@ -401,13 +581,16 @@ def build_daily_rows(
     # Some registered types (e.g. training_readiness) are fetch-only and have
     # no projection; skip them rather than crash.
     names = [n for n in (types or list(PARSERS)) if n in PARSERS]
+    if force and set(names) == set(PARSERS):
+        # A full re-parse rebuilds the schema: drop every daily_metrics column
+        # so the table only contains what the current parsers write. Stale
+        # columns from renamed/removed metrics don't linger as NULLs.
+        dropped = db.reset_daily_columns()
+        if dropped:
+            logger.info("reset daily_metrics schema: dropped %s", ", ".join(dropped))
     counts: dict[str, int] = {}
     for name in names:
-        rows = db.conn.execute(
-            "SELECT calendar_date, raw_json, fetched_at FROM metrics "
-            "WHERE data_type = ? ORDER BY calendar_date",
-            (name,),
-        ).fetchall()
+        rows = db.metrics_rows(name)
         parsed_at = {} if force else db.metric_parsed_at(name)
         if force:
             dirty: set[str] | None = None
@@ -459,7 +642,6 @@ def parse_activity_summary(payload: dict[str, Any]) -> dict[str, Any]:
     out = _leaf(payload, [
         ("activity_name", "activityName"),
         ("start_time_local", "startTimeLocal"),
-        ("start_time_gmt", "startTimeGMT"),
         ("distance_km", "distance"),
         ("avg_hr", "averageHR"),
         ("max_hr", "maxHR"),
@@ -481,6 +663,8 @@ def parse_activity_summary(payload: dict[str, Any]) -> dict[str, Any]:
         ("body_battery_change", "differenceBodyBattery"),
         ("water_estimated_ml", "waterEstimated"),
         ("is_pr", "isPR"),
+        ("norm_power_w", "normPower"),
+        ("vo2max", "vO2MaxValue"),
         ("avg_stride_length_cm", "avgStrideLength"),
         ("avg_vertical_oscillation_cm", "avgVerticalOscillation"),
         ("avg_ground_contact_time_ms", "avgGroundContactTime"),
@@ -506,6 +690,16 @@ def parse_activity_summary(payload: dict[str, Any]) -> dict[str, Any]:
         out["avg_speed_kmh"] = round(out["avg_speed_kmh"] * 3.6, 2)
     if isinstance(out.get("max_speed_kmh"), (int, float)):
         out["max_speed_kmh"] = round(out["max_speed_kmh"] * 3.6, 2)
+    # Running pace in min/km (decimal minutes), only for running-type
+    # activities — the same number flipped from km/h, in the units runners
+    # actually talk in. Non-running activities get NULL, not a meaningless
+    # min/km.
+    if (
+        out.get("activity_type") in _RUNNING_TYPES
+        and isinstance(out.get("avg_speed_kmh"), (int, float))
+        and out["avg_speed_kmh"] > 0
+    ):
+        out["pace_min_km"] = round(60 / out["avg_speed_kmh"], 2)
     # Heart-rate zones 1..5: each as a percentage of total activity duration.
     duration_s = payload.get("duration")
     if isinstance(duration_s, (int, float)) and duration_s > 0:
@@ -513,10 +707,29 @@ def parse_activity_summary(payload: dict[str, Any]) -> dict[str, Any]:
             secs = payload.get(f"hrTimeInZone_{zone}")
             if isinstance(secs, (int, float)) and secs > 0:
                 out[f"hr_time_zone_{zone}_pct"] = round(secs / duration_s * 100, 1)
+    # Power zones 1..5: same layout (seconds in zone -> % of duration).
+    if isinstance(duration_s, (int, float)) and duration_s > 0:
+        for zone in range(1, 6):
+            secs = payload.get(f"powerTimeInZone_{zone}")
+            if isinstance(secs, (int, float)) and secs > 0:
+                out[f"power_time_zone_{zone}_pct"] = round(secs / duration_s * 100, 1)
     # start_date: local start date (YYYY-MM-DD).
     start_date = str(out.get("start_time_local") or "")[:10]
     if start_date:
         out["start_date"] = start_date
+    # End time (local wall clock): Garmin only exposes endTimeGMT, so derive
+    # the local end from the local start plus elapsed duration (this matches
+    # the app's displayed end time, since local and GMT shift together).
+    start_local = out.get("start_time_local")
+    elapsed_s = payload.get("elapsedDuration") or payload.get("duration")
+    if isinstance(start_local, str) and isinstance(elapsed_s, (int, float)):
+        try:
+            end = datetime.strptime(
+                start_local, "%Y-%m-%d %H:%M:%S"
+            ) + timedelta(seconds=elapsed_s)
+            out["end_time_local"] = end.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
     return out
 
 
@@ -528,9 +741,7 @@ def build_activity_summaries(db: Any, force: bool = False) -> dict[str, int]:
     changed since last parse are touched unless ``force``. Returns
     {"activities": rows_parsed}.
     """
-    rows = db.conn.execute(
-        "SELECT activity_id, raw_json, fetched_at FROM activities"
-    ).fetchall()
+    rows = db.activity_rows()
     marker = "summary_parsed_at"
     stamped = {} if force else db.activity_parsed_at(marker)
     count = 0
@@ -574,11 +785,11 @@ _SERIES_COLUMNS = {
     "directTimestamp": "ts_ms",
     "directHeartRate": "heart_rate",
     "directPower": "power_w",
-    "directSpeed": "speed_mps",
+    "directSpeed": "speed_kmh",
     "directElevation": "elevation_m",
     "sumDistance": "distance_m",
-    "directLatitude": "latitude",
-    "directLongitude": "longitude",
+    "directRespirationRate": "respiration_rate",
+    "sumAccumulatedPower": "accumulated_power_w",
 }
 
 
@@ -676,6 +887,9 @@ def parse_activity_detail_series(payload: dict[str, Any]) -> list[dict[str, Any]
             if isinstance(v, (int, float)) and v == v:  # reject NaN only
                 if col_name == "cadence":
                     projected[col_name] = float(v) * cadence_scale
+                elif col_name == "speed_kmh":
+                    # Garmin records m/s -> km/h (x3.6).
+                    projected[col_name] = round(float(v) * 3.6, 2)
                 else:
                     projected[col_name] = float(v)
         if len(projected) > 1:
@@ -693,11 +907,7 @@ def build_activity_details(db: Any, force: bool = False) -> dict[str, int]:
     Only activities whose details changed since last parse are touched unless
     ``force``.
     """
-    rows = db.conn.execute(
-        "SELECT activity_id, details_json, details_fetched_at, fetched_at "
-        "FROM activities "
-        "WHERE details_json IS NOT NULL AND details_json != ''"
-    ).fetchall()
+    rows = db.activity_detail_rows()
     marker = "details_parsed_at"
     stamped = {} if force else db.activity_parsed_at(marker)
     activities = 0
@@ -719,6 +929,119 @@ def build_activity_details(db: Any, force: bool = False) -> dict[str, int]:
             series += db.replace_activity_series(row["activity_id"], ticks)
         db.mark_activity_parsed(row["activity_id"], marker, "details_fetched_at")
     return {"activities": activities, "series": series}
+
+
+# --- Activity splits ---------------------------------------------------------
+#
+# Each activity's splits payload (per-lap work/rest chunks from
+# ``get_activity_splits``) is stored raw on the ``activities`` row
+# (``splits_json``) and projected below into the ``activity_splits`` table.
+# Pace is derived from distance+duration so it is comparable regardless of the
+# units Garmin happens to use in the raw field.
+
+
+def _split_type(item: dict[str, Any]) -> str:
+    """Map Garmin's lap ``intensityType`` to the documented ``split_type``.
+
+    Garmin tags a lap as ACTIVE (a work chunk, e.g. a per-km distance split),
+    REST or INACTIVE (a recovery chunk). Anything else is passed through
+    lowercased, falling back to "split".
+    """
+    raw = (item.get("intensityType") or item.get("splitType") or "").strip().upper()
+    if raw == "ACTIVE":
+        return "distance"
+    if raw in ("REST", "INACTIVE"):
+        return "rest"
+    return raw.lower() or "split"
+
+
+def parse_activity_splits(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project an activity's splits payload into typed per-split rows.
+
+    Garmin's ``get_activity_splits`` payload carries the per-lap list under
+    ``lapDTOs`` (some payload shapes use ``splits``); each lap is one
+    work/rest chunk with distance, duration and (for most sports) HR/power/
+    cadence. ``start_time_s`` is the lap's offset into the activity (seconds,
+    accumulated from preceding laps' elapsed durations). Returns [] for a
+    payload with no usable lap list. Values that the sport didn't record are
+    omitted (NULL at insert).
+    """
+    raw_splits = payload.get("lapDTOs")
+    if raw_splits is None:
+        raw_splits = payload.get("splits")
+    if not isinstance(raw_splits, list) or not raw_splits:
+        return []
+    rows: list[dict[str, Any]] = []
+    offset = 0.0
+    for index, item in enumerate(raw_splits):
+        if not isinstance(item, dict):
+            continue
+        row: dict[str, Any] = {
+            "split_number": index,
+            "split_type": _split_type(item),
+            "start_time_s": offset,
+        }
+        distance = _num(item.get("distance"))
+        duration = _num(item.get("duration"))
+        if distance is not None:
+            row["distance_m"] = round(distance, 1)
+        if duration is not None:
+            row["duration_s"] = round(duration, 1)
+        if distance and duration:
+            row["pace_sec_per_km"] = round(duration / (distance / 1000.0), 1)
+        for src, col in (
+            ("averageHR", "avg_hr"),
+            ("avgHr", "avg_hr"),
+            ("maxHR", "max_hr"),
+            ("maxHr", "max_hr"),
+            ("averagePower", "avg_power"),
+            ("avgPower", "avg_power"),
+            ("maxPower", "max_power"),
+            ("averageRunCadence", "avg_cadence"),
+            ("averageBikeCadence", "avg_cadence"),
+            ("avgCadence", "avg_cadence"),
+            ("maxRunCadence", "max_cadence"),
+            ("maxBikeCadence", "max_cadence"),
+            ("maxCadence", "max_cadence"),
+            ("elevationGain", "elevation_gain_m"),
+        ):
+            value = _num(item.get(src))
+            if value is not None:
+                row[col] = value
+        elapsed = _num(item.get("elapsedDuration"))
+        offset += elapsed if elapsed is not None else (duration or 0.0)
+        rows.append(row)
+    return rows
+
+
+def build_activity_splits(db: Any, force: bool = False) -> dict[str, int]:
+    """Project stored activity splits payloads into the ``activity_splits`` table.
+
+    For each stored activity with a splits payload, replaces the per-split
+    projection. Only activities whose splits payload changed since last parse
+    are touched unless ``force``. Returns {"activities": parsed,
+    "splits": splits_written}.
+    """
+    rows = db.activity_split_rows()
+    marker = "splits_parsed_at"
+    stamped = {} if force else db.activity_parsed_at(marker)
+    activities = 0
+    splits = 0
+    for row in rows:
+        if (
+            not force
+            and row["splits_fetched_at"] is not None
+            and stamped.get(row["activity_id"]) == row["splits_fetched_at"]
+        ):
+            continue
+        payload = json.loads(row["splits_json"])
+        parsed = parse_activity_splits(payload)
+        if parsed:
+            splits += db.replace_activity_splits(row["activity_id"], parsed)
+            activities += 1
+        if row["splits_fetched_at"] is not None:
+            db.mark_activity_parsed(row["activity_id"], marker, "splits_fetched_at")
+    return {"activities": activities, "splits": splits}
 
 
 # --- Heart-rate zone profiles ------------------------------------------------
@@ -787,6 +1110,74 @@ def build_hr_zones(db: Any) -> dict[str, int]:
     return {"hr_zones": db.replace_hr_zones(rows)}
 
 
+# --- Power-zone profiles -----------------------------------------------------
+#
+# Cycling power-zone boundaries are a *user profile* setting (per sport), like
+# HR zones: the device stores each sport's zone floors (watts) plus the
+# functional threshold power used to compute them. Stored raw in
+# ``user_profile`` (profile_type='power_zones'); the projection below replaces
+# the whole ``power_zones`` table with one row per sport. Zone N spans
+# ``zoneN_floor`` up to (but not including) ``zoneN+1_floor``; the last zone
+# runs to the functional threshold power.
+
+
+def parse_power_zones(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project the power-zones payload into per-sport zone-range rows.
+
+    Mirrors ``parse_hr_zones``: one row per sport; zone N = [floor_N,
+    floor_(N+1)) for N < 7, zone 7 = [floor, functional_threshold_power].
+    A sport with no numeric floors yields no row.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        sport = item.get("sportType") or item.get("sport")
+        if not sport:
+            continue
+        floors = [item.get(f"zone{n}Floor") for n in range(1, 8)]
+        if not any(isinstance(f, (int, float)) for f in floors):
+            continue
+        ftp = item.get("functionalThresholdPower")
+        if not isinstance(ftp, (int, float)):
+            ftp = None
+        row: dict[str, Any] = {
+            "sport": sport,
+            "functional_threshold_power": ftp,
+        }
+        for n in range(1, 8):
+            lo = floors[n - 1]
+            if not isinstance(lo, (int, float)):
+                continue
+            hi = ftp if n == 7 else (
+                floors[n] - 1
+                if isinstance(floors[n], (int, float)) and n < 7
+                else None
+            )
+            row[f"zone{n}_min"] = lo
+            row[f"zone{n}_max"] = hi
+        rows.append(row)
+    return rows
+
+
+def build_power_zones(db: Any) -> dict[str, int]:
+    """Project the stored power-zone profile into the ``power_zones`` table.
+
+    Replaces the whole table from the latest stored payload (user_profile key
+    'power_zones'). Returns {"power_zones": rows}.
+    """
+    profile = db.get_profile("power_zones")
+    if not profile:
+        return {"power_zones": 0}
+    payload = json.loads(profile["raw_json"])
+    if not isinstance(payload, list):
+        return {"power_zones": 0}
+    rows = parse_power_zones(payload)
+    for row in rows:
+        row["fetched_at"] = profile["fetched_at"]
+    return {"power_zones": db.replace_power_zones(rows)}
+
+
 # --- Race predictions ---------------------------------------------------------
 #
 # Garmin's race predictor is a current-fitness snapshot (predicted finish times
@@ -835,6 +1226,158 @@ def build_race_predictions(db: Any) -> dict[str, int]:
         return {"race_predictions": 0}
     row["fetched_at"] = profile["fetched_at"]
     return {"race_predictions": db.replace_race_predictions(row)}
+
+
+# --- Gear ---------------------------------------------------------------------
+#
+# Garmin gear (bikes, shoes, ...) is a current "what's in your garage" snapshot,
+# like hr_zones: one entry per item with its cumulative stats (distance ridden,
+# max speed, activity count, last use). Stored raw in ``user_profile``
+# (profile_type='gear') and projected below into one ``gear`` row per item,
+# replacing the whole table each sync (no history).
+
+
+def _gear_value(item: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """First present non-None, non-empty value among candidate keys."""
+    for key in keys:
+        if isinstance(item, dict):
+            value = item.get(key)
+            if value is not None and value != "":
+                return value
+    return default
+
+
+def _iso_date(value: Any) -> str | None:
+    """Normalise a Garmin datetime string to ``YYYY-MM-DD`` (or None)."""
+    if not isinstance(value, str):
+        return None
+    return value[:10] or None
+
+
+def parse_gear(payload: Any) -> list[dict[str, Any]]:
+    """Project the gear payload into per-item rows (most recent stats).
+
+    The gear list may come back as a bare list or wrapped (e.g.
+    ``{"gearList": [...]}``). Only a minimal, high-signal set is kept per item:
+    type, name, cumulative distance, activity count, last use and retired
+    status. ``name`` is the user's nickname (``displayName``) when set,
+    otherwise the real product name (``customMakeModel``, e.g. "novablast 5").
+    Cumulative stats (total distance, activity count, last activity date)
+    arrive per item from the stats endpoint merged into the same dict.
+    Distance is meters -> km.
+    """
+    if isinstance(payload, dict):
+        for key in ("gearList", "gear", "items"):
+            wrapped = payload.get(key)
+            if isinstance(wrapped, list):
+                payload = wrapped
+                break
+    if not isinstance(payload, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        gear_uuid = _gear_value(item, "uuid", "gearUUID", "gearUuid")
+        if not gear_uuid:
+            continue
+        row: dict[str, Any] = {
+            "gear_uuid": str(gear_uuid),
+            "gear_type": _gear_value(item, "gearTypeName", "typeKey", "type", "gearType"),
+            "name": _gear_value(item, "displayName", "nickname")
+            or _gear_value(item, "customMakeModel", "customModel", "model"),
+            "last_activity_date": _iso_date(
+                _gear_value(item, "lastActivityDate", "lastUsedDate")
+            ),
+        }
+        distance_m = _gear_value(item, "totalDistance", "totalDistanceMeters", "distance")
+        if isinstance(distance_m, (int, float)):
+            row["total_distance_km"] = round(distance_m / 1000, 3)
+        activity_count = _gear_value(
+            item, "activityCount", "totalActivities", "numberOfActivities", "activity_count"
+        )
+        if isinstance(activity_count, (int, float)):
+            row["activity_count"] = int(activity_count)
+        status = _gear_value(item, "gearStatusName", "status")
+        if isinstance(status, str) and status:
+            row["retired"] = status.lower() == "retired"
+        else:
+            retired = _gear_value(item, "retired", "isRetired")
+            if isinstance(retired, bool):
+                row["retired"] = retired
+            elif isinstance(retired, (int, float)):
+                row["retired"] = bool(retired)
+        rows.append(row)
+    return rows
+
+
+def build_gear(db: Any) -> dict[str, int]:
+    """Project the stored gear snapshot into the ``gear`` table.
+
+    Replaces the whole table from the latest stored payload (user_profile key
+    'gear'). Returns {"gear": rows}.
+    """
+    profile = db.get_profile("gear")
+    if not profile:
+        return {"gear": 0}
+    payload = json.loads(profile["raw_json"])
+    rows = parse_gear(payload)
+    if not rows:
+        return {"gear": 0}
+    for row in rows:
+        row["fetched_at"] = profile["fetched_at"]
+    return {"gear": db.replace_gear(rows)}
+
+
+# --- Devices -----------------------------------------------------------------
+#
+# The current device list (from ``get_devices``) is stored raw in
+# ``user_profile`` (profile_type='devices'). Only the identity is kept — the
+# agent needs the model name to say what the user records on; battery/firmware/
+# last-used are noise and the per-device settings calls that would populate them
+# were dropped. The projection replaces the whole ``devices`` table with one row
+# per device.
+
+
+def parse_devices(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project the device snapshot into one row per device.
+
+    Returns [] for a payload with no usable device rows.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        device_id = item.get("deviceId")
+        if device_id is None:
+            continue
+        rows.append(
+            {
+                "device_id": device_id,
+                "model_name": item.get("modelName"),
+                "display_name": item.get("displayName") or item.get("deviceName"),
+            }
+        )
+    return rows
+
+
+def build_devices(db: Any) -> dict[str, int]:
+    """Project the stored device snapshot into the ``devices`` table.
+
+    Replaces the whole table from the latest stored payload (user_profile key
+    'devices'). Returns {"devices": rows}.
+    """
+    profile = db.get_profile("devices")
+    if not profile:
+        return {"devices": 0}
+    payload = json.loads(profile["raw_json"])
+    if not isinstance(payload, list):
+        return {"devices": 0}
+    rows = parse_devices(payload)
+    for row in rows:
+        row["fetched_at"] = profile["fetched_at"]
+    return {"devices": db.replace_devices(rows)}
 
 
 # --- Activity weather ---------------------------------------------------------
@@ -890,10 +1433,7 @@ def build_activity_weather(db: Any, force: bool = False) -> dict[str, int]:
     weather payload changed since last parse are touched unless ``force``.
     Returns {"activities": rows_parsed}.
     """
-    rows = db.conn.execute(
-        "SELECT activity_id, weather_json, weather_fetched_at FROM activities "
-        "WHERE weather_json IS NOT NULL AND weather_json != ''"
-    ).fetchall()
+    rows = db.activity_weather_rows()
     marker = "weather_parsed_at"
     stamped = {} if force else db.activity_parsed_at(marker)
     count = 0

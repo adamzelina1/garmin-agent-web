@@ -1,11 +1,12 @@
-"""AI agent that answers questions by querying the local Garmin database.
+"""AI agent that answers questions by querying the per-user Garmin database.
 
 The agent layer is deliberately thin: a ``ReadOnlyDB`` executor that exposes
 schema introspection and safe ``SELECT`` queries, wrapped in a Pydantic AI
-agent whose tools let the model inspect and query the SQLite store. All data
-access is read-only by construction (``PRAGMA query_only`` + an authorizer
-that denies write opcodes + a statement gate), so a model can never mutate
-``garmin.db``.
+agent whose tools let the model inspect and query the Postgres store. All data
+access is read-only by construction (the agent connects as a SELECT-only PG
+role, and Row-Level Security scopes every row to ``current_setting('app.user_id')``)
+plus a statement gate as a second layer, so a model can never mutate the DB or
+read another account's rows.
 
 The model/provider is swappable: point ``LLM_BASE_URL`` at Ollama (local,
 data stays on-machine) or leave it unset to use the OpenAI API
@@ -13,12 +14,13 @@ data stays on-machine) or leave it unset to use the OpenAI API
 
 The agent also has a stateless ``weather`` tool (Open-Meteo archive + short
 forecast) to contextualise stored facts — it never writes anything, so the
-SQLite store stays the sole source of truth.
+store stays the sole source of truth.
 
 ``garmin-ask`` runs a one-shot query, or (with no question argument) an
 interactive session that threads the conversation history through every turn
-so the model keeps context across questions. Pass ``--session FILE`` to
-persist that history after each turn and resume it on a later run.
+so the model keeps context across questions. Both the conversation and the
+long-term memory profile are persisted per user in Postgres (the ``user_state``
+table), so a later ``garmin-ask`` resumes exactly where the last one left off.
 
 The interactive session understands two extra commands:
 ``/clear`` wipes the context and starts a new session with no prior history;
@@ -31,19 +33,43 @@ from __future__ import annotations
 
 import json
 import re
-import os
-import secrets
-import sqlite3
-import time
+from contextlib import contextmanager
+from decimal import Decimal
 from argparse import ArgumentParser, Namespace
-from datetime import date, timedelta
-from pathlib import Path
-from typing import Any, Callable
+from datetime import date, datetime, time, timedelta
+from typing import Any, Callable, Protocol
+
+import psycopg
 
 from .config import load_config
 
+
+class _Memory(Protocol):
+    """The durable per-user memory interface (implemented by
+    ``server.state.PgMemory``)."""
+
+    def get(self) -> dict[str, str]: ...
+
+    def remember(self, key: str, value: str) -> None: ...
+
+    def forget(self, key: str) -> bool: ...
+
+
+class _Plan(Protocol):
+    """The per-user training-plan interface (implemented by
+    ``server.state.TrainingPlan``)."""
+
+    def list(
+        self,
+        date_start: str | None = None,
+        date_end: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def apply(self, spec: dict[str, Any]) -> dict[str, Any]: ...
+
+
 #: Guard a statement is a read-only query and not a write.
-_SELECT_PREFIX = re.compile(r"^\s*(?:SELECT|WITH|EXPLAIN|PRAGMA)\b", re.IGNORECASE)
+_SELECT_PREFIX = re.compile(r"^\s*(?:SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
 _WRITE_WORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|REINDEX|VACUUM|"
     r"REPLACE|TRIGGER)\b",
@@ -52,75 +78,165 @@ _WRITE_WORDS = re.compile(
 
 _MAX_ROWS = 200
 
+#: Training-plan tool guardrails: by default ``get_training_plan`` returns only
+#: this window (recent past + upcoming) so a long completed history is never
+#: pulled into the model context, and caps the rows at the safety limit.
+_PLAN_PAST_DAYS = 30
+_PLAN_FUTURE_DAYS = 180
+_PLAN_MAX_WORKOUTS = 200
+
 #: Tables the agent may see and query. Everything else (raw ``metrics``,
-#: ``activities``, ``user_profile``, ``sync_state``) stays invisible to the model.
+#: ``activities``, ``user_profile``, ``sync_state``) stays invisible to the
+#: model — and, at the database level, unreadable by the agent's SELECT-only
+#: role (real REVOKEs). This list is the second-layer statement gate.
 _ALLOWED_TABLES = (
-    "daily_metrics", "activity_summaries", "activity_detail_series", "hr_zones",
-    "race_predictions",
+    "daily_metrics", "activity_summaries", "activity_detail_series",
+    "activity_splits", "hr_zones", "power_zones", "race_predictions", "gear",
+    "devices", "derived_metrics", "training_plan",
 )
 
-#: How the model should interpret the stored metrics (units, NULL semantics).
-_SYSTEM_PROMPT = """\
-You are an analyst with read-only access to a local SQLite database of personal
+#: Data-driven schema annotations: table-level notes and per-column unit/semantic
+#: hints. ``_schema_text`` generates the agent-facing schema from these plus the
+#: live columns, so a schema change needs at most one dict entry here — never a
+#: prose edit that can drift out of sync.
+_TABLE_NOTES: dict[str, str] = {
+    "daily_metrics": "one row per calendar_date (YYYY-MM-DD)",
+    "activity_summaries": "one row per activity",
+    "activity_detail_series": (
+        "one row per tick (activity_id + tick); prefer aggregate/interval "
+        "queries; a metric may be NULL on every tick if the device didn't record it"
+    ),
+    "activity_splits": "one row per split (activity_id + split_type + split_number)",
+    "hr_zones": "configured HR zone boundaries, one row per sport; current snapshot",
+    "power_zones": "configured power zones (watts) + FTP, one row per sport; current snapshot",
+    "race_predictions": "single current-fitness snapshot",
+    "gear": "one row per item; current snapshot (each sync replaces it)",
+    "devices": "one row per device; current snapshot",
+    "derived_metrics": (
+        "one row per (calendar_date, metric); daily derived scores recomputed "
+        "and stored each sync. metric = 'readiness' (0-100 score) with "
+        "readiness_hrv/readiness_rhr/readiness_sleep (raw values), "
+        "readiness_z_hrv/readiness_z_rhr/readiness_z_sleep (z-scores), "
+        "readiness_composite, readiness_samples_hrv/rhr/sleep; 'acwr' (ratio) "
+        "with acwr_acute_load / acwr_chronic_load / acwr_daily_load. Pivot with "
+        "WHERE metric = '<name>' (a day's components share its calendar_date)"
+    ),
+    "training_plan": "planned workouts; READ-ONLY via SQL — write only through the plan tools",
+}
+
+#: Per-column hints for columns whose unit or meaning is non-obvious. Keyed by
+#: table, then column; an entry only shows up when that column actually exists.
+_COLUMN_DOCS: dict[str, dict[str, str]] = {
+    "daily_metrics": {
+        "total_distance_m": "METRES (activity_summaries.distance_km is km)",
+        "sleep_start_local": "wall-clock HH:MM",
+        "sleep_end_local": "wall-clock HH:MM",
+        "sleep_score": "0-100",
+        "hrv_last_night_avg": "HRV score (ms)",
+        "vo2max": "precise VO2max estimate, forward-filled",
+        "resting_hr": "bpm; no 7-day avg stored — compute rolling averages yourself",
+        "lactate_threshold_hr": "bpm, forward-filled",
+        "lactate_threshold_speed_kmh": "km/h, forward-filled",
+        "running_ftp_watts": "running FTP (watts), forward-filled",
+        "cycling_ftp_watts": "cycling FTP (watts); absent without a power meter",
+        "sweat_loss_ml": "estimated sweat loss (ml)",
+    },
+    "activity_summaries": {
+        "activity_type": "Garmin typeKey (e.g. running, road_biking)",
+        "distance_km": "km",
+        "duration_hours": "hours",
+        "elapsed_hours": "hours",
+        "moving_hours": "hours",
+        "avg_hr": "bpm",
+        "max_hr": "bpm",
+        "pace_min_km": "running min/km (decimal, 5.5 = 5:30); NULL for non-running",
+        "vo2max": "the activity's own VO2max estimate",
+        "weather_temp_c": "degC",
+        "weather_apparent_c": "degC",
+        "weather_humidity": "0-100",
+        "weather_wind_kmh": "km/h",
+        "weather_description": "e.g. 'Fair'; NULL for indoor/weatherless",
+        "is_pr": "personal record flag",
+    },
+    "activity_detail_series": {
+        "distance_m": "cumulative metres",
+        "ts_ms": "epoch ms",
+        "speed_kmh": "km/h",
+        "power_w": "watts",
+        "accumulated_power_w": "watts",
+    },
+    "activity_splits": {
+        "distance_m": "metres",
+        "duration_s": "seconds",
+        "start_time_s": "offset into the activity (seconds)",
+        "pace_sec_per_km": "seconds/km (lower = faster)",
+        "split_type": "'distance' (work) or 'rest'",
+    },
+    "race_predictions": {
+        "time_5k_min": "minutes",
+        "time_10k_min": "minutes",
+        "time_half_marathon_min": "minutes",
+        "time_marathon_min": "minutes",
+    },
+    "derived_metrics": {
+        "metric": "which derived metric the row holds — see the table note for known names",
+        "value": "the metric's value; units differ per metric (readiness 0-100, acwr ratio, loads arbitrary)",
+        "qualifier": "category label: readiness = Prime/Moderate/Low/Depleted; acwr = Sweet Spot/Elevated/Danger/Detraining",
+    },
+    "training_plan": {
+        "activity_type": "run/cycle/swim/strength/rest/other",
+        "duration_min": "planned minutes",
+        "distance_km": "planned km",
+        "completed_activity_id": (
+            "activity_summaries.activity_id that satisfied it — join for actual stats"
+        ),
+    },
+}
+
+#: The prompt, split into independently-editable sections. ``_PROMPT_ROLE`` is
+#: the only one with a ``{today}`` placeholder (formatted at build time); the
+#: rest are plain strings concatenated in order.
+_PROMPT_ROLE = """\
+You are an analyst with read-only access to a per-user Postgres database of personal
 Garmin health data. Today is {today}. Answer the user's questions by inspecting
 the schema and running read-only SELECT queries. You may run several queries.
-You can never write.
+You can never write — except through the dedicated training-plan tools (see below).
 
-Only five tables are available and you may only query these:
-- daily_metrics: one row per calendar_date, wide columns.
-  calendar_date is YYYY-MM-DD.
-- activity_summaries: one row per activity (activity_id), curated summary fields.
-  Also carries per-activity observed weather when Garmin recorded it:
-  weather_temp_c / weather_apparent_c (degC), weather_humidity (0-100),
-  weather_wind_kmh / weather_wind_gust_kmh (km/h), and
-  weather_description (e.g. "Fair"). Indoor or weatherless activities have
-  NULLs here.
-- activity_detail_series: the intra-activity time series, one row per tick
-  (activity_id + tick). Columns: heart_rate, cadence, power_w, speed_mps,
-  elevation_m, distance_m (cumulative metres), latitude, longitude, ts_ms
-  (epoch ms). A sport's device may not record a metric, in which case that
-  column is NULL for every tick. Prefer aggregate/interval queries over this
-  table (e.g. per-km buckets via distance_m, or WHERE heart_rate > X).
-- hr_zones: the user's configured heart-rate zone boundaries, one row per
-  sport (sport: DEFAULT/RUNNING/CYCLING/...). zoneN_min..zoneN_max give each
-  zone's bpm range (e.g. zone2_min..zone2_max is the user's Zone 2). This is
-  the *current* device configuration snapshot, not historical.
-- race_predictions: a single current-fitness snapshot row with Garmin's
-  predicted race times, in MINUTES: time_5k_min, time_10k_min,
-  time_half_marathon_min, time_marathon_min (NULL when a prediction is
-  unavailable). calendar_date is when the prediction was made.
+This session may run for a long time, so the date baked into this prompt can go
+stale across days. Whenever the answer depends on "today"/"tomorrow"/"this week"
+or other relative dates, call the ``today`` tool and use its result — never rely
+on the date above alone.
 
-Units and semantics:
-- Sleep durations (sleep_time_hours, nap_time_hours, deep_sleep_hours,
-  light_sleep_hours, rem_sleep_hours, awake_sleep_hours,
-  unmeasurable_sleep_hours) are in HOURS.
-- sleep_start_local / sleep_end_local are wall-clock 'HH:MM' strings.
-- daily_metrics.total_distance_m is in METRES. activity_summaries.distance_km
-  is in KM; its durations (duration_hours etc.) are in HOURS.
-- body battery is 0..100; stress and heart rate are bpm; hrv_last_night_avg is
-  an HRV score; sleep_score is 0..100.
-- Almost every column may be NULL on days where the value is N/A. Only use
-  aggregate functions over the rows you have.
+Column suffixes are the units: *_kmh = km/h, *_m = metres, *_w = watts, *_hours
+= hours, *_min = minutes, *_c = degC, *_ml = ml, *_kcal = kcal. *_pct = percent
+(zone *_pct = % of activity duration spent in that zone). Heart rate is bpm,
+cadence is spm, body battery and stress are 0-100. Columns with non-obvious
+units or special meaning carry a parenthetical note in the schema below.
+"""
 
-Result sets are capped at 200 rows, so prefer aggregated queries (GROUP BY
-weeks/months/weekdays) over dumping raw rows. Never use SELECT *; list only
-the columns you need (daily_metrics is ~50 columns wide and activity_summaries
-~38). Keep result sets tiny: select a handful of columns and aggregate to at
-most ~100-200 rows, ORDER BY time columns so trends read naturally. Prefer
-small probes — e.g. query with LIMIT 10 to sanity-check columns before a
-full aggregation.
+_PROMPT_QUERY = """\
+Almost every column may be NULL on days/rows where the value is N/A; only use
+aggregate functions over the rows you have. Result sets are capped at 200 rows,
+so prefer aggregated queries (GROUP BY weeks/months/weekdays) over dumping raw
+rows. Never use SELECT *; list only the columns you need (daily_metrics is ~60
+columns wide and activity_summaries ~58). Keep result sets tiny: select a handful
+of columns and aggregate to at most ~100-200 rows, ORDER BY time columns so
+trends read naturally. Prefer small probes — e.g. query with LIMIT 10 to
+sanity-check columns before a full aggregation.
+"""
 
+_PROMPT_CHARTS = """\
 When asked for a chart or visualization: call the chart tool to validate a
 spec. The spec is a JSON object of your OWN design (you write the graph, not
-the data): {{"sql": "SELECT ...", "traces": [{{...}}], "layout": {{"title":
-{{"text": "..."}}}}}}. The `sql` must return the plotted data itself (column
+the data): {"sql": "SELECT ...", "traces": [{...}], "layout": {"title":
+{"text": "..."}}}. The `sql` must return the plotted data itself (column
 names in the traces reference its result). You are free to draw ANY Plotly
 figure: each trace names a plotly.graph_objects class via "go" (e.g. "Scatter",
 "Scattergl", "Violin", "Heatmap", "Pie", "Bar", "Candlestick") — the compact
 aliases line / scatter / area / bar / pie / histogram / box also work. Data
 columns are referenced by name in x / y / z, and any other numeric trace
-argument can reference a column as {{"column": "<name>"}} (e.g. for a pie:
-{{"labels": {{"column": "sport_type"}}, "values": {{"column": "hours"}}}}).
+argument can reference a column as {"column": "<name>"} (e.g. for a pie:
+{"labels": {"column": "sport_type"}, "values": {"column": "hours"}}).
 Every remaining key in a trace is passed straight to the Plotly constructor
 (mode, marker, line, opacity, orientation, colorscale, text, ...). Keep points
 to at most ~200 by aggregating (GROUP BY week/month/weekday) and ORDER BY time
@@ -130,19 +246,23 @@ valid. Embed only the spec JSON — the object after "OK: " — VERBATIM in the
 final answer wrapped in <chart> ... </chart> (one per chart) and add a short
 one-sentence description of what it shows as normal text. Do NOT paste query
 data or Python code into your answer — only the spec.
+"""
 
+_PROMPT_WEATHER = """\
 Weather: observed conditions during a workout are already stored per activity
 in activity_summaries (weather_temp_c, weather_apparent_c, weather_humidity,
-weather_wind_kmh, weather_description) — prefer those columns
-whenever a question is about the weather at the time/location of a stored
-activity. The `weather` tool is for what the stored data does NOT cover: (1) the short forecast (today/tomorrow),
-(2) historical weather for days with no activity (e.g. correlate a restless
-night with the temperature), and (3) weather at any location via explicit
-`lat`/`lon` (default: GARMIN_HOME_LAT/GARMIN_HOME_LON). It returns per-day
-min/max temp (degC), precipitation (mm) and max wind (km/h) for a range fully
-before today (historical) or starting today (forecast). It is never a
+weather_wind_kmh, weather_description) — prefer those columns whenever a
+question is about the weather at the time/location of a stored activity. The
+`weather` tool is for what the stored data does NOT cover: (1) the short forecast
+(up to 16 days ahead), (2) historical weather for days with no activity (e.g.
+correlate a restless night with the temperature), and (3) weather at any location
+via explicit `lat`/`lon` (default: GARMIN_HOME_LAT/GARMIN_HOME_LON). It returns
+per-day min/max temp (degC), precipitation (mm) and max wind (km/h) for a range
+fully before today (historical) or starting today (forecast). It is never a
 substitute for a database value: exact answers must still come from the tables.
+"""
 
+_PROMPT_MEMORY = """\
 Long-term memory: you keep a persistent profile of the user across sessions.
 Call get_memory() when personal context may matter. Save with
 remember_memory(key, value) — short lowercase keys, concise values — only
@@ -153,9 +273,38 @@ FTP, LTHR), no personal records, no race predictions, no training zones, no
 baseline resting HR/HRV — those all belong in the tables and are re-derived
 on demand. Memory exists solely to hold what the database cannot tell you.
 Overwrite a key when a fact changes, and skip ephemeral or one-off details.
+"""
 
+_PROMPT_PLAN = """\
+Training plan: the user keeps a training plan (a set of planned workouts) shown
+on the site and editable both manually and through you. Read it with
+get_training_plan() and update it with update_training_plan(). When the user
+asks to create or adjust a training plan (e.g. "build a 12-week half-marathon
+plan starting Monday", "move my Thursday run to Friday", "add an easy swim on
+Wednesday"), plan the workouts yourself — dates (YYYY-MM-DD), activity_type
+(run/cycle/swim/strength/rest/other), title, duration_min, distance_km,
+intensity (easy/moderate/hard/race_pace) — and call update_training_plan with
+the complete set. Pass "replace": true when the user wants a brand-new plan
+(so stale workouts are cleared first). Use the schema and existing data (e.g.
+recent weekly mileage, race predictions, VO2max, hr_zones) to make the plan
+sensible and specific to the user. After updating, tell the user what you
+added/changed (a concise weekly summary is ideal).
+
+When the user wants to SEE the plan (or a slice of it) in the chat, call
+get_training_plan() to inspect it, then do NOT transcribe the workouts into a
+markdown table and NEVER paste the raw JSON the tool returns. Instead embed
+this exact marker in your answer: <plan_table /> — optionally with date
+bounds, e.g. <plan_table from="2026-08-10" to="2026-08-16" />. The UI replaces
+the marker with the user's stored plan rendered directly from the database
+(identical to the Training Plan tab), so you never burn tokens writing the
+table out. Keep your narrative answer short — the marker renders the table
+for you.
+"""
+
+_PROMPT_ANSWER = """\
 When returning an answer, refer to every number with its unit (e.g. "7.6
-hours of sleep", "22:35")."""
+hours of sleep", "22:35").
+"""
 
 #: Label placed ahead of a compacted summary when it seeds a new session.
 _SUMMARY_LABEL = "This is a compact summary of our previous conversation. Read it as context and continue normally."
@@ -170,43 +319,26 @@ Drop tool-call details, intermediate reasoning and redundancy. Do NOT call any
 tools. Return ONLY the summary, with no preamble or commentary."""
 
 
-def _deny(action: int, *args: Any) -> int:
-    """Authorizer: deny write opcodes, allow everything else.
-
-    ``return sqlite3.SQLITE_DENY`` aborts the offending statement. The sqlite
-    authorizer callback is invoked with 5 positional arguments; only ``action``
-    is relevant here.
-    """
-    blocked = {
-        sqlite3.SQLITE_INSERT,
-        sqlite3.SQLITE_UPDATE,
-        sqlite3.SQLITE_DELETE,
-        sqlite3.SQLITE_DROP_TABLE,
-        sqlite3.SQLITE_DROP_VIEW,
-        sqlite3.SQLITE_DROP_INDEX,
-        sqlite3.SQLITE_DROP_TRIGGER,
-        sqlite3.SQLITE_DROP_VTABLE,
-        sqlite3.SQLITE_CREATE_TABLE,
-        sqlite3.SQLITE_CREATE_VIEW,
-        sqlite3.SQLITE_CREATE_INDEX,
-        sqlite3.SQLITE_CREATE_TRIGGER,
-        sqlite3.SQLITE_CREATE_VTABLE,
-        sqlite3.SQLITE_ALTER_TABLE,
-        sqlite3.SQLITE_ATTACH,
-        sqlite3.SQLITE_DETACH,
-    }
-    if action in blocked:
-        return sqlite3.SQLITE_DENY
-    return sqlite3.SQLITE_OK
-
-
 def _jsonable(value: Any) -> Any:
-    """Coerce a SQLite value into a JSON-safe one."""
+    """Coerce a driver value into a JSON-safe one."""
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError:
             return value.hex()
+    if isinstance(value, Decimal):
+        # psycopg returns ``numeric`` (e.g. EXTRACT(...)) as Decimal, which the
+        # json module can't serialize; collapse to float (NaN -> null).
+        if value != value:
+            return None
+        try:
+            return float(value)
+        except (OverflowError, ValueError):
+            return str(value)
+    if isinstance(value, (datetime, date, time)):
+        # psycopg returns ``date``/``timestamp``/``time`` as their Python
+        # counterparts, which json can't serialize; emit ISO-8601 strings.
+        return value.isoformat()
     return value
 
 
@@ -376,45 +508,121 @@ def _build_chart_figure(
     return fig
 
 
-class ReadOnlyDB:
-    """Read-only handle over the Garmin database plus safe query execution.
+class QueryError(Exception):
+    """A read-only query was rejected by the Postgres driver."""
 
-    Every call opens its own short-lived connection with ``PRAGMA query_only``
-    and an authorizer that denies all write opcodes; ``run_sql`` additionally
-    guards the statement. Connections are per-call because Pydantic AI runs
-    tools from a worker thread (SQLite connections are thread-bound).
+
+#: Driver-level errors raised by the read-only PG role (psycopg is a hard
+#: dependency; there is no SQLite fallback).
+_DB_ERROR_TYPES: tuple[type[BaseException], ...] = (psycopg.Error,)
+
+
+class _PgReadOnlyBackend:
+    """Postgres read-only backend: pooled connections, ``information_schema``.
+
+    Read-only enforcement comes from the read-only PG role (+ Row-Level
+    Security, Phase 3): the role has SELECT on the five agent tables and
+    nothing else, and RLS filters every row by ``current_setting('app.user_id')``.
+    The agent's statement gate stays on top as a second layer. Per-call
+    connections are drawn from a shared ``psycopg_pool`` so concurrent chat
+    requests don't each open a fresh TCP connection.
     """
 
-    def __init__(self, db_path: str) -> None:
-        self.path = db_path
+    name = "postgres"
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only = ON")
-        conn.set_authorizer(_deny)
-        return conn
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self._pool = None
+
+    def _get_pool(self) -> Any:
+        if self._pool is None:
+            import psycopg
+            from psycopg_pool import ConnectionPool
+
+            self._pool = ConnectionPool(
+                self.dsn,
+                min_size=1,
+                max_size=8,
+                open=True,
+                configure=lambda conn: setattr(
+                    conn, "row_factory", psycopg.rows.dict_row
+                ),
+            )
+        return self._pool
+
+    def connect(self) -> Any:
+        """A pooled connection as a context manager (returns to pool on exit)."""
+        return self._get_pool().connection()
+
+    def table_names(self, conn: Any) -> list[str]:
+        return [
+            r["name"]
+            for r in conn.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema = 'public' ORDER BY table_name"
+            ).fetchall()
+        ]
+
+    def columns(self, conn: Any, table: str) -> list[dict[str, Any]]:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT column_name AS name, data_type AS type "
+                "FROM information_schema.columns WHERE table_name = %s "
+                "ORDER BY ordinal_position",
+                (table,),
+            ).fetchall()
+        ]
+
+    def row_values(self, row: Any) -> list[Any]:
+        return list(row.values())
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+
+
+class ReadOnlyDB:
+    """Read-only handle over one account's Garmin data plus safe query execution.
+
+    Bound to a ``user_id``: every call opens its own short-lived pooled
+    connection, runs ``SET LOCAL app.user_id = <uid>`` so Row-Level Security
+    scopes the transaction, and executes the query as the read-only PG role.
+    Connections are per-call because Pydantic AI runs tools from a worker
+    thread.
+    """
+
+    def __init__(self, url: str, *, user_id: int | None = None) -> None:
+        self.path = url
+        self.user_id = user_id
+        self._backend = _PgReadOnlyBackend(url)
+
+    @classmethod
+    def from_url(cls, url: str, *, user_id: int | None = None) -> "ReadOnlyDB":
+        """A Postgres-backed read-only handle from a ``postgres://`` DSN."""
+        return cls(url, user_id=user_id)
+
+    @contextmanager
+    def _connect(self) -> Any:
+        with self._backend.connect() as conn:
+            if self.user_id is not None:
+                conn.execute(
+                    "SELECT set_config('app.user_id', %s, true)",
+                    (str(self.user_id),),
+                )
+            yield conn
 
     def tables(self) -> list[str]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
-        return [r["name"] for r in rows if r["name"] in _ALLOWED_TABLES]
+            names = self._backend.table_names(conn)
+        return [n for n in names if n in _ALLOWED_TABLES]
 
     def _forbidden_table_regex(self) -> re.Pattern | None:
         """Regex matching any table the agent must not reference, or None."""
         with self._connect() as conn:
-            known = [
-                r["name"]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                ).fetchall()
-            ]
+            known = self._backend.table_names(conn)
         banned = [n for n in known if n not in _ALLOWED_TABLES]
-        banned.extend(["sqlite_master", "sqlite_sequence"])
         if not banned:
             return None
         alternatives = "|".join(
@@ -426,8 +634,7 @@ class ReadOnlyDB:
         if table not in _ALLOWED_TABLES:
             raise ValueError(f"unknown table: {table!r}")
         with self._connect() as conn:
-            rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
-        return [dict(r) for r in rows]
+            return self._backend.columns(conn, table)
 
     def date_range(self) -> dict[str, Any]:
         try:
@@ -436,7 +643,7 @@ class ReadOnlyDB:
                     "SELECT MIN(calendar_date) AS min_date, MAX(calendar_date) "
                     "AS max_date, COUNT(*) AS n FROM daily_metrics"
                 ).fetchone()
-        except sqlite3.DatabaseError:
+        except _DB_ERROR_TYPES:
             return {"min": None, "max": None, "rows": 0}
         return {
             "min": row["min_date"],
@@ -453,7 +660,7 @@ class ReadOnlyDB:
             raise ValueError("only a single statement is allowed")
         if not _SELECT_PREFIX.match(statement):
             raise ValueError(
-                "only SELECT / WITH / EXPLAIN / PRAGMA statements are allowed"
+                "only SELECT / WITH / EXPLAIN statements are allowed"
             )
         write_word = _WRITE_WORDS.search(statement)
         if write_word:
@@ -470,12 +677,14 @@ class ReadOnlyDB:
         with self._connect() as conn:
             try:
                 cur = conn.execute(statement)
-            except sqlite3.DatabaseError as exc:
-                raise sqlite3.DatabaseError(
+            except _DB_ERROR_TYPES as exc:
+                raise QueryError(
                     f"{exc} | statement: {statement!r}"
                 ) from exc
             columns = [d[0] for d in (cur.description or [])]
-            rows = [list(row) for row in cur.fetchmany(_MAX_ROWS + 1)]
+            rows = [
+                self._backend.row_values(row) for row in cur.fetchmany(_MAX_ROWS + 1)
+            ]
         truncated = len(rows) > _MAX_ROWS
         return {
             "columns": columns,
@@ -489,82 +698,8 @@ class ReadOnlyDB:
         }
 
     def close(self) -> None:
-        """Connections are per-call; nothing to release."""
-
-
-class Memory:
-    """A tiny persistent key/value store for long-term user facts.
-
-    Persisted as a JSON dict at ``path``. Reads and writes go straight to the
-    file per call (like the DB connections) so it is safe from agent worker
-    threads; writes are atomic-ish (tmp file then replace). Corruption or a
-    missing file degrades to an empty profile.
-    """
-
-    _MAX_KEY = 80
-    _MAX_VALUE = 2000
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-
-    def _read(self) -> dict[str, str]:
-        try:
-            data = json.loads(Path(self.path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        return {
-            k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)
-        }
-
-    def _write(self, data: dict[str, str]) -> None:
-        """Atomic-ish write with a unique tmp + retry, for Windows file locking.
-
-        The destination may be transiently held by another process (antivirus,
-        indexer, or a concurrent turn), which makes ``os.replace`` fail with
-        ``PermissionError [WinError 32]``. Each write uses its own temp name so
-        concurrent writers never clobber each other, and the replace is retried
-        briefly before re-raising.
-        """
-        path = Path(self.path)
-        tmp = path.with_name(f"{path.stem}.{secrets.token_hex(6)}.tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        try:
-            for attempt in range(5):
-                try:
-                    os.replace(tmp, path)
-                    return
-                except OSError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
-        finally:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    def get(self) -> dict[str, str]:
-        return self._read()
-
-    def remember(self, key: str, value: str) -> None:
-        key, value = key.strip(), value.strip()
-        if not key or len(key) > self._MAX_KEY:
-            raise ValueError(f"key must be 1..{self._MAX_KEY} characters")
-        if len(value) > self._MAX_VALUE:
-            raise ValueError(f"value must be at most {self._MAX_VALUE} characters")
-        data = self._read()
-        data[key] = value
-        self._write(data)
-
-    def forget(self, key: str) -> bool:
-        data = self._read()
-        if key not in data:
-            return False
-        del data[key]
-        self._write(data)
-        return True
+        """Release the pooled connections (no-op if never opened)."""
+        self._backend.close()
 
 
 class Weather:
@@ -579,7 +714,7 @@ class Weather:
     ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
     FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
     MAX_DAYS = 92
-    FORECAST_DAYS = 2
+    FORECAST_DAYS = 16
     _DAILY_FIELDS = (
         "temperature_2m_max,temperature_2m_min,precipitation_sum,"
         "wind_speed_10m_max"
@@ -652,9 +787,9 @@ class Weather:
         """Return per-day weather for ``date_start``..``date_end`` (inclusive).
 
         A range fully before *today* uses the historical archive; a range
-        starting today or later is the forecast (forecast days only). With no
-        dates the forecast for today/tomorrow is returned. Raises ``ValueError``
-        with a model-facing message on invalid input.
+        starting today or later is the forecast (up to ``FORECAST_DAYS`` days
+        ahead). With no dates the forecast from today onward is returned. Raises
+        ``ValueError`` with a model-facing message on invalid input.
         """
         lat, lon = self._resolve(lat, lon)
         today = self._today
@@ -693,17 +828,21 @@ class Weather:
                 "(history) or wholly today-and-later (forecast)"
             )
 
-        payload = self._get(
-            url,
-            {
-                "latitude": lat,
-                "longitude": lon,
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-                "daily": self._DAILY_FIELDS,
-                "timezone": "auto",
-            },
-        )
+        params: dict[str, Any] = {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": self._DAILY_FIELDS,
+            "timezone": "auto",
+        }
+        if url == self.ARCHIVE_URL:
+            params["start_date"] = start.isoformat()
+            params["end_date"] = end.isoformat()
+        else:
+            # Open-Meteo only returns `forecast_days` (default 7) unless asked,
+            # and `forecast_days` is mutually exclusive with start/end dates.
+            # Request from today and trim to the requested range in _compact.
+            params["forecast_days"] = (end - today).days + 1
+        payload = self._get(url, params)
         return self._compact(payload, lat, lon, start, end, url)
 
     def _compact(
@@ -719,11 +858,12 @@ class Weather:
         times = daily.get("time") or []
         days: list[dict[str, Any]] = []
         for i, day in enumerate(times):
-            row: dict[str, Any] = {"date": day}
-            for field, alias in self._FIELD_ALIASES.items():
-                series = daily.get(field) or []
-                row[alias] = series[i] if i < len(series) else None
-            days.append(row)
+            if start <= date.fromisoformat(day) <= end:
+                row: dict[str, Any] = {"date": day}
+                for field, alias in self._FIELD_ALIASES.items():
+                    series = daily.get(field) or []
+                    row[alias] = series[i] if i < len(series) else None
+                days.append(row)
         return {
             "source": "forecast" if url == self.FORECAST_URL else "historical",
             "location": {"lat": lat, "lon": lon},
@@ -749,11 +889,23 @@ def _tool_error(exc: BaseException) -> str:
 
 
 def _schema_text(db: ReadOnlyDB) -> str:
-    """Render the agent-facing schema as ``table: col1, col2`` lines."""
-    return "\n".join(
-        f"{table}: {', '.join(c['name'] for c in db.columns(table))}"
-        for table in db.tables()
-    )
+    """Render the agent-facing schema, annotating tables and tricky columns.
+
+    Table notes come from ``_TABLE_NOTES`` and per-column unit/semantic hints
+    from ``_COLUMN_DOCS``, so the prompt can never drift from the real columns:
+    a new column simply appears (with a hint only if one is defined here).
+    """
+    lines: list[str] = []
+    for table in db.tables():
+        note = _TABLE_NOTES.get(table)
+        header = f"{table}: " + (f"[{note}] " if note else "")
+        parts: list[str] = []
+        for col in db.columns(table):
+            name = col["name"]
+            hint = _COLUMN_DOCS.get(table, {}).get(name)
+            parts.append(name if hint is None else f"{name} ({hint})")
+        lines.append(header + ", ".join(parts))
+    return "\n".join(lines)
 
 
 def build_agent(
@@ -764,8 +916,9 @@ def build_agent(
     api_key: str | None = None,
     reasoning_effort: str | None = None,
     model: Any = None,
-    memory: Memory | None = None,
+    memory: _Memory | None = None,
     weather: "Weather | None" = None,
+    plan: _Plan | None = None,
 ) -> Any:
     """Build the Pydantic AI agent wired to ``db`` tools.
 
@@ -773,7 +926,8 @@ def build_agent(
     Pass ``reasoning_effort`` to request a reasoning effort level from the
     underlying model (``low``/``medium``/``high``). Pass ``memory`` to give
     the agent get/remember/forget tools over a durable user profile (long-term
-    memory between sessions).
+    memory between sessions). Pass ``plan`` (a ``server.state.TrainingPlan``)
+    to give the agent read/update tools over the user's training plan.
     """
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel
@@ -790,15 +944,26 @@ def build_agent(
             provider=OpenAIProvider(base_url=base_url, api_key=api_key),
             settings=model_settings,
         )
-    system_prompt = _SYSTEM_PROMPT.format(today=date.today().isoformat())
+    system_prompt = _PROMPT_ROLE.format(today=date.today().isoformat())
     schema = _schema_text(db)
     if schema:
         system_prompt += (
             "\n\nThe current database schema is given below. You do NOT need to "
-            "call table_schema for these tables — the columns are already listed "
-            "here. Write queries directly against these columns; if a column you "
-            "expect is missing, re-check with table_schema once.\n\n" + schema
+            "call table_schema for these tables — the columns (with units/notes) "
+            "are already listed here. Write queries directly against these "
+            "columns; if a column you expect is missing, re-check with "
+            "table_schema once.\n\n" + schema
         )
+    system_prompt += "\n\n" + "\n\n".join(
+        [
+            _PROMPT_QUERY,
+            _PROMPT_CHARTS,
+            _PROMPT_WEATHER,
+            _PROMPT_MEMORY,
+            _PROMPT_PLAN,
+            _PROMPT_ANSWER,
+        ]
+    )
     agent = Agent(model, system_prompt=system_prompt)
 
     @agent.tool_plain
@@ -821,16 +986,25 @@ def build_agent(
         return json.dumps(db.date_range())
 
     @agent.tool_plain
+    def today() -> str:
+        """Return the current date as YYYY-MM-DD.
+
+        Use this (not the date in the system prompt) for any relative-date
+        question — the prompt's date can be stale in a long-running session.
+        """
+        return date.today().isoformat()
+
+    @agent.tool_plain
     def run_sql(sql: str) -> str:
         """Run a read-only SQL query. Returns columns and rows as JSON.
 
-        Only SELECT / WITH / EXPLAIN / PRAGMA statements are allowed. List only
+        Only SELECT / WITH / EXPLAIN statements are allowed. List only
         the columns you need (never SELECT *), aggregate with GROUP BY, and use
         small limits — results are capped at 200 rows.
         """
         try:
             result = db.run_sql(sql)
-        except (ValueError, sqlite3.DatabaseError) as exc:
+        except (ValueError, QueryError) as exc:
             return _tool_error(exc)
         return json.dumps(result)
 
@@ -877,7 +1051,7 @@ def build_agent(
             return "ERROR: spec needs a string 'sql' key"
         try:
             result = db.run_sql(sql)
-        except (ValueError, sqlite3.DatabaseError) as exc:
+        except (ValueError, QueryError) as exc:
             return f"ERROR: {exc}"
         try:
             _build_chart_figure(parsed, result)
@@ -902,8 +1076,8 @@ def build_agent(
 
             ``date_start``/``date_end`` are inclusive YYYY-MM-DD bounds: a range
             fully before today is historical weather; a range starting today or
-            later is the forecast (today/tomorrow only). With neither date given
-            the forecast for today/tomorrow is returned. Coordinates default to
+            later is the forecast (up to 16 days ahead). With neither date given
+            the forecast from today onward is returned. Coordinates default to
             the configured home location (GARMIN_HOME_LAT/GARMIN_HOME_LON);
             override by passing both ``lat`` and ``lon``. Returns JSON of daily
             rows plus the location used. Use it only to contextualise stored
@@ -948,10 +1122,96 @@ def build_agent(
             except OSError as exc:
                 return f"ERROR: {exc}"
 
+    if plan is not None:
+
+        @agent.tool_plain
+        def get_training_plan(
+            date_start: str | None = None,
+            date_end: str | None = None,
+        ) -> str:
+            """Return the user's training plan as JSON (recent + upcoming).
+
+            ``date_start``/``date_end`` are optional inclusive YYYY-MM-DD
+            bounds. With neither given, only the last 30 days plus the next
+            180 days are returned — older completed history is NOT included;
+            pass explicit dates to page further back. With both given, that
+            exact range is returned. Results are capped at 200 workouts (the
+            ``truncated`` flag is set when rows were dropped, so pass a
+            narrower range to see the rest). Each workout has id, planned_date,
+            activity_type (run/cycle/swim/strength/rest/other), title,
+            description, duration_min, distance_km, intensity, completed, and
+            completed_activity_id (the activity_summaries.activity_id that
+            satisfied it, when auto-detected — join on it for the actual
+            workout's stats).
+            """
+            try:
+                if (date_start is None) != (date_end is None):
+                    return "ERROR: pass both date_start and date_end, or neither"
+                if date_start is None:
+                    date_start = (
+                        date.today() - timedelta(days=_PLAN_PAST_DAYS)
+                    ).isoformat()
+                    date_end = (
+                        date.today() + timedelta(days=_PLAN_FUTURE_DAYS)
+                    ).isoformat()
+                else:
+                    date.fromisoformat(date_start)
+                    date.fromisoformat(date_end)
+                workouts = plan.list(date_start, date_end)
+                truncated = len(workouts) > _PLAN_MAX_WORKOUTS
+                if truncated:
+                    workouts = workouts[:_PLAN_MAX_WORKOUTS]
+                return json.dumps(
+                    {"workouts": workouts, "truncated": truncated},
+                    ensure_ascii=False,
+                )
+            except ValueError as exc:
+                return _tool_error(exc)
+
+        @agent.tool_plain
+        def update_training_plan(spec: str) -> str:
+            """Add, edit or delete workouts in the user's training plan.
+
+            ``spec`` is a JSON object:
+            - "replace": optional bool — when true, the whole plan is wiped
+              first (use for "create a brand-new plan").
+            - "workouts": optional list of workout objects. An object with an
+              "id" updates that existing workout (the full desired state must
+              be given); one without an "id" creates a new workout. Fields:
+              planned_date (required, YYYY-MM-DD), activity_type (required:
+              run/cycle/swim/strength/rest/other), title, description,
+              duration_min, distance_km, intensity (easy/moderate/hard/
+              race_pace), completed (bool).
+            - "delete_ids": optional list of workout ids to delete.
+            Returns a JSON summary of what changed.
+            """
+            try:
+                parsed = json.loads(spec)
+            except json.JSONDecodeError as exc:
+                return f"ERROR: spec is not valid JSON: {exc}"
+            if not isinstance(parsed, dict):
+                return "ERROR: spec must be a JSON object"
+            if "replace" in parsed and not isinstance(parsed["replace"], bool):
+                return "ERROR: 'replace' must be a boolean"
+            for key in ("workouts", "delete_ids"):
+                if key in parsed and not isinstance(parsed[key], list):
+                    return f"ERROR: '{key}' must be a list"
+            try:
+                result = plan.apply(parsed)
+            except ValueError as exc:
+                return _tool_error(exc)
+            return json.dumps(result, ensure_ascii=False)
+
     return agent
 
 
-def _build_agent(cfg: dict[str, str], db: ReadOnlyDB) -> Any:
+def _build_agent(
+    cfg: dict[str, str],
+    db: ReadOnlyDB,
+    *,
+    memory: Any | None = None,
+    plan: Any | None = None,
+) -> Any:
     api_key = cfg["llm_api_key"] or None
     base_url = cfg["llm_base_url"] or None
     if not api_key and not base_url:
@@ -959,7 +1219,6 @@ def _build_agent(cfg: dict[str, str], db: ReadOnlyDB) -> Any:
             "no LLM configured: set OPENAI_API_KEY / LLM_API_KEY for cloud, "
             "or LLM_BASE_URL (e.g. http://host.docker.internal:11434/v1) with LLM_MODEL for a local Ollama model"
         )
-    memory = Memory(cfg["memory_file"]) if cfg.get("memory_file") else None
     weather = Weather.from_config(cfg)
     return build_agent(
         db,
@@ -969,59 +1228,64 @@ def _build_agent(cfg: dict[str, str], db: ReadOnlyDB) -> Any:
         reasoning_effort=cfg.get("llm_reasoning_effort") or None,
         memory=memory,
         weather=weather,
+        plan=plan,
     )
+
+
+def _open_readonly(cfg: dict[str, Any]) -> ReadOnlyDB:
+    """Read-only handle for the configured backend (read-only PG role)."""
+    url = cfg.get("readonly_db_url") or cfg.get("db_url")
+    if not url:
+        raise RuntimeError(
+            "GARMIN_DB_URL (or GARMIN_READONLY_DB_URL) must be set — "
+            "Postgres is the only supported backend"
+        )
+    return ReadOnlyDB.from_url(url, user_id=cfg.get("local_user_id") or 1)
 
 
 def _record_turn(
     cfg: dict[str, str],
     question: str,
     result: Any,
+    *,
+    trace_writer: Any,
 ) -> None:
-    """Append a trace entry for this turn (no-op when tracing is disabled)."""
-    path = cfg.get("trace_file")
-    if not path:
-        return
-    from .trace import append_turn
+    """Append a trace entry for this turn via ``trace_writer`` (which persists
+    the record to the per-user ``user_state`` ``trace`` key)."""
+    from .trace import build_trace_record
 
-    append_turn(
-        path,
+    record = build_trace_record(
         question,
         result.new_messages(),
         answer=str(result.output),
         model=cfg.get("llm_model", ""),
         usage=result.usage,
     )
+    trace_writer(record)
 
 
 def _ask(cfg: dict[str, str], question: str) -> str:
-    db = ReadOnlyDB(cfg["db_path"])
+    db = _open_readonly(cfg)
+    from .server.state import PgMemory, TrainingPlan, TrainingPlanStore, UserState
+
+    state = UserState(cfg["db_url"])
+    plan_store = TrainingPlanStore(cfg["db_url"])
+    user_id = cfg.get("local_user_id") or 1
     try:
-        result = _build_agent(cfg, db).run_sync(question)
-        _record_turn(cfg, question, result)
+        result = _build_agent(
+            cfg,
+            db,
+            memory=PgMemory(state, user_id),
+            plan=TrainingPlan(plan_store, user_id),
+        ).run_sync(question)
+        _record_turn(
+            cfg, question, result, trace_writer=lambda r: state.append_trace(user_id, r)
+        )
         return str(result.output)
     finally:
         db.close()
-
-
-def _load_session(path: str) -> list[Any]:
-    """Load a persisted conversation history from ``path`` (or [] if absent)."""
-    from pydantic_ai.messages import ModelMessagesTypeAdapter
-
-    if not Path(path).exists():
-        return []
-    raw = Path(path).read_text(encoding="utf-8")
-    if not raw.strip():
-        return []
-    return ModelMessagesTypeAdapter.validate_json(raw)
-
-
-def _save_session(path: str, history: list[Any]) -> None:
-    """Persist ``history`` to ``path`` (atomic-ish: write then replace)."""
-    from pydantic_ai.messages import ModelMessagesTypeAdapter
-
-    tmp = Path(path).with_suffix(".json.tmp")
-    tmp.write_text(ModelMessagesTypeAdapter.dump_json(history).decode(), encoding="utf-8")
-    tmp.replace(Path(path))
+        state.close()
+        plan_store.close()
 
 
 def _seed_history_from_summary(summary: str) -> list[Any]:
@@ -1035,26 +1299,44 @@ def _seed_history_from_summary(summary: str) -> list[Any]:
     ]
 
 
-def _ask_session(cfg: dict[str, str], session_path: str | None = None) -> None:
+def _ask_session(cfg: dict[str, str]) -> None:
     """Interactive multi-turn session; history persists across questions.
 
-    With ``session_path`` the conversation is loaded on start and saved to the
-    file after every turn, so a later ``garmin-ask --session FILE`` resumes it.
+    Both the conversation and the long-term memory profile live in Postgres
+    (``user_state``, scoped to ``GARMIN_LOCAL_USER_ID``), so a later
+    ``garmin-ask`` resumes exactly where the last session left off.
 
     Two commands reset the context mid-session:
 
     - ``/clear``  drops all history — the session starts over with no memory
-      of what came before (and the persisted file is wiped too).
+      of what came before (and the stored conversation is wiped too).
     - ``/new``    asks the model to fold the conversation into one compact
       summary, then starts a new session seeded with that summary, so context
       survives in compressed form.
     """
-    db = ReadOnlyDB(cfg["db_path"])
+    from .server.state import PgMemory, TrainingPlan, TrainingPlanStore, UserState
+
+    db = _open_readonly(cfg)
+    state = UserState(cfg["db_url"])
+    plan_store = TrainingPlanStore(cfg["db_url"])
+    user_id = cfg.get("local_user_id") or 1
     try:
-        agent = _build_agent(cfg, db)
-        history = _load_session(session_path) if session_path else []
+        agent = _build_agent(
+            cfg,
+            db,
+            memory=PgMemory(state, user_id),
+            plan=TrainingPlan(plan_store, user_id),
+        )
+        history = state.get_session_messages(user_id) or []
         if history:
-            print(f"Resumed {len(history)} prior message(s) from {session_path}")
+            print(
+                f"Resumed {len(history)} prior message(s) from the database "
+                f"(user {user_id})"
+            )
+
+        def _persist(messages: list[Any]) -> None:
+            state.set_session_messages(user_id, messages)
+
         print(
             "Ask about your Garmin data, one question per line "
             "(exit/quit or EOF to leave; /clear starts fresh; "
@@ -1073,15 +1355,13 @@ def _ask_session(cfg: dict[str, str], session_path: str | None = None) -> None:
                 return
             if low == "/clear":
                 history = []
-                if session_path:
-                    _save_session(session_path, history)
+                state.clear_session(user_id)
                 print("Cleared — new session with no prior context.")
                 continue
             if low == "/new":
                 if not history:
                     history = []
-                    if session_path:
-                        _save_session(session_path, history)
+                    state.clear_session(user_id)
                     print("Nothing to compact yet — starting a new empty session.")
                     continue
                 try:
@@ -1097,8 +1377,7 @@ def _ask_session(cfg: dict[str, str], session_path: str | None = None) -> None:
                     continue
                 n_before = len(history)
                 history = _seed_history_from_summary(summary)
-                if session_path:
-                    _save_session(session_path, history)
+                _persist(history)
                 print(
                     f"Compacted {n_before} message(s) into 1; "
                     "new session seeded with the summary."
@@ -1109,13 +1388,19 @@ def _ask_session(cfg: dict[str, str], session_path: str | None = None) -> None:
             except Exception as exc:
                 print(f"error: {exc}")
                 continue
-            _record_turn(cfg, prompt, result)
+            _record_turn(
+                cfg,
+                prompt,
+                result,
+                trace_writer=lambda r: state.append_trace(user_id, r),
+            )
             history = result.all_messages()
-            if session_path:
-                _save_session(session_path, history)
+            _persist(history)
             print(result.output)
     finally:
         db.close()
+        state.close()
+        plan_store.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1130,21 +1415,14 @@ def main(argv: list[str] | None = None) -> int:
         "question", nargs="*", metavar="QUESTION",
         help="question to ask; omit it to start an interactive session",
     )
-    parser.add_argument(
-        "--session", metavar="FILE", dest="session_file",
-        help="in the interactive session, persist/resume the conversation "
-        "history in FILE (saved after each turn)",
-    )
     args = parser.parse_args(argv)
-    if args.question and args.session_file:
-        parser.error("--session only applies to the interactive session; omit QUESTION")
 
     cfg = load_config()
     try:
         if args.question:
             print(_ask(cfg, " ".join(args.question)))
         else:
-            _ask_session(cfg, args.session_file)
+            _ask_session(cfg)
     except RuntimeError as exc:
         print(f"error: {exc}")
         return 1

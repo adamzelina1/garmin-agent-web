@@ -18,12 +18,10 @@ build/
 
 # Garmin tokens
 .garminconnect/
-
-# Runtime aids (LLM-facing, contain personal health data - never commit)
-ask_trace.jsonl
-web_session.json
-agent_memory.json
 meta.json
+
+# Local user data (per-user sync state)
+data/
 
 # Test cache
 .pytest_cache/

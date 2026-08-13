@@ -1,0 +1,57 @@
+# Self-hosted Postgres + the multi-user FastAPI server (Phase 3 runtime).
+#
+#   docker compose up -d
+#
+# The app runs as a non-superuser role (garmin_app) so Row-Level Security can
+# enforce per-user isolation; the LLM agent connects as a SELECT-only role
+# (garmin_readonly). The roles are created on first boot by
+# docker/initdb/01-roles.sh; GARMIN_ADMIN_DB_URL connects as the superuser
+# (POSTGRES_USER) only for idempotent role bootstrap on later starts.
+#
+# Override the passwords (and the matching GARMIN_DB_URL / GARMIN_READONLY_DB_URL
+# in .env) for anything exposed beyond localhost.
+services:
+  db:
+    image: postgres:17
+    container_name: garmin-db
+    environment:
+      POSTGRES_USER: garmin
+      POSTGRES_PASSWORD: garmin
+      POSTGRES_DB: garmin
+      POSTGRES_APP_USER: garmin_app
+      POSTGRES_APP_PASSWORD: garmin_app
+      POSTGRES_READONLY_USER: garmin_readonly
+      POSTGRES_READONLY_PASSWORD: garmin_readonly
+    ports:
+      - "5432:5432"
+    volumes:
+      - garmin_pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U garmin -d garmin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # The FastAPI server (auth + background sync worker + read-only ask agent).
+  # Stateless: every user-facing byte lives in Postgres. Load the same .env as
+  # local dev (secrets), but override the three DSNs so they point at the `db`
+  # service instead of localhost. Wait until Postgres reports healthy so the
+  # role bootstrap in docker/initdb has run before the server connects.
+  server:
+    build: .
+    container_name: garmin-server
+    env_file: .env
+    environment:
+      GARMIN_DB_URL: postgresql://garmin_app:garmin_app@db:5432/garmin
+      GARMIN_READONLY_DB_URL: postgresql://garmin_readonly:garmin_readonly@db:5432/garmin
+      GARMIN_ADMIN_DB_URL: postgresql://garmin:garmin@db:5432/garmin
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  garmin_pgdata:

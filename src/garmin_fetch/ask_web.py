@@ -4,11 +4,9 @@ A thin front-end for ``garmin-ask``: the same agent, tools, model config
 (cloud / Ollama), long-term memory profile and read-only safety are reused
 unchanged; Gradio renders the conversation.
 
-Automatic session persistence: every web chat is written to a session file
-after each turn and the last session is loaded back into the UI on startup, so
-picking up where you left off is the default. The file can be overridden with
-``--session FILE`` (a later console ``garmin-ask --session FILE`` can also
-resume it).
+Automatic session persistence: every web chat is written to the per-user
+``user_state`` table after each turn and the last session is loaded back into
+the UI on startup, so picking up where you left off is the default.
 
 Charts: the agent can call the ``chart`` tool, which runs a read-only query
 and returns Plotly chart JSON embedded in ``<chart> ... </chart>`` tags. This
@@ -26,12 +24,10 @@ from typing import Any
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from .ask import (
-    ReadOnlyDB,
     _build_agent,
     _build_chart_figure,
-    _load_session,
+    _open_readonly,
     _record_turn,
-    _save_session,
 )
 from .config import load_config
 
@@ -72,7 +68,13 @@ def _history_to_messages(
 
 
 def _messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
-    """Map persisted Pydantic AI messages back to Gradio's history format."""
+    """Map persisted Pydantic AI messages back to Gradio's history format.
+
+    Assistant responses that also carry tool calls are the model's *working
+    narration* ("Let me check…", etc.), not its answer — they are skipped so
+    the chat only ever shows the final text-only reply. The terminal answer
+    is its own response with no tool calls, so it is always kept.
+    """
     from pydantic_ai.messages import ModelResponse, ModelRequest, TextPart, UserPromptPart
 
     history: list[dict[str, str]] = []
@@ -88,6 +90,8 @@ def _messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
                         }
                     )
         elif isinstance(message, ModelResponse):
+            if any(getattr(p, "tool_name", None) is not None for p in message.parts):
+                continue
             for part in message.parts:
                 if isinstance(part, TextPart):
                     history.append({"role": "assistant", "content": part.content})
@@ -204,32 +208,112 @@ def _extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
     return "".join(pieces), charts
 
 
-class ChatSession:
-    """One chat app instance: lazy agent, auto-persistent conversation."""
+def _looks_like_plan_dump(data: Any) -> bool:
+    """True when ``data`` is training-plan workout JSON.
 
-    def __init__(
-        self,
-        cfg: dict[str, Any],
-        session_path: str | None = None,
-    ) -> None:
+    The ``get_training_plan`` tool returns ``{"workouts": [...], "truncated":
+    ...}``, so both the wrapper object and a bare array of workouts are
+    recognised.
+    """
+    if isinstance(data, dict):
+        data = data.get("workouts")
+    if not isinstance(data, list) or not data:
+        return False
+    for item in data:
+        if not isinstance(item, dict):
+            return False
+        if not (
+            isinstance(item.get("planned_date"), str)
+            and isinstance(item.get("activity_type"), str)
+        ):
+            return False
+    return True
+
+
+def _plan_dump_marker(data: Any) -> str:
+    """Render the ``<plan_table />`` marker for a plan dump, with date bounds."""
+    if isinstance(data, dict):
+        data = data.get("workouts") or []
+    dates = [str(i["planned_date"]) for i in data if i.get("planned_date")]
+    attrs = ""
+    if dates:
+        attrs = f' from="{min(dates)}" to="{max(dates)}"'
+    return f"<plan_table{attrs} />"
+
+
+def _replace_plan_dumps(text: str) -> str:
+    """Replace verbatim training-plan JSON dumps with a ``<plan_table />`` marker.
+
+    The model is told to show the plan via ``<plan_table />`` (the UI renders
+    the stored plan straight from the DB), but it sometimes ignores that and
+    pastes the raw JSON the ``get_training_plan`` tool returned — burning
+    tokens and displaying ugly JSON. This post-processes the answer: any JSON
+    array whose items look like plan workouts (fenced or bare) is swapped for
+    the marker, so the chat always shows the rendered table.
+    """
+    def _swap(match: re.Match[str]) -> str:
+        try:
+            data = json.loads(match.group(1))
+        except (json.JSONDecodeError, AttributeError):
+            return match.group(0)
+        if not _looks_like_plan_dump(data):
+            return match.group(0)
+        return _plan_dump_marker(data)
+
+    text = re.sub(r"```(?:json)?\s*\n([\s\S]*?)```", _swap, text)
+
+    out: list[str] = []
+    pos = 0
+    dec = json.JSONDecoder()
+    while True:
+        idx = text.find("[", pos)
+        if idx == -1:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:idx])
+        try:
+            data, end = dec.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            out.append(text[idx])
+            pos = idx + 1
+            continue
+        if _looks_like_plan_dump(data):
+            out.append(_plan_dump_marker(data))
+        else:
+            out.append(text[idx : idx + end])
+        pos = idx + end
+    return "".join(out)
+
+
+class ChatSession:
+    """One chat app instance: lazy agent, DB-persisted conversation."""
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        from .server.state import UserState
+
         self.cfg = cfg
-        self.session_path = session_path or cfg.get("web_session_file")
         self._holder: dict[str, Any] = {}
+        self._state = UserState(cfg["db_url"])
+        self._user_id = cfg.get("local_user_id") or 1
         self.initial_history: list[dict[str, str]] = []
 
-        if self.session_path:
-            resumed = _load_session(self.session_path)
-            if resumed:
-                self.initial_history = _messages_to_history(resumed)
-                print(
-                    f"resumed {len(resumed)} prior message(s) from {self.session_path}"
-                )
+        resumed = self._state.get_session_messages(self._user_id)
+        if resumed:
+            self.initial_history = _messages_to_history(resumed)
+            print(
+                f"resumed {len(resumed)} prior message(s) from the database "
+                f"(user {self._user_id})"
+            )
 
     def _agent(self) -> Any:
+        from .server.state import PgMemory
+
         if "agent" not in self._holder:
-            db = ReadOnlyDB(self.cfg["db_path"])
+            db = _open_readonly(self.cfg)
             self._holder["db"] = db
-            self._holder["agent"] = _build_agent(self.cfg, db)
+            self._holder["agent"] = _build_agent(
+                self.cfg, db, memory=PgMemory(self._state, self._user_id)
+            )
         return self._holder["agent"]
 
     def respond(
@@ -239,7 +323,12 @@ class ChatSession:
         result = self._agent().run_sync(
             message, message_history=_history_to_messages(history)
         )
-        _record_turn(self.cfg, message, result)
+        _record_turn(
+            self.cfg,
+            message,
+            result,
+            trace_writer=lambda r: self._state.append_trace(self._user_id, r),
+        )
         text, specs = _extract_charts(str(result.output))
 
         # Fallback: the model may validate a chart via the tool but forget to
@@ -251,15 +340,7 @@ class ChatSession:
                 specs.append(spec)
                 embedded_sql.add(spec["sql"])
 
-        if self.session_path:
-            full = _history_to_messages(
-                history
-                + [
-                    {"role": "user", "content": message},
-                    {"role": "assistant", "content": text.strip()},
-                ]
-            )
-            _save_session(self.session_path, full)
+        self._state.set_session_messages(self._user_id, result.all_messages())
 
         db = self._holder.get("db")
         content: list[Any] = []
@@ -274,17 +355,9 @@ class ChatSession:
         return {"role": "assistant", "content": content}
 
 
-def make_chat_session(
-    cfg: dict[str, Any],
-    session_path: str | None = None,
-) -> ChatSession:
-    """Build a :class:`ChatSession` for ``gr.ChatInterface``.
-
-    ``session_path`` defaults to the configured ``web_session_file``, so
-    sessions persist and resume automatically. Pass an explicit path to
-    override it.
-    """
-    return ChatSession(cfg, session_path)
+def make_chat_session(cfg: dict[str, Any]) -> ChatSession:
+    """Build a :class:`ChatSession` for ``gr.ChatInterface``."""
+    return ChatSession(cfg)
 
 
 def _render_chart(spec: dict[str, Any], db: ReadOnlyDB) -> Any | None:
@@ -310,13 +383,6 @@ def main() -> int:
         description="Browser chat over the read-only Garmin agent (Gradio).",
     )
     parser.add_argument(
-        "--session",
-        metavar="FILE",
-        dest="session_file",
-        help="conversation history file to save to / resume from "
-        "(default: auto-persist and resume the last session)",
-    )
-    parser.add_argument(
         "--port",
         type=int,
         default=7860,
@@ -337,13 +403,13 @@ def main() -> int:
 
     import gradio as gr
 
-    session = make_chat_session(cfg, session_path=args.session_file)
+    session = make_chat_session(cfg)
     demo = gr.ChatInterface(
         session.respond,
         chatbot=gr.Chatbot(value=session.initial_history),
         title="Garmin AI",
         description="Ask about your Garmin data. Queries are read-only SELECTs "
-        f"against {cfg['db_path']}. Ask for a chart and it will be drawn here.",
+        "against Postgres. Ask for a chart and it will be drawn here.",
         fill_height=True,
     )
     demo.launch(server_port=args.port, share=args.share, inbrowser=True)

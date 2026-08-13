@@ -8,8 +8,17 @@ dependencies = [
     "gradio>=6.22.0",
     "httpx>=0.28.0",
     "plotly>=6.9.0",
+    "psycopg[binary]>=3.2.0",
+    "psycopg-pool>=3.2.0",
     "pydantic-ai>=2.27.0",
     "python-dotenv>=1.2.2",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
+    "pyjwt>=2.13.0",
+    "cryptography>=50.0.0",
+    "bcrypt>=5.0.0",
+    "apscheduler>=3.11.3",
+    "python-multipart>=0.0.32",
 ]
 
 [project.scripts]
@@ -17,6 +26,7 @@ garmin-fetch = "garmin_fetch.fetcher:main"
 garmin-ask = "garmin_fetch.ask:main"
 garmin-ask-web = "garmin_fetch.ask_web:main"
 garmin-trace = "garmin_fetch.trace:main"
+garmin-server = "garmin_fetch.server.app:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -34,5 +44,4 @@ dev = [
     "jupyter>=1.1.1",
     "nbclient>=0.11.0",
     "nbformat>=5.11.0",
-    "pytest>=9.1.1",
 ]

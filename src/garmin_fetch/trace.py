@@ -6,28 +6,22 @@ tool returns (outputs/outcome), in order, plus the model's final answer. The
 aim is an inspectable record for tuning the tools — what the model asked for
 and what each tool actually returned.
 
-Written as one JSON object per turn to ``GARMIN_TRACE_FILE`` (default
-``ask_trace.jsonl``); every write is a fresh append. ``garmin-trace`` prints
-that file as a readable transcript.
+Turns are stored per user in Postgres (the ``user_state`` table's ``trace``
+key); ``garmin-trace`` prints that transcript. A legacy ``--file`` reads an old
+``ask_trace.jsonl`` instead.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import PROJECT_ROOT
-
-#: Hard cap for a single tool-return/content payload stored in the JSONL.
+#: Hard cap for a single tool-return/content payload stored in a trace record.
 _MAX_PAYLOAD = 5000
-
-_trace_env = os.getenv("GARMIN_TRACE_FILE")
-_DEFAULT_FILE = Path(_trace_env) if _trace_env else PROJECT_ROOT / "ask_trace.jsonl"
 
 
 def _clip(text: str, n: int) -> str:
@@ -126,8 +120,7 @@ def _usage_summary(usage: Any | None) -> dict[str, Any] | None:
     }
 
 
-def append_turn(
-    path: str,
+def build_trace_record(
     question: str,
     messages: list[Any],
     answer: str = "",
@@ -135,8 +128,8 @@ def append_turn(
     usage: Any | None = None,
     *,
     _ts: str | None = None,
-) -> None:
-    """Append one trace record (one JSON line) to ``path``."""
+) -> dict[str, Any]:
+    """Build one JSON-safe trace record (without writing it anywhere)."""
     record = {
         "ts": _ts or datetime.now().astimezone().isoformat(timespec="seconds"),
         "question": question,
@@ -146,8 +139,7 @@ def append_turn(
     }
     if (usage_summary := _usage_summary(usage)) is not None:
         record["usage"] = usage_summary
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
 
 
 def _iter_records(path: str) -> list[dict[str, Any]]:
@@ -166,6 +158,27 @@ def _iter_records(path: str) -> list[dict[str, Any]]:
         if isinstance(data, dict):
             records.append(data)
     return records
+
+
+def _db_records() -> list[dict[str, Any]]:
+    """Read the per-user trace transcript from Postgres (the ``trace`` key of
+    ``user_state`` for ``GARMIN_LOCAL_USER_ID``)."""
+    from .config import load_config
+    from .server.state import UserState
+
+    cfg = load_config()
+    state = UserState(cfg["db_url"])
+    try:
+        raw = state.get(cfg.get("local_user_id") or 1, "trace")
+    finally:
+        state.close()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
 
 
 def _render(record: dict[str, Any], full: bool) -> list[str]:
@@ -215,13 +228,14 @@ def _render(record: dict[str, Any], full: bool) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="garmin-trace",
-        description="View the recorded agent tool-call trace (ask_trace.jsonl).",
+        description="View the recorded agent tool-call trace (stored in Postgres "
+        "for GARMIN_LOCAL_USER_ID).",
     )
     parser.add_argument(
         "--file",
         metavar="PATH",
         default=None,
-        help="trace file to read (default: GARMIN_TRACE_FILE or ask_trace.jsonl)",
+        help="read a legacy JSONL trace file instead of the database",
     )
     parser.add_argument(
         "--tail", type=int, default=0,
@@ -240,8 +254,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _utf8_console()
-    path = args.file or str(_DEFAULT_FILE)
-    records = _iter_records(path)
+    if args.file:
+        records = _iter_records(args.file)
+    else:
+        records = _db_records()
     if args.tool:
         records = [
             r

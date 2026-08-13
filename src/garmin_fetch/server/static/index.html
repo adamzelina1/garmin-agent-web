@@ -1,0 +1,1271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Garmin AI</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+<style>
+  :root { --bg:#0f1419; --panel:#171d24; --panel2:#1d242e; --text:#e7edf3;
+          --muted:#8b98a5; --accent:#3b82f6; --border:#2a323d; --ok:#22c55e; --err:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background:var(--bg); color:var(--text); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 16px; }
+  header { display:flex; align-items:center; justify-content:space-between;
+           padding:12px 16px; background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { font-size:18px; margin:0; }
+  header .who { color:var(--muted); font-size:13px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px;
+           padding:8px 14px; cursor:pointer; font-size:14px;
+           transition:background .15s ease, filter .15s ease, transform .05s ease, opacity .15s ease; }
+  button:hover:not(:disabled):not([data-busy]) { filter:brightness(1.1); }
+  button:active:not(:disabled):not([data-busy]) { transform:translateY(1px); }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button.secondary { background:var(--panel2); border:1px solid var(--border); color:var(--text); }
+  button:disabled { opacity:.55; cursor:default; }
+  #login-view button, #register-view button { width:100%; padding:10px; font-weight:600; }
+  .spin { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,.35);
+          border-top-color:#fff; border-radius:50%; margin-right:7px; vertical-align:-2px;
+          animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  input { width:100%; padding:9px 10px; border-radius:6px; border:1px solid var(--border);
+          background:var(--panel2); color:var(--text); font-size:14px; margin:4px 0;
+          transition:border-color .15s ease, box-shadow .15s ease; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent);
+          box-shadow:0 0 0 2px rgba(59,130,246,.25); }
+  input[type="checkbox"] { width:auto; margin:0; padding:0; }
+  .cfg-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+              gap:6px 16px; margin-top:8px; }
+  .cfg-grid label { display:flex; align-items:flex-start; gap:8px; font-size:13px; margin:0;
+                    color:var(--text); }
+  .cfg-item { display:flex; flex-direction:column; line-height:1.25; }
+  .cfg-item .muted { font-size:11px; }
+  label { font-size:12px; color:var(--muted); display:block; margin-top:8px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+          padding:20px; margin-top:16px; }
+  .tabs { display:flex; gap:8px; margin-bottom:14px; }
+  .tabs button { background:var(--panel2); color:var(--muted); border:1px solid var(--border); }
+  .tabs button.active { color:#fff; border-color:var(--accent); }
+  .banner { border-radius:8px; padding:10px 12px; font-size:13px; margin:8px 0; }
+  .banner.warn { background:#3b2f10; border:1px solid #7a5c14; color:#f5d67b; }
+  .banner.err { background:#3b1216; border:1px solid #7a222a; color:#f5a3a3; }
+  .banner.ok { background:#0f2f1a; border:1px solid #1f5c34; color:#a3e6bd; }
+  #auth { max-width:460px; margin:48px auto; }
+  #app { display:none; }
+  .chatbox { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+             min-height:340px; max-height:60vh; overflow-y:auto; padding:14px; margin-top:16px; }
+  .msg { margin:10px 0; }
+  .msg .role { font-size:12px; color:var(--muted); margin-bottom:3px; }
+  .msg .body { font-size:14px; line-height:1.5; }
+  .msg .body p { margin:6px 0; }
+  .msg .body h2, .msg .body h3, .msg .body h4 { margin:10px 0 4px; font-size:15px; }
+  .msg .body ul, .msg .body ol { margin:6px 0; padding-left:22px; }
+  .msg .body li { margin:2px 0; }
+  .msg .body table { border-collapse:collapse; margin:8px 0; width:100%; font-size:13px; }
+  .msg .body th, .msg .body td { border:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:top; }
+  .msg .body th { background:var(--panel2); }
+  .msg .body a { color:var(--accent); }
+  .msg .body pre { background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:10px; overflow-x:auto; font-size:12px; }
+  .planbox { margin:10px 0 4px; }
+  .planbox .planbox-head { font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .msg.user .body { color:#cfe4ff; }
+  .askrow { display:flex; gap:8px; margin-top:10px; }
+  .askrow input { flex:1; }
+  .chartbox { margin-top:8px; }
+  .toolbar { display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap; }
+  .stat { font-size:13px; color:var(--muted); }
+  .hidden { display:none !important; }
+  code { background:var(--panel2); padding:1px 4px; border-radius:4px; font-size:12px; }
+  .muted { color:var(--muted); font-size:13px; }
+  select, textarea { width:100%; padding:9px 10px; border-radius:6px; border:1px solid var(--border);
+                     background:var(--panel2); color:var(--text); font-size:14px; margin:4px 0; }
+  .readiness-head { display:flex; align-items:baseline; gap:10px; margin-bottom:14px; }
+  .readiness-head .muted { font-size:12px; }
+  .readiness-score-row { display:flex; align-items:center; gap:18px; margin:6px 0 16px; flex-wrap:wrap; }
+  .readiness-score { font-size:64px; font-weight:700; line-height:1; }
+  .readiness-cat { font-size:16px; font-weight:600; }
+  .readiness-meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  .readiness-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+                    gap:12px; margin-bottom:18px; }
+  .readiness-comp { background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+                    padding:10px 12px; }
+  .readiness-comp .r-label { font-size:11px; color:var(--muted); text-transform:uppercase;
+                             letter-spacing:.05em; }
+  .readiness-comp .r-value { font-size:20px; font-weight:600; margin:2px 0; }
+  .readiness-comp .r-sub { font-size:12px; color:var(--muted); }
+  .plan-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+  .plan-head .plan-week-label { flex:1; text-align:center; font-weight:600; font-size:14px; }
+  .plan-week { display:grid; grid-template-columns:repeat(7,1fr); gap:8px; }
+  .plan-day { background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+              padding:8px; min-height:130px; }
+  .plan-day.today { border-color:var(--accent); }
+  .plan-day-header { display:flex; justify-content:space-between; font-size:11px; color:var(--muted);
+                     margin-bottom:6px; }
+  .plan-card { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--accent);
+               border-radius:6px; padding:6px; margin-bottom:6px; cursor:pointer; font-size:12px; }
+  .plan-card.rest { border-left-color:var(--muted); opacity:.7; }
+  .plan-card.done { opacity:.5; text-decoration:line-through; }
+  .plan-card .pc-type { font-size:10px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .plan-card .pc-title { font-weight:600; margin:2px 0; }
+  .plan-card .pc-meta { color:var(--muted); font-size:11px; }
+  .plan-add { width:100%; background:transparent; border:1px dashed var(--border); color:var(--muted);
+              border-radius:6px; padding:4px; font-size:12px; cursor:pointer; }
+  .plan-empty { color:var(--muted); font-size:12px; text-align:center; padding:18px 4px; }
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center;
+              justify-content:center; z-index:50; }
+  .modal { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px;
+           width:min(480px, 92vw); }
+  .modal h3 { margin:0 0 12px; }
+  .modal .row { display:flex; gap:10px; }
+  .modal .row > div { flex:1; }
+  .modal-actions { display:flex; justify-content:space-between; align-items:center; margin-top:16px; gap:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Garmin AI</h1>
+  <span class="who" id="who"></span>
+  <button id="logout" class="secondary hidden">Sign out</button>
+</header>
+<div class="wrap">
+
+  <!-- Auth view -->
+  <div id="auth">
+    <div class="card">
+      <div class="tabs">
+        <button id="tab-login" class="active">Login</button>
+        <button id="tab-register">Register</button>
+      </div>
+      <div id="login-view">
+        <label>Email</label>
+        <input id="login-email" type="email" autocomplete="email">
+        <label>Password</label>
+        <input id="login-password" type="password" autocomplete="current-password">
+        <div class="banner err hidden" id="login-error"></div>
+        <div class="banner ok hidden" id="login-ok"></div>
+        <div style="margin-top:14px"><button id="btn-login">Sign in</button></div>
+      </div>
+      <div id="register-view" class="hidden">
+        <label>Your email (login)</label>
+        <input id="reg-email" type="email" autocomplete="off">
+        <label>Password (min 8 chars)</label>
+        <input id="reg-password" type="password" autocomplete="new-password">
+        <label>Garmin Connect email</label>
+        <input id="reg-garmin-email" type="email" autocomplete="off">
+        <label>Garmin Connect password</label>
+        <input id="reg-garmin-password" type="password" autocomplete="off">
+        <div class="banner err hidden" id="reg-error"></div>
+        <div class="banner ok hidden" id="reg-ok"></div>
+        <div style="margin-top:14px"><button id="btn-register">Create account</button></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- App view -->
+  <div id="app">
+    <div class="tabs" id="app-tabs">
+      <button class="active" data-tab="chat">Chat</button>
+      <button data-tab="readiness">Readiness</button>
+      <button data-tab="acwr">ACWR</button>
+      <button data-tab="plan">Training Plan</button>
+      <button data-tab="settings">Settings</button>
+    </div>
+
+    <div id="tab-chat">
+      <div class="banner warn hidden" id="llm-missing">Chat is unavailable: set
+        <code>LLM_API_KEY</code> (or a local <code>LLM_BASE_URL</code>) in <code>.env</code>
+        and restart the server.</div>
+      <div class="chatbox" id="chat"></div>
+      <div class="askrow">
+        <input id="question" placeholder="Ask about your Garmin data… (e.g. avg sleep last week)" autocomplete="off">
+        <button id="btn-ask">Ask</button>
+        <button id="btn-new-chat" title="Forget this conversation and start a fresh session (long-term memory is kept)">New chat</button>
+      </div>
+    </div>
+
+    <div id="tab-readiness" class="hidden">
+      <div class="card">
+        <div class="readiness-head">
+          <h3 style="margin:0">Training Readiness</h3>
+          <span class="muted">Custom score from your nightly HRV, resting HR and sleep.</span>
+        </div>
+        <div class="banner warn hidden" id="readiness-hint">Needs at least 7 days of logged
+          sleep, HRV and resting heart rate. It will appear automatically once enough data has
+          been synced.</div>
+        <div id="readiness-summary"></div>
+        <div id="readiness-chart"></div>
+      </div>
+    </div>
+
+    <div id="tab-acwr" class="hidden">
+      <div class="card">
+        <div class="readiness-head">
+          <h3 style="margin:0">Acute-to-Chronic Workload Ratio</h3>
+          <span class="muted">7-day vs 28-day training load (EMA) · injury / overtraining risk</span>
+        </div>
+        <div class="banner warn hidden" id="acwr-hint">No training-load data yet — ACWR will appear
+          once activities with a training load have been synced.</div>
+        <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
+          0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated</div>
+        <div id="acwr-summary"></div>
+        <div id="acwr-chart"></div>
+      </div>
+    </div>
+
+    <div id="tab-plan" class="hidden">
+      <div class="card">
+        <div class="plan-head">
+          <button id="plan-prev" class="secondary" title="Previous week">‹</button>
+          <span class="plan-week-label" id="plan-week-label"></span>
+          <button id="btn-plan-today" class="secondary" title="Jump to this week">Today</button>
+          <button id="plan-next" class="secondary" title="Next week">›</button>
+        </div>
+        <div class="banner warn" style="margin-top:0">You can edit your plan here, or ask the AI in
+          Chat to build or change it (e.g. "create a 12-week half-marathon plan").</div>
+        <div class="banner err hidden" id="plan-error"></div>
+        <div class="plan-week" id="plan-week"></div>
+      </div>
+    </div>
+
+    <div id="tab-settings" class="hidden">
+      <div class="tabs" id="settings-tabs">
+        <button class="active" data-subtab="sync">Sync</button>
+        <button data-subtab="config">Config</button>
+      </div>
+
+      <div id="sub-sync">
+        <div class="card">
+          <h3 style="margin:0 0 10px">Garmin sync</h3>
+          <div class="banner err hidden" id="sync-error"></div>
+          <div class="banner warn hidden" id="bind-pending">Waiting to bind to Garmin — will retry
+            automatically. If it stays pending, Garmin is rate-limiting or your credentials are
+            invalid.</div>
+          <div class="toolbar">
+            <button id="btn-sync">Sync now</button>
+            <button id="btn-sync-full" title="Fetch new data, then rebuild daily_metrics and activity tables from raw (ignores incremental parse markers)">Sync + full re-parse</button>
+            <span class="stat" id="sync-status">not synced yet</span>
+            <span class="stat hidden" id="sync-running">(running…)</span>
+          </div>
+          <div class="banner warn" style="margin-top:10px">Garmin rate-limits unofficial
+            clients and can suspend accounts that hammer it. Syncs are spaced and auto-back-off on
+            failures.</div>
+        </div>
+      </div>
+
+      <div id="sub-config" class="hidden">
+        <div class="card">
+          <h3 style="margin:0 0 10px">Your AI config</h3>
+          <div class="banner err hidden" id="cfg-error"></div>
+          <label>LLM API key (per-user, encrypted)</label>
+          <input id="cfg-api-key" type="password" placeholder="sk-…" autocomplete="off">
+          <div class="muted" id="cfg-key-state" style="margin:4px 0 0"></div>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text)">
+            <input type="checkbox" id="cfg-clear-key" style="width:auto;margin:0">
+            Remove the stored API key (leave blank to keep it)
+          </label>
+          <label>LLM base URL (optional, e.g. local Ollama)</label>
+          <input id="cfg-base-url" type="text" placeholder="https://api.deepseek.com" autocomplete="off">
+          <label>LLM model (optional)</label>
+          <input id="cfg-model" type="text" placeholder="deepseek-v4-flash" autocomplete="off">
+          <label>Home latitude (optional, for weather)</label>
+          <input id="cfg-home-lat" type="text" placeholder="e.g. 37.7749" autocomplete="off">
+          <label>Home longitude (optional, for weather)</label>
+          <input id="cfg-home-lon" type="text" placeholder="e.g. -122.4194" autocomplete="off">
+          <label>Don't fetch these Garmin features (check what you don't have)</label>
+          <div id="cfg-excluded"></div>
+          <div style="margin-top:16px"><button id="btn-save-config">Save config</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Workout edit modal -->
+  <div id="plan-modal" class="modal-bg hidden">
+    <div class="modal">
+      <h3 id="plan-modal-title">Workout</h3>
+      <div class="banner err hidden" id="plan-modal-error"></div>
+      <label>Date</label>
+      <input type="date" id="pm-date">
+      <div class="row">
+        <div>
+          <label>Activity</label>
+          <select id="pm-type">
+            <option value="run">Run</option>
+            <option value="cycle">Cycle</option>
+            <option value="swim">Swim</option>
+            <option value="strength">Strength</option>
+            <option value="rest">Rest</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+        <div>
+          <label>Intensity</label>
+          <select id="pm-intensity">
+            <option value="">—</option>
+            <option value="easy">Easy</option>
+            <option value="moderate">Moderate</option>
+            <option value="hard">Hard</option>
+            <option value="race_pace">Race pace</option>
+          </select>
+        </div>
+      </div>
+      <label>Title</label>
+      <input type="text" id="pm-title" placeholder="e.g. Easy 5K" autocomplete="off">
+      <label>Notes / description</label>
+      <textarea id="pm-description" rows="3" placeholder="Warm-up, main set, cool-down…"></textarea>
+      <div class="row">
+        <div>
+          <label>Duration (min)</label>
+          <input type="number" id="pm-duration" min="0" placeholder="30">
+        </div>
+        <div>
+          <label>Distance (km)</label>
+          <input type="number" id="pm-distance" min="0" step="any" placeholder="5.0">
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text)">
+        <input type="checkbox" id="pm-completed" style="width:auto;margin:0">
+        Completed
+      </label>
+      <div class="modal-actions">
+        <button id="pm-delete" class="secondary" style="border-color:var(--err);color:var(--err)">Delete</button>
+        <span></span>
+        <button id="pm-cancel" class="secondary">Cancel</button>
+        <button id="pm-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const API = "";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+let token = localStorage.getItem("garmin_token") || "";
+
+function api(path, body, method) {
+  const opts = { method: method || "POST", headers: { "Content-Type": "application/json" } };
+  if (token) opts.headers["Authorization"] = "Bearer " + token;
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  return fetch(API + path, opts).then(async (r) => {
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
+    return data;
+  });
+}
+
+function showAuth() { $("auth").style.display = ""; $("app").style.display = "none"; }
+function showApp() { $("auth").style.display = "none"; $("app").style.display = "block"; }
+
+function switchTab(which) {
+  $("tab-login").classList.toggle("active", which === "login");
+  $("tab-register").classList.toggle("active", which === "register");
+  $("login-view").classList.toggle("hidden", which !== "login");
+  $("register-view").classList.toggle("hidden", which !== "register");
+  setErr($("login-error"), ""); setErr($("login-ok"), "");
+  setErr($("reg-error"), ""); setErr($("reg-ok"), "");
+}
+
+function switchAppTab(which) {
+  for (const b of document.querySelectorAll("#app-tabs button")) {
+    b.classList.toggle("active", b.dataset.tab === which);
+  }
+  $("tab-chat").classList.toggle("hidden", which !== "chat");
+  $("tab-readiness").classList.toggle("hidden", which !== "readiness");
+  $("tab-acwr").classList.toggle("hidden", which !== "acwr");
+  $("tab-plan").classList.toggle("hidden", which !== "plan");
+  $("tab-settings").classList.toggle("hidden", which !== "settings");
+  if (which === "readiness") loadReadiness();
+  if (which === "acwr") loadACWR();
+  if (which === "plan") loadPlan();
+}
+
+function switchSettingsSubTab(which) {
+  for (const b of document.querySelectorAll("#settings-tabs button")) {
+    b.classList.toggle("active", b.dataset.subtab === which);
+  }
+  $("sub-sync").classList.toggle("hidden", which !== "sync");
+  $("sub-config").classList.toggle("hidden", which !== "config");
+}
+
+function setErr(el, msg) { el.textContent = msg || ""; el.classList.toggle("hidden", !msg); }
+
+function setBusy(btn, label) {
+  btn.dataset.orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.setAttribute("data-busy", "1");
+  btn.innerHTML = '<span class="spin"></span>' + label;
+}
+
+function clearBusy(btn) {
+  btn.disabled = false;
+  btn.removeAttribute("data-busy");
+  if (btn.dataset.orig) { btn.innerHTML = btn.dataset.orig; delete btn.dataset.orig; }
+}
+
+async function loginFlow() {
+  const btn = $("btn-login");
+  setErr($("login-error"), ""); setErr($("login-ok"), "");
+  setBusy(btn, "Signing in…");
+  try {
+    const data = await api("/auth/login", { email: $("login-email").value, password: $("login-password").value });
+    token = data.token; localStorage.setItem("garmin_token", token);
+    await enterApp();
+  } catch (e) {
+    setErr($("login-error"), e.message);
+    $("login-password").select();
+  } finally {
+    clearBusy(btn);
+  }
+}
+
+async function registerFlow() {
+  const btn = $("btn-register");
+  setErr($("reg-error"), ""); setErr($("reg-ok"), "");
+  setBusy(btn, "Linking Garmin account…");
+  try {
+    const data = await api("/auth/register", {
+      email: $("reg-email").value, password: $("reg-password").value,
+      garmin_email: $("reg-garmin-email").value, garmin_password: $("reg-garmin-password").value,
+    });
+    token = data.token; localStorage.setItem("garmin_token", token);
+    $("reg-ok").textContent = "Account created and linked to Garmin. Signing you in…";
+    $("reg-ok").classList.remove("hidden");
+    await sleep(1200);
+    await enterApp();
+  } catch (e) {
+    setErr($("reg-error"), e.message);
+  } finally {
+    clearBusy(btn);
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Renders a small, safe subset of GFM (tables, bold, italic, code, headings,
+// lists, links). Input is HTML-escaped first so model/user text can never
+// inject markup; only our own tags ever reach innerHTML.
+function renderInline(s) {
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (m, c) => {
+    codes.push(c);
+    return "\u0000" + (codes.length - 1) + "\u0000";
+  });
+  // Single pass over ***bold italic*** / **bold** / *italic* (order matters).
+  // Unlike before, bold/italic may span newlines and is never re-scanned, so a
+  // model's multi-line emphasis no longer leaks literal ** asterisks.
+  s = s.replace(
+    /\*\*\*([\s\S]+?)\*\*\*|\*\*([\s\S]+?)\*\*|(^|[^*\w])\*(?!\s)([^\n*]+?)\*(?!\*|\s)/g,
+    (m, b3, b2, pre, em) =>
+      b3 != null ? "<strong><em>" + b3 + "</em></strong>"
+      : b2 != null ? "<strong>" + b2 + "</strong>"
+      : pre + "<em>" + em + "</em>"
+  );
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (m, i) => "<code>" + codes[Number(i)] + "</code>");
+}
+
+function renderTable(rows) {
+  const delim = /^\s*\|?[\s:|-]+\|?\s*$/;
+  const split = (r) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  if (rows.length < 2 || !delim.test(rows[1])) {
+    return rows.map((r) => "<p>" + renderInline(r.trim()) + "</p>").join("");
+  }
+  const cells = (r) => split(r).map((c) => renderInline(c));
+  let html = "<table><thead><tr>" + cells(rows[0]).map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>";
+  for (let j = 2; j < rows.length; j++) {
+    html += "<tr>" + cells(rows[j]).map((c) => "<td>" + c + "</td>").join("") + "</tr>";
+  }
+  return html + "</tbody></table>";
+}
+
+function renderMarkdown(text) {
+  if (!text) return "";
+  const lines = escapeHtml(text).replace(/\r\n/g, "\n").split("\n");
+  const isBlock = (l) => {
+    const t = l.trim();
+    return t === "" || t.startsWith("|") || t.startsWith("```")
+      || /^\s*([-*]|\d+\.)\s+/.test(l) || /^\s*#{1,4}\s+/.test(l);
+  };
+  let html = "";
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const t = line.trim();
+    if (t.startsWith("```")) {
+      i++;
+      const buf = [];
+      while (i < lines.length && !lines[i].trim().startsWith("```")) { buf.push(lines[i]); i++; }
+      i++;
+      html += "<pre><code>" + buf.join("\n") + "</code></pre>";
+      continue;
+    }
+    if (t.startsWith("|")) {
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) { rows.push(lines[i]); i++; }
+      html += renderTable(rows);
+      continue;
+    }
+    const h = t.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { const lv = Math.min(h[1].length + 1, 6); html += "<h" + lv + ">" + renderInline(h[2]) + "</h" + lv + ">"; i++; continue; }
+    const ul = t.match(/^([-*])\s+(.*)$/);
+    if (ul) {
+      let items = "";
+      while (i < lines.length) {
+        const m2 = lines[i].trim().match(/^([-*])\s+(.*)$/);
+        if (!m2) break;
+        items += "<li>" + renderInline(m2[2]) + "</li>";
+        i++;
+      }
+      html += "<ul>" + items + "</ul>";
+      continue;
+    }
+    const ol = t.match(/^\d+\.\s+(.*)$/);
+    if (ol) {
+      let items = "";
+      while (i < lines.length) {
+        const m2 = lines[i].trim().match(/^\d+\.\s+(.*)$/);
+        if (!m2) break;
+        items += "<li>" + renderInline(m2[1]) + "</li>";
+        i++;
+      }
+      html += "<ol>" + items + "</ol>";
+      continue;
+    }
+    if (t === "") { i++; continue; }
+    const buf = [line];
+    i++;
+    while (i < lines.length && !isBlock(lines[i])) { buf.push(lines[i]); i++; }
+    // Inline-format the whole paragraph at once (so **bold** can span lines),
+    // then turn the paragraph's own newlines into <br>.
+    html += "<p>" + renderInline(buf.join("\n")).replace(/\n/g, "<br>") + "</p>";
+  }
+  return html;
+}
+
+function addMsg(role, text, charts) {
+  const box = $("chat");
+  const m = document.createElement("div");
+  m.className = "msg " + role;
+  const body = document.createElement("div");
+  body.className = "role";
+  body.textContent = role === "user" ? "You" : "Garmin AI";
+  const b = document.createElement("div");
+  b.className = "body";
+  if (role === "user") {
+    b.textContent = text || "";
+  } else {
+    // <plan_table .../> markers are replaced by the stored plan, rendered
+    // from /training-plan (the model must not transcribe the table itself).
+    const parts = (text || "").split(/<plan_table\b([^>]*)>/gi);
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (parts[i]) b.insertAdjacentHTML("beforeend", renderMarkdown(parts[i]));
+      } else {
+        const box = document.createElement("div");
+        box.className = "planbox";
+        const from = parts[i].match(/from\s*=\s*["']([^"']*)["']/i);
+        const to = parts[i].match(/to\s*=\s*["']([^"']*)["']/i);
+        box.dataset.from = from ? from[1] : "";
+        box.dataset.to = to ? to[1] : "";
+        b.appendChild(box);
+      }
+    }
+  }
+  m.appendChild(body); m.appendChild(b);
+  for (const spec of (charts || [])) {
+    const holder = document.createElement("div");
+    holder.className = "chartbox";
+    holder.dataset.sql = spec.sql || "";
+    holder.dataset.spec = JSON.stringify(spec);
+    m.appendChild(holder);
+  }
+  box.appendChild(m);
+  box.scrollTop = box.scrollHeight;
+  if (charts) renderCharts();
+  if (b.querySelector(".planbox")) renderPlanBoxes();
+}
+
+const PLAN_MARKER_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function buildPlanTable(box, workouts) {
+  const head = document.createElement("div");
+  head.className = "planbox-head";
+  head.textContent = "Training plan" + (workouts.length ? " (" + workouts.length + " workouts)" : "");
+  box.appendChild(head);
+  if (!workouts.length) {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = "No workouts in this date range.";
+    box.appendChild(empty);
+    return;
+  }
+  const tbl = document.createElement("table");
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const h of ["Date", "Activity", "Title", "Intensity", "Duration", "Distance", "Done"]) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  tbl.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const w of workouts) {
+    const tr = document.createElement("tr");
+    const mk = (t) => { const td = document.createElement("td"); td.textContent = t || ""; return td; };
+    tr.appendChild(mk(w.planned_date));
+    tr.appendChild(mk(w.activity_type));
+    tr.appendChild(mk(w.title || (w.activity_type === "rest" ? "Rest" : "")));
+    tr.appendChild(mk(w.intensity || ""));
+    tr.appendChild(mk(w.duration_min != null ? w.duration_min + " min" : ""));
+    tr.appendChild(mk(w.distance_km != null ? Number(w.distance_km) + " km" : ""));
+    tr.appendChild(mk(w.completed ? "yes" : ""));
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  box.appendChild(tbl);
+}
+
+async function renderPlanBoxes() {
+  const boxes = Array.from(document.querySelectorAll(".planbox:not([data-done])"));
+  for (const box of boxes) {
+    box.setAttribute("data-done", "1");
+    try {
+      const from = box.dataset.from || "";
+      const to = box.dataset.to || "";
+      if (from && !PLAN_MARKER_DATE.test(from)) throw new Error("invalid from date");
+      if (to && !PLAN_MARKER_DATE.test(to)) throw new Error("invalid to date");
+      const qs = [];
+      if (from) qs.push("from_date=" + encodeURIComponent(from));
+      if (to) qs.push("to_date=" + encodeURIComponent(to));
+      const url = "/training-plan" + (qs.length ? "?" + qs.join("&") : "");
+      const data = await api(url, undefined, "GET");
+      buildPlanTable(box, data.workouts || []);
+    } catch (e) {
+      box.innerHTML = '<div class="planbox-head">Training plan</div>'
+        + '<div class="muted">(unavailable: ' + escapeHtml(e.message) + ')</div>';
+    }
+  }
+}
+
+async function renderCharts() {
+  const holders = Array.from(document.querySelectorAll(".chartbox:not([data-done])"));
+  for (const h of holders) {
+    h.setAttribute("data-done", "1");
+    try {
+      const spec = JSON.parse(h.dataset.spec);
+      const fig = await api("/ask/chart", { spec });
+      Plotly.newPlot(h, fig.data, fig.layout, { responsive: true });
+    } catch (e) { h.textContent = "(chart unavailable: " + e.message + ")"; }
+  }
+}
+
+async function ask() {
+  const q = $("question").value.trim();
+  if (!q) return;
+  addMsg("user", q);
+  $("question").value = "";
+  $("btn-ask").disabled = true;
+  const placeholder = document.createElement("div");
+  placeholder.className = "msg";
+  placeholder.innerHTML = '<div class="role">Garmin AI</div><div class="body muted">thinking…</div>';
+  $("chat").appendChild(placeholder);
+  $("chat").scrollTop = $("chat").scrollHeight;
+  try {
+    const data = await api("/ask", { question: q });
+    placeholder.remove();
+    addMsg("assistant", data.answer, data.chart_specs || []);
+  } catch (e) {
+    placeholder.remove();
+    addMsg("assistant", "Error: " + e.message);
+  } finally {
+    $("btn-ask").disabled = false;
+    $("question").focus();
+  }
+}
+
+async function triggerSync() {
+  $("btn-sync").disabled = true;
+  try {
+    const data = await api("/sync", {});
+    if (data.running) {
+      $("sync-status").textContent = "sync running…";
+      pollStatus();
+    } else {
+      $("sync-status").textContent = "sync queued";
+      pollStatus();
+    }
+  } catch (e) { setErr($("sync-error"), e.message); } finally { $("btn-sync").disabled = false; }
+}
+
+async function triggerSyncFull() {
+  $("btn-sync-full").disabled = true;
+  try {
+    const data = await api("/sync/full", {});
+    $("sync-status").textContent = data.queued
+      ? "sync + full re-parse queued…"
+      : "a sync is already running — please wait";
+    pollStatus();
+  } catch (e) { setErr($("sync-error"), e.message); } finally { $("btn-sync-full").disabled = false; }
+}
+
+let statusTimer = null;
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()];
+  return mon + " " + d.getDate() + ", " + hh + ":" + mm;
+}
+
+async function refreshStatus() {
+  try {
+    const s = await api("/sync/status", undefined, "GET");
+    $("sync-running").classList.toggle("hidden", !s.running);
+    if (s.last_sync_at) $("sync-status").textContent = "last sync: " + fmtTime(s.last_sync_at);
+    if (s.sync_error) { setErr($("sync-error"), "last sync error: " + s.sync_error); }
+    else { setErr($("sync-error"), ""); }
+    if (s.rate_limit_until) $("sync-status").textContent += " · backoff until " + fmtTime(s.rate_limit_until);
+    return s.running;
+  } catch (e) { return null; }
+}
+
+async function pollStatus() {
+  clearTimeout(statusTimer);
+  const running = await refreshStatus();
+  if (running) {
+    statusTimer = setTimeout(pollStatus, 2000);
+  } else if (running === false) {
+    $("sync-running").classList.add("hidden");
+    try {
+      const me = await api("/auth/me", undefined, "GET");
+      $("bind-pending").classList.toggle("hidden", !!me.confirmed);
+    } catch (e) { /* not fatal */ }
+  }
+}
+
+const PLAN_TYPES = ["run", "cycle", "swim", "strength", "rest", "other"];
+const PLAN_COLORS = { run:"#3b82f6", cycle:"#22c55e", swim:"#06b6d4",
+                      strength:"#a855f7", rest:"#64748b", other:"#eab308" };
+const DAY_LABELS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+let planWeekStart = mondayOf(new Date());
+let planEditId = null;
+
+function mondayOf(d) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const dow = (x.getDay() + 6) % 7; // Mon=0
+  x.setDate(x.getDate() - dow);
+  return x;
+}
+
+function fmt(d) {
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0")
+       + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+async function loadPlan() {
+  const end = new Date(planWeekStart);
+  end.setDate(end.getDate() + 6);
+  try {
+    const data = await api("/training-plan?from_date=" + fmt(planWeekStart) + "&to_date=" + fmt(end),
+      undefined, "GET");
+    renderPlan(data.workouts || []);
+    setErr($("plan-error"), "");
+  } catch (e) { setErr($("plan-error"), e.message); }
+}
+
+function renderPlan(workouts) {
+  const byDate = {};
+  for (const w of workouts) {
+    (byDate[w.planned_date] = byDate[w.planned_date] || []).push(w);
+  }
+  const grid = $("plan-week");
+  grid.innerHTML = "";
+  const today = fmt(new Date());
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(planWeekStart);
+    d.setDate(d.getDate() + i);
+    const iso = fmt(d);
+    const day = document.createElement("div");
+    day.className = "plan-day" + (iso === today ? " today" : "");
+    const head = document.createElement("div");
+    head.className = "plan-day-header";
+    const dow = document.createElement("span");
+    dow.textContent = DAY_LABELS[i];
+    const dnum = document.createElement("span");
+    dnum.textContent = iso.slice(8);
+    head.appendChild(dow); head.appendChild(dnum);
+    day.appendChild(head);
+    const list = document.createElement("div");
+    for (const w of byDate[iso] || []) list.appendChild(workoutCard(w));
+    if (!(byDate[iso] || []).length) {
+      const empty = document.createElement("div");
+      empty.className = "plan-empty";
+      empty.textContent = "—";
+      list.appendChild(empty);
+    }
+    const add = document.createElement("button");
+    add.className = "plan-add";
+    add.textContent = "+ add";
+    add.addEventListener("click", () => openPlanModal(null, iso));
+    list.appendChild(add);
+    day.appendChild(list);
+    grid.appendChild(day);
+  }
+  const end = new Date(planWeekStart);
+  end.setDate(end.getDate() + 6);
+  $("plan-week-label").textContent = fmt(planWeekStart) + " — " + fmt(end);
+}
+
+function workoutCard(w) {
+  const card = document.createElement("div");
+  card.className = "plan-card"
+    + (w.activity_type === "rest" ? " rest" : "")
+    + (w.completed ? " done" : "");
+  card.style.borderLeftColor = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
+  const t = document.createElement("div");
+  t.className = "pc-type";
+  t.textContent = w.activity_type;
+  const title = document.createElement("div");
+  title.className = "pc-title";
+  title.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
+  const meta = [];
+  if (w.distance_km != null) meta.push(Number(w.distance_km) + " km");
+  if (w.duration_min != null) meta.push(Number(w.duration_min) + " min");
+  if (w.intensity) meta.push(w.intensity);
+  if (w.completed) meta.push("done");
+  const m = document.createElement("div");
+  m.className = "pc-meta";
+  m.textContent = meta.join(" · ");
+  card.appendChild(t); card.appendChild(title); card.appendChild(m);
+  card.addEventListener("click", () => openPlanModal(w, w.planned_date));
+  return card;
+}
+
+function openPlanModal(workout, date) {
+  planEditId = workout ? workout.id : null;
+  $("pm-date").value = workout ? workout.planned_date : date;
+  $("pm-type").value = workout ? workout.activity_type : "run";
+  $("pm-intensity").value = workout ? (workout.intensity || "") : "";
+  $("pm-title").value = workout ? (workout.title || "") : "";
+  $("pm-description").value = workout ? (workout.description || "") : "";
+  $("pm-duration").value = workout && workout.duration_min != null ? workout.duration_min : "";
+  $("pm-distance").value = workout && workout.distance_km != null ? workout.distance_km : "";
+  $("pm-completed").checked = workout ? !!workout.completed : false;
+  $("pm-delete").classList.toggle("hidden", !workout);
+  $("plan-modal-title").textContent = workout ? "Edit workout" : "Add workout";
+  setErr($("plan-modal-error"), "");
+  $("plan-modal").classList.remove("hidden");
+}
+
+function closePlanModal() { $("plan-modal").classList.add("hidden"); }
+
+async function savePlan() {
+  setErr($("plan-modal-error"), "");
+  const body = {
+    planned_date: $("pm-date").value,
+    activity_type: $("pm-type").value,
+    title: $("pm-title").value,
+    description: $("pm-description").value,
+    duration_min: $("pm-duration").value === "" ? null : Number($("pm-duration").value),
+    distance_km: $("pm-distance").value === "" ? null : Number($("pm-distance").value),
+    intensity: $("pm-intensity").value,
+    completed: $("pm-completed").checked,
+  };
+  if (!body.planned_date) { setErr($("plan-modal-error"), "pick a date"); return; }
+  try {
+    if (planEditId) await api("/training-plan/" + planEditId, body, "PUT");
+    else await api("/training-plan", body, "POST");
+    closePlanModal();
+    loadPlan();
+  } catch (e) { setErr($("plan-modal-error"), e.message); }
+}
+
+async function deletePlan() {
+  if (!planEditId) return;
+  setErr($("plan-modal-error"), "");
+  try {
+    await api("/training-plan/" + planEditId, undefined, "DELETE");
+    closePlanModal();
+    loadPlan();
+  } catch (e) { setErr($("plan-modal-error"), e.message); }
+}
+
+const READINESS_COLORS = { Prime:"#22c55e", Moderate:"#3b82f6", Low:"#f59e0b", Depleted:"#ef4444" };
+
+async function loadReadiness() {
+  const box = $("readiness-summary");
+  const chart = $("readiness-chart");
+  box.innerHTML = "";
+  setErr($("readiness-hint"), "");
+  try {
+    const data = await api("/readiness", undefined, "GET");
+    const days = data.days || [];
+    const today = data.today;
+    if (!today) {
+      $("readiness-hint").classList.remove("hidden");
+      chart.innerHTML = "";
+      return;
+    }
+    $("readiness-hint").classList.add("hidden");
+
+    const color = READINESS_COLORS[today.category] || "#fff";
+    const row = document.createElement("div");
+    row.className = "readiness-score-row";
+    const score = document.createElement("div");
+    score.className = "readiness-score";
+    score.style.color = color;
+    score.textContent = Math.round(today.score);
+    const right = document.createElement("div");
+    const cat = document.createElement("div");
+    cat.className = "readiness-cat";
+    cat.style.color = color;
+    cat.textContent = today.category;
+    const meta = document.createElement("div");
+    meta.className = "readiness-meta";
+    meta.textContent = "as of " + today.calendar_date;
+    right.appendChild(cat); right.appendChild(meta);
+    row.appendChild(score); row.appendChild(right);
+    box.appendChild(row);
+
+    const grid = document.createElement("div");
+    grid.className = "readiness-grid";
+    const comps = [
+      ["HRV (rmssd)", today.hrv != null ? Number(today.hrv).toFixed(1) + " ms" : "—",
+        today.z_hrv != null ? "z = " + Number(today.z_hrv).toFixed(2) : "n/a"],
+      ["Resting HR", today.rhr != null ? Math.round(today.rhr) + " bpm" : "—",
+        today.z_rhr != null ? "z = " + Number(today.z_rhr).toFixed(2) : "n/a"],
+      ["Sleep score", today.sleep_score != null ? Math.round(today.sleep_score) : "—",
+        today.z_sleep != null ? "z = " + Number(today.z_sleep).toFixed(2) : "n/a"],
+      ["Baseline samples", "HRV " + (today.samples_hrv != null ? today.samples_hrv : "—") +
+        " · RHR " + (today.samples_rhr != null ? today.samples_rhr : "—") +
+        " · Sleep " + (today.samples_sleep != null ? today.samples_sleep : "—"), "last 28 days"],
+    ];
+    for (const [label, value, sub] of comps) {
+      const c = document.createElement("div");
+      c.className = "readiness-comp";
+      const l = document.createElement("div");
+      l.className = "r-label";
+      l.textContent = label;
+      const v = document.createElement("div");
+      v.className = "r-value";
+      v.textContent = value;
+      const s = document.createElement("div");
+      s.className = "r-sub";
+      s.textContent = sub;
+      c.appendChild(l); c.appendChild(v); c.appendChild(s);
+      grid.appendChild(c);
+    }
+    box.appendChild(grid);
+
+    const scale = (data.meta && data.meta.scale) || [];
+    const anchors = scale.filter((s) => s.percentile > 0 && s.percentile < 1);
+    if (anchors.length) {
+      const foot = document.createElement("div");
+      foot.className = "muted";
+      foot.style.marginBottom = "10px";
+      foot.textContent = "Auto-scaled to your recent ~90 days: " +
+        anchors.map((s) => "P" + Math.round(s.percentile * 100) + " → " + Math.round(s.score))
+          .join(" · ");
+      box.appendChild(foot);
+    }
+    renderReadinessChart(chart, days);
+  } catch (e) {
+    box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
+  }
+}
+
+function renderReadinessChart(el, days) {
+  const pts = (days || []).filter((d) => d.score != null);
+  if (!pts.length) { el.innerHTML = ""; return; }
+  const bands = [
+    { y0: 0, y1: 39, color: "rgba(239,68,68,.16)", label: "Depleted" },
+    { y0: 40, y1: 59, color: "rgba(245,158,11,.16)", label: "Low" },
+    { y0: 60, y1: 79, color: "rgba(59,130,246,.16)", label: "Moderate" },
+    { y0: 80, y1: 100, color: "rgba(34,197,94,.16)", label: "Prime" },
+  ];
+  Plotly.newPlot(el, [
+    {
+      x: pts.map((d) => d.calendar_date),
+      y: pts.map((d) => d.score),
+      mode: "lines+markers",
+      type: "scatter",
+      name: "Readiness",
+      line: { color: "#e7edf3", width: 2 },
+      marker: { color: pts.map((d) => READINESS_COLORS[d.category] || "#8b98a5"), size: 6 },
+    },
+  ], {
+    title: { text: "Readiness history" },
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: "#e7edf3" },
+    xaxis: { gridcolor: "#2a323d", title: { text: "" } },
+    yaxis: { gridcolor: "#2a323d", range: [0, 100], title: { text: "score" } },
+    shapes: bands.map((b) => ({
+      type: "rect", xref: "paper", x0: 0, x1: 1,
+      y0: b.y0, y1: b.y1, fillcolor: b.color, line: { width: 0 },
+    })),
+    margin: { l: 40, r: 20, t: 40, b: 40 },
+    showlegend: false,
+  }, { responsive: true });
+}
+
+const ACWR_COLORS = { "Sweet Spot":"#22c55e", Elevated:"#f59e0b", Danger:"#ef4444", Detraining:"#3b82f6" };
+
+async function loadACWR() {
+  const box = $("acwr-summary");
+  const chart = $("acwr-chart");
+  box.innerHTML = "";
+  setErr($("acwr-hint"), "");
+  try {
+    const data = await api("/acwr", undefined, "GET");
+    const days = data.days || [];
+    const today = data.today;
+    if (!today) {
+      $("acwr-hint").classList.remove("hidden");
+      chart.innerHTML = "";
+      return;
+    }
+    $("acwr-hint").classList.add("hidden");
+
+    const color = ACWR_COLORS[today.category] || "#fff";
+    const row = document.createElement("div");
+    row.className = "readiness-score-row";
+    const score = document.createElement("div");
+    score.className = "readiness-score";
+    score.style.color = color;
+    score.textContent = Number(today.acwr).toFixed(2);
+    const right = document.createElement("div");
+    const cat = document.createElement("div");
+    cat.className = "readiness-cat";
+    cat.style.color = color;
+    cat.textContent = today.category;
+    const meta = document.createElement("div");
+    meta.className = "readiness-meta";
+    meta.textContent = "as of " + today.calendar_date;
+    right.appendChild(cat); right.appendChild(meta);
+    row.appendChild(score); row.appendChild(right);
+    box.appendChild(row);
+
+    const grid = document.createElement("div");
+    grid.className = "readiness-grid";
+    const comps = [
+      ["Acute load (7d EMA)", today.acute_load != null ? Number(today.acute_load).toFixed(1) : "—", "short-term fatigue"],
+      ["Chronic load (28d EMA)", today.chronic_load != null ? Number(today.chronic_load).toFixed(1) : "—", "long-term adaptation"],
+      ["Today's training load", today.daily_load != null ? Number(today.daily_load).toFixed(1) : "—", "sum of activity loads"],
+    ];
+    for (const [label, value, sub] of comps) {
+      const c = document.createElement("div");
+      c.className = "readiness-comp";
+      const l = document.createElement("div");
+      l.className = "r-label";
+      l.textContent = label;
+      const v = document.createElement("div");
+      v.className = "r-value";
+      v.textContent = value;
+      const s = document.createElement("div");
+      s.className = "r-sub";
+      s.textContent = sub;
+      c.appendChild(l); c.appendChild(v); c.appendChild(s);
+      grid.appendChild(c);
+    }
+    box.appendChild(grid);
+    renderAcwrChart(chart, days);
+  } catch (e) {
+    box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
+  }
+}
+
+function renderAcwrChart(el, days) {
+  const pts = (days || []).filter((d) => d.acwr != null);
+  if (!pts.length) { el.innerHTML = ""; return; }
+  const maxV = Math.max.apply(null, pts.map((d) => Number(d.acwr)));
+  const ymax = Math.max(2.0, Math.ceil((maxV * 1.15) * 10) / 10);
+  const bands = [
+    { y0: 0, y1: 0.8, color: "rgba(59,130,246,.16)", label: "Detraining" },
+    { y0: 0.8, y1: 1.3, color: "rgba(34,197,94,.16)", label: "Sweet Spot" },
+    { y0: 1.3, y1: 1.5, color: "rgba(245,158,11,.16)", label: "Elevated" },
+    { y0: 1.5, y1: ymax, color: "rgba(239,68,68,.16)", label: "Danger" },
+  ];
+  Plotly.newPlot(el, [
+    {
+      x: pts.map((d) => d.calendar_date),
+      y: pts.map((d) => d.acwr),
+      mode: "lines+markers",
+      type: "scatter",
+      name: "ACWR",
+      line: { color: "#e7edf3", width: 2 },
+      marker: { color: pts.map((d) => ACWR_COLORS[d.category] || "#8b98a5"), size: 6 },
+    },
+  ], {
+    title: { text: "ACWR history" },
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: "#e7edf3" },
+    xaxis: { gridcolor: "#2a323d" },
+    yaxis: { gridcolor: "#2a323d", range: [0, ymax], title: { text: "acute / chronic" } },
+    shapes: bands.map((b) => ({
+      type: "rect", xref: "paper", x0: 0, x1: 1,
+      y0: b.y0, y1: b.y1, fillcolor: b.color, line: { width: 0 },
+    })),
+    margin: { l: 40, r: 20, t: 40, b: 40 },
+    showlegend: false,
+  }, { responsive: true });
+}
+
+const DATA_TYPES = [
+  "heart_rate", "steps", "sleep", "body_battery", "hrv", "stress",
+  "respiration", "spo2", "rhr", "daily_summary", "intensity_minutes",
+  "max_metrics", "training_readiness", "morning_training_readiness",
+  "fitnessage", "training_status", "lactate_threshold",
+  "sweat_loss", "weight", "body_composition", "blood_pressure",
+  "endurance_score", "hill_score", "running_tolerance", "cycling_ftp",
+];
+
+async function loadConfig() {
+  try {
+    const c = await api("/auth/config", undefined, "GET");
+    $("cfg-base-url").value = c.llm_base_url || "";
+    $("cfg-model").value = c.llm_model || "";
+    $("cfg-home-lat").value = c.home_lat || "";
+    $("cfg-home-lon").value = c.home_lon || "";
+    $("cfg-key-state").textContent = c.llm_api_key_set
+      ? "An API key is stored (leave blank to keep it)."
+      : "No API key stored yet.";
+    const excluded = new Set(c.excluded_data_types || []);
+    const box = $("cfg-excluded");
+    box.innerHTML = "";
+    const grid = document.createElement("div");
+    grid.className = "cfg-grid";
+    // The exhaustive daily-metric list comes from the server (DATA_TYPES),
+    // so the checkbox grid always covers every collectible type. Each entry
+    // is {name, label, description}; plain-name arrays are a fallback.
+    const types = (c.available_data_types || DATA_TYPES).map((t) =>
+      typeof t === "string" ? { name: t, label: t, description: "" } : t
+    );
+    for (const t of types) {
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = excluded.has(t.name);
+      cb.value = t.name;
+      const wrap = document.createElement("span");
+      wrap.className = "cfg-item";
+      const name = document.createElement("span");
+      name.textContent = t.label || t.name;
+      wrap.appendChild(name);
+      if (t.description) {
+        const desc = document.createElement("span");
+        desc.className = "muted";
+        desc.textContent = t.description;
+        wrap.appendChild(desc);
+      }
+      label.appendChild(cb); label.appendChild(wrap);
+      grid.appendChild(label);
+    }
+    box.appendChild(grid);
+  } catch (e) { setErr($("cfg-error"), e.message); }
+}
+
+async function saveConfig() {
+  setErr($("cfg-error"), "");
+  const excluded = Array.from(document.querySelectorAll("#cfg-excluded input:checked"))
+    .map((cb) => cb.value);
+  const clearKey = $("cfg-clear-key").checked;
+  try {
+    await api("/auth/config", {
+      api_key: clearKey ? "" : $("cfg-api-key").value,
+      llm_base_url: $("cfg-base-url").value,
+      llm_model: $("cfg-model").value,
+      home_lat: $("cfg-home-lat").value,
+      home_lon: $("cfg-home-lon").value,
+      excluded_data_types: excluded,
+    }, "PUT");
+    $("cfg-api-key").value = "";
+    $("cfg-clear-key").checked = false;
+    $("cfg-key-state").textContent = "Saved.";
+    $("llm-missing").classList.toggle("hidden", true);
+  } catch (e) { setErr($("cfg-error"), e.message); }
+}
+
+async function loadHistory() {
+  try {
+    const data = await api("/ask/history", undefined, "GET");
+    for (const m of (data.history || [])) addMsg(m.role, m.content, m.chart_specs || []);
+  } catch (e) { /* conversation history is best-effort on login */ }
+}
+
+async function enterApp() {
+  const me = await api("/auth/me", undefined, "GET");
+  $("who").textContent = me.email;
+  $("logout").classList.remove("hidden");
+  $("bind-pending").classList.toggle("hidden", !!me.confirmed);
+  $("llm-missing").classList.toggle("hidden", !!me.llm_configured);
+  showApp();
+  switchAppTab("chat");
+  $("chat").innerHTML = "";
+  loadHistory();
+  refreshStatus();
+}
+
+function logout() {
+  token = ""; localStorage.removeItem("garmin_token");
+  showAuth();
+}
+
+$("btn-login").addEventListener("click", loginFlow);
+$("btn-register").addEventListener("click", registerFlow);
+$("btn-ask").addEventListener("click", ask);
+$("btn-new-chat").addEventListener("click", async () => {
+  try { await api("/ask/clear", {}); } catch (e) {}
+  $("chat").innerHTML = "";
+  $("question").focus();
+});
+$("btn-sync").addEventListener("click", triggerSync);
+$("btn-sync-full").addEventListener("click", triggerSyncFull);
+$("logout").addEventListener("click", logout);
+$("tab-login").addEventListener("click", () => switchTab("login"));
+$("tab-register").addEventListener("click", () => switchTab("register"));
+for (const b of document.querySelectorAll("#app-tabs button")) {
+  b.addEventListener("click", () => switchAppTab(b.dataset.tab));
+}
+for (const b of document.querySelectorAll("#settings-tabs button")) {
+  b.addEventListener("click", () => {
+    switchSettingsSubTab(b.dataset.subtab);
+    if (b.dataset.subtab === "config") loadConfig();
+  });
+}
+$("btn-save-config").addEventListener("click", saveConfig);
+$("plan-prev").addEventListener("click", () => { planWeekStart.setDate(planWeekStart.getDate() - 7); loadPlan(); });
+$("plan-next").addEventListener("click", () => { planWeekStart.setDate(planWeekStart.getDate() + 7); loadPlan(); });
+$("btn-plan-today").addEventListener("click", () => { planWeekStart = mondayOf(new Date()); loadPlan(); });
+$("pm-save").addEventListener("click", savePlan);
+$("pm-cancel").addEventListener("click", closePlanModal);
+$("pm-delete").addEventListener("click", deletePlan);
+$("plan-modal").addEventListener("click", (e) => { if (e.target === $("plan-modal")) closePlanModal(); });
+$("question").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+$("login-email").addEventListener("keydown", (e) => { if (e.key === "Enter") loginFlow(); });
+$("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") loginFlow(); });
+$("reg-password").addEventListener("keydown", (e) => { if (e.key === "Enter") registerFlow(); });
+$("reg-garmin-password").addEventListener("keydown", (e) => { if (e.key === "Enter") registerFlow(); });
+
+if (token) {
+  enterApp().catch(() => { token = ""; localStorage.removeItem("garmin_token"); showAuth(); });
+} else {
+  showAuth();
+}
+</script>
+</body>
+</html>
