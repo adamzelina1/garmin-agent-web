@@ -19,6 +19,7 @@ dependencies = [
     "bcrypt>=5.0.0",
     "apscheduler>=3.11.3",
     "python-multipart>=0.0.32",
+    "tzdata>=2026.3",
 ]
 
 [project.scripts]

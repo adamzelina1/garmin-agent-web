@@ -92,6 +92,7 @@ def _ensure_user_config_columns(conn: Any) -> None:
         ("home_lon", "TEXT"),
         ("excluded_data_types", "TEXT"),
         ("sync_start_date", "TEXT"),
+        ("auto_sync", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ):
         # Skip silently until the table exists (fresh volumes create it later).
         exists = conn.execute(

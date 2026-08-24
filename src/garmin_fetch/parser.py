@@ -581,13 +581,12 @@ def build_daily_rows(
     # Some registered types (e.g. training_readiness) are fetch-only and have
     # no projection; skip them rather than crash.
     names = [n for n in (types or list(PARSERS)) if n in PARSERS]
-    if force and set(names) == set(PARSERS):
-        # A full re-parse rebuilds the schema: drop every daily_metrics column
-        # so the table only contains what the current parsers write. Stale
-        # columns from renamed/removed metrics don't linger as NULLs.
-        dropped = db.reset_daily_columns()
-        if dropped:
-            logger.info("reset daily_metrics schema: dropped %s", ", ".join(dropped))
+    # NOTE: a full re-parse deliberately does NOT drop and rebuild the
+    # daily_metrics columns anymore. daily_metrics is one shared, RLS-scoped
+    # table: dropping a column deletes every account's projected values, not
+    # just the syncing user's, and they only come back for dates that user
+    # re-parses. Stale columns from renamed/removed metrics simply linger as
+    # NULLs — a safe trade-off for the multi-user server.
     counts: dict[str, int] = {}
     for name in names:
         rows = db.metrics_rows(name)

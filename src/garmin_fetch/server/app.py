@@ -4,6 +4,7 @@ Serves a small same-origin JS frontend (``/static/index.html``) and a JSON
 API:
 
 - ``POST /auth/register``   — create account + bind Garmin (single-step login)
+- ``POST /auth/register/mfa`` — submit Garmin verification code, finish bound
 - ``POST /auth/login``      — email+password -> JWT
 - ``GET  /auth/me``         — current user (JWT)
 - ``POST /sync``            — enqueue the caller's own sync (JWT)
@@ -45,6 +46,7 @@ from ..ask import (
     _build_agent,
     _build_chart_figure,
     _record_turn,
+    _refresh_resumed_prompt,
 )
 from ..ask_web import (
     _extract_charts,
@@ -73,6 +75,11 @@ class RegisterRequest(BaseModel):
     garmin_password: str
 
 
+class RegisterMFARequest(BaseModel):
+    challenge: str
+    code: str
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -88,13 +95,15 @@ class ChartRequest(BaseModel):
 
 
 class ConfigRequest(BaseModel):
-    api_key: str = ""
-    llm_base_url: str = ""
-    llm_model: str = ""
-    home_lat: str = ""
-    home_lon: str = ""
-    excluded_data_types: list[str] = []
+    api_key: str | None = None
+    llm_base_url: str | None = None
+    llm_model: str | None = None
+    home_lat: str | None = None
+    home_lon: str | None = None
+    excluded_data_types: list[str] | None = None
     clear_api_key: bool = False
+    auto_sync: bool | None = None
+    sync_start_date: str | None = None
 
 
 class TrainingPlanWorkout(BaseModel):
@@ -212,6 +221,17 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         except AuthError as exc:
             raise HTTPException(exc.status_code, exc.detail) from exc
 
+    @app.post("/auth/register/mfa")
+    def register_mfa(body: RegisterMFARequest, request: Request) -> dict[str, Any]:
+        """Finish a signup that hit Garmin two-step verification by submitting
+        the code the user was sent. ``challenge`` is from the ``mfa_required``
+        response of ``POST /auth/register``."""
+        auth: AuthService = request.app.state.auth
+        try:
+            return auth.confirm_mfa(challenge=body.challenge, code=body.code)
+        except AuthError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+
     @app.post("/auth/login")
     def login(body: LoginRequest, request: Request) -> dict[str, Any]:
         auth: AuthService = request.app.state.auth
@@ -231,6 +251,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             "active": user["active"],
             "last_sync_at": user["last_sync_at"],
             "sync_error": user["sync_error"],
+            "auto_sync": bool(user.get("auto_sync")),
             "llm_configured": auth.user_llm_configured(user),
         }
 
@@ -244,18 +265,31 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         body: ConfigRequest, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
         auth: AuthService = request.app.state.auth
-        auth.save_user_config(
-            user["id"],
-            api_key=body.api_key,
-            llm_base_url=body.llm_base_url.strip(),
-            llm_model=body.llm_model.strip(),
-            home_lat=body.home_lat.strip(),
-            home_lon=body.home_lon.strip(),
-            excluded_data_types=[
+        # Only write fields the client actually sent. Partial updates (e.g. the
+        # auto-sync toggle, the sync start date) must never reset unrelated
+        # settings to empty via Pydantic defaults.
+        kwargs: dict[str, Any] = {}
+        if body.api_key is not None:
+            kwargs["api_key"] = body.api_key
+        if body.llm_base_url is not None:
+            kwargs["llm_base_url"] = body.llm_base_url.strip()
+        if body.llm_model is not None:
+            kwargs["llm_model"] = body.llm_model.strip()
+        if body.home_lat is not None:
+            kwargs["home_lat"] = body.home_lat.strip()
+        if body.home_lon is not None:
+            kwargs["home_lon"] = body.home_lon.strip()
+        if body.excluded_data_types is not None:
+            kwargs["excluded_data_types"] = [
                 t.strip().lower() for t in body.excluded_data_types if t.strip()
-            ],
-            clear_api_key=body.clear_api_key,
-        )
+            ]
+        if body.clear_api_key:
+            kwargs["clear_api_key"] = True
+        if body.auto_sync is not None:
+            kwargs["auto_sync"] = body.auto_sync
+        if body.sync_start_date is not None:
+            kwargs["sync_start_date"] = body.sync_start_date
+        auth.save_user_config(user["id"], **kwargs)
         return {"status": "ok"}
 
     # -- sync -----------------------------------------------------------------
@@ -408,6 +442,59 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             raise HTTPException(404, "workout not found")
         return {"status": "ok"}
 
+    # -- weather ---------------------------------------------------------------
+
+    @app.get("/weather")
+    def weather_get(
+        request: Request,
+        user: dict = Depends(get_user),
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict[str, Any]:
+        """The user's stored daily weather forecast (min/max degC, precip, wind).
+
+        Populated by the sync worker from Open-Meteo on each sync, so this is
+        read-only and never hits an external API on a page view. With no dates
+        the window today..(today+15) is returned (whatever has been synced).
+        """
+        from datetime import date as _date, timedelta as _timedelta
+
+        from ..db import PostgresBackend
+
+        for label, value in (("from_date", from_date), ("to_date", to_date)):
+            if value:
+                try:
+                    _date.fromisoformat(value)
+                except ValueError as exc:
+                    raise HTTPException(
+                        400, f"{label} must be a YYYY-MM-DD date (or blank)"
+                    ) from exc
+
+        today = _date.today()
+        if from_date is None and to_date is None:
+            start, end = today, today + _timedelta(days=15)
+        elif from_date is None or to_date is None:
+            raise HTTPException(400, "pass both from_date and to_date, or neither")
+        else:
+            start, end = _date.fromisoformat(from_date), _date.fromisoformat(to_date)
+        if end < start:
+            raise HTTPException(400, "to_date must not be before from_date")
+
+        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
+        conn = backend.connect()
+        try:
+            rows = conn.execute(
+                "SELECT calendar_date AS date, temp_max_c, temp_min_c, precip_mm, "
+                "wind_max_kmh, source "
+                "FROM weather_forecast "
+                "WHERE user_id = %s AND calendar_date >= %s AND calendar_date <= %s "
+                "ORDER BY calendar_date",
+                (user["id"], start.isoformat(), end.isoformat()),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"days": [dict(r) for r in rows]}
+
     # -- ask ------------------------------------------------------------------
 
     @app.post("/ask")
@@ -439,6 +526,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 history = _history_to_messages(body.history)
             else:
                 history = state.get_session_messages(user["id"])
+                if history:
+                    # Stored sessions may carry a stale "Today is <yesterday>"
+                    # system prompt from before the date became dynamic.
+                    _refresh_resumed_prompt(history)
             result = agent.run_sync(body.question, message_history=history)
 
             def _trace_writer(record: dict) -> None:

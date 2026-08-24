@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from datetime import UTC, date, datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from garminconnect import Garmin
 
@@ -133,10 +133,10 @@ class DataFetcher:
 
     def get_token_string(self) -> str:
         """Serialize the current Garmin auth tokens (for encrypted storage)."""
-        return self.client.dumps()
+        return self.client.client.dumps()
 
     def is_authenticated(self) -> bool:
-        client = self.client
+        client = self.client.client
         return bool(
             getattr(client, "di_token", None)
             or getattr(client, "jwt_web", None)
@@ -450,6 +450,38 @@ class DataFetcher:
         return fetched
 
 
+def refresh_weather_forecast(db: Database, lat: float, lon: float) -> int:
+    """Fetch the next 16 days of daily weather and store it for one user.
+
+    Called once per sync so the forecast in the training-plan calendar only
+    changes when a sync runs (it never hits Open-Meteo on a page view). The
+    stored rows are replaced wholesale. Returns the number of rows written, or
+    0 when no forecast could be produced (e.g. a location was not configured),
+    leaving any previously stored rows untouched.
+    """
+    from .ask import Weather
+
+    weather = Weather(default_lat=lat, default_lon=lon)
+    try:
+        data = weather.query()
+    except ValueError:
+        return 0
+    rows: list[dict[str, Any]] = []
+    for day in data.get("days", []):
+        rows.append(
+            {
+                "calendar_date": day.get("date"),
+                "temp_max_c": day.get("temp_max_c"),
+                "temp_min_c": day.get("temp_min_c"),
+                "precip_mm": day.get("precip_mm"),
+                "wind_max_kmh": day.get("wind_max_kmh"),
+                "source": data.get("source", "forecast"),
+                "fetched_at": _now_iso(),
+            }
+        )
+    return db.replace_weather_forecast(rows)
+
+
 def sync_data(
     *,
     user_id: int = 1,
@@ -517,7 +549,7 @@ def sync_data(
         if include_activities:
             act_start = _resolve_activity_start(db, configured_start, freeze_days, end)
             counts["activities"] = fetcher.fetch_activities(act_start, end, db)
-            mark_activities_finalized(db, end, freeze_days)
+            mark_activities_finalized(db, end, freeze_days, act_start)
             logger.info(
                 "synced activities: fetched %d new (%s to %s)",
                 counts["activities"], act_start, end,
@@ -670,12 +702,17 @@ def _resolve_activity_start(
 
     Steady state (a finalization marker exists): re-scan only the rolling
     freeze buffer, i.e. ``end - freeze_days + 1``, bounded below by the
-    finalized marker. First run: full backfill from ``configured_start``,
+    finalized marker. A ``configured_start`` earlier than the marker means the
+    account's start date was set/changed after data was settled, so this run
+    re-backfills from it. First run: full backfill from ``configured_start``,
     else just the rolling window.
     """
     finalized = db.get_state(_ACTIVITY_FINALIZED_KEY)
     if finalized:
-        return _rolling_start(end, freeze_days, date.fromisoformat(finalized))
+        marker = date.fromisoformat(finalized)
+        if configured_start and configured_start < marker:
+            return configured_start
+        return _rolling_start(end, freeze_days, marker)
     if configured_start:
         return configured_start
     return _rolling_start(end, freeze_days, None)
@@ -689,11 +726,22 @@ def _rolling_start(end: date, freeze_days: int, finalized: date | None) -> date:
     return start
 
 
-def mark_activities_finalized(db: Database, end: date, freeze_days: int) -> None:
-    """After a successful sync, freeze everything older than the buffer."""
-    if freeze_days > 0:
-        finalized = end - timedelta(days=freeze_days)
-        db.set_state(_ACTIVITY_FINALIZED_KEY, finalized.isoformat())
+def mark_activities_finalized(
+    db: Database, end: date, freeze_days: int, effective_start: date | None = None
+) -> None:
+    """After a successful sync, freeze everything older than the buffer.
+
+    ``effective_start`` is the activity start actually used this run. When it
+    predates the freeze boundary (a backfill from a user-set start date), the
+    marker is pinned to it so the next run resumes the normal rolling window
+    instead of re-backfilling the whole range.
+    """
+    if freeze_days <= 0:
+        return
+    finalized = end - timedelta(days=freeze_days)
+    if effective_start and effective_start < finalized:
+        finalized = effective_start
+    db.set_state(_ACTIVITY_FINALIZED_KEY, finalized.isoformat())
 
 
 def _resolve_start_date(

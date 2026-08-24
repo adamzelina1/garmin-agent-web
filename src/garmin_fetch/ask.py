@@ -194,18 +194,18 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
 }
 
 #: The prompt, split into independently-editable sections. ``_PROMPT_ROLE`` is
-#: the only one with a ``{today}`` placeholder (formatted at build time); the
-#: rest are plain strings concatenated in order.
+#: the only one with a ``{today}`` placeholder (formatted at run time as a
+#: dynamic system prompt, so the date is always fresh); the rest are plain
+#: strings concatenated in order.
 _PROMPT_ROLE = """\
 You are an analyst with read-only access to a per-user Postgres database of personal
 Garmin health data. Today is {today}. Answer the user's questions by inspecting
 the schema and running read-only SELECT queries. You may run several queries.
 You can never write — except through the dedicated training-plan tools (see below).
 
-This session may run for a long time, so the date baked into this prompt can go
-stale across days. Whenever the answer depends on "today"/"tomorrow"/"this week"
-or other relative dates, call the ``today`` tool and use its result — never rely
-on the date above alone.
+The date above is refreshed on every turn. Whenever the answer depends on
+"today"/"tomorrow"/"this week" or other relative dates, call the ``today`` tool
+and use its result — it is the authoritative current date.
 
 Column suffixes are the units: *_kmh = km/h, *_m = metres, *_w = watts, *_hours
 = hours, *_min = minutes, *_c = degC, *_ml = ml, *_kcal = kcal. *_pct = percent
@@ -223,6 +223,16 @@ columns wide and activity_summaries ~58). Keep result sets tiny: select a handfu
 of columns and aggregate to at most ~100-200 rows, ORDER BY time columns so
 trends read naturally. Prefer small probes — e.g. query with LIMIT 10 to
 sanity-check columns before a full aggregation.
+
+Write the SQL yourself for every data question. There are no ready-made query
+tools and no shortcuts: use the schema given above and the ``run_sql`` tool for
+all data access (metric time series, recent activities, splits, per-tick series,
+per-day summaries — everything). Derive each answer directly from the tables.
+
+One exception: for "how was my day X" questions, call ``get_day_summary(YYYY-MM-DD)``
+instead of writing a SELECT — it returns the whole per-day bundle (every stored
+daily metric plus that day's activities) in one call without a ~60-column
+daily_metrics dump. For anything else, write the SQL yourself.
 """
 
 _PROMPT_CHARTS = """\
@@ -340,6 +350,11 @@ def _jsonable(value: Any) -> Any:
         # counterparts, which json can't serialize; emit ISO-8601 strings.
         return value.isoformat()
     return value
+
+
+def _jsonify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coerce every value in a list of dict rows to a JSON-safe form."""
+    return [{k: _jsonable(v) for k, v in row.items()} for row in rows]
 
 
 _CHART_TYPES = (
@@ -651,6 +666,43 @@ class ReadOnlyDB:
             "rows": row["n"],
         }
 
+    def day_summary(self, calendar_date: str) -> dict[str, Any]:
+        """Every stored daily metric plus activities for one calendar date."""
+        if not isinstance(calendar_date, str) or not calendar_date.strip():
+            raise ValueError("calendar_date must be YYYY-MM-DD")
+        day = calendar_date.strip()
+        try:
+            date.fromisoformat(day)
+        except ValueError as exc:
+            raise ValueError(
+                f"calendar_date must be YYYY-MM-DD, got {calendar_date!r}"
+            ) from exc
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_metrics WHERE calendar_date = %s",
+                (day,),
+            ).fetchone()
+            activities = conn.execute(
+                "SELECT activity_id, activity_name, activity_type, "
+                "start_time_local, duration_hours, distance_km, avg_hr, "
+                "max_hr, pace_min_km, training_load "
+                "FROM activity_summaries WHERE start_date = %s "
+                "ORDER BY start_time_local DESC NULLS LAST",
+                (day,),
+            ).fetchall()
+        metrics: dict[str, Any] = {}
+        if row:
+            metrics = {
+                k: _jsonable(v)
+                for k, v in dict(row).items()
+                if v is not None and k not in ("user_id", "calendar_date", "fetched_at")
+            }
+        return {
+            "calendar_date": day,
+            "metrics": metrics,
+            "activities": _jsonify_rows([dict(r) for r in activities]),
+        }
+
     def run_sql(self, sql: str) -> dict[str, Any]:
         """Validate and execute a read-only query, returning rows as JSON-safe."""
         statement = sql.strip().rstrip(";").strip()
@@ -908,6 +960,42 @@ def _schema_text(db: ReadOnlyDB) -> str:
     return "\n".join(lines)
 
 
+def _current_date_prompt() -> str:
+    """The role prompt with today's date, re-evaluated as a dynamic prompt.
+
+    Includes the weekday name (e.g. ``2026-08-16 (Sunday)``) so the model never
+    has to compute the day of week from the date itself — models reliably get
+    that arithmetic wrong by a day.
+    """
+    return _PROMPT_ROLE.format(
+        today=date.today().strftime("%Y-%m-%d (%A)")
+    )
+
+
+def _refresh_resumed_prompt(messages: list[Any]) -> list[Any]:
+    """Stamp the current date onto any stored system prompt in resumed history.
+
+    Sessions persisted before the date prompt became dynamic carry a
+    ``SystemPromptPart`` with an old date and no ``dynamic_ref``, so Pydantic AI
+    can never re-evaluate it — the resumed agent keeps thinking "today" is the
+    day the session started. Rewrite those parts in place with the fresh date
+    and the current ``dynamic_ref`` so they keep refreshing on later turns.
+    """
+    from pydantic_ai.messages import SystemPromptPart
+
+    fresh = _current_date_prompt()
+    ref = _current_date_prompt.__qualname__
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if not isinstance(part, SystemPromptPart):
+                continue
+            if part.content == fresh and part.dynamic_ref == ref:
+                continue
+            part.content = fresh
+            part.dynamic_ref = ref
+    return messages
+
+
 def build_agent(
     db: ReadOnlyDB,
     *,
@@ -944,16 +1032,14 @@ def build_agent(
             provider=OpenAIProvider(base_url=base_url, api_key=api_key),
             settings=model_settings,
         )
-    system_prompt = _PROMPT_ROLE.format(today=date.today().isoformat())
     schema = _schema_text(db)
-    if schema:
-        system_prompt += (
-            "\n\nThe current database schema is given below. You do NOT need to "
-            "call table_schema for these tables — the columns (with units/notes) "
-            "are already listed here. Write queries directly against these "
-            "columns; if a column you expect is missing, re-check with "
-            "table_schema once.\n\n" + schema
-        )
+    system_prompt = (
+        "The current database schema is given below. You do NOT need to "
+        "call table_schema for these tables — the columns (with units/notes) "
+        "are already listed here. Write queries directly against these "
+        "columns; if a column you expect is missing, re-check with "
+        "table_schema once.\n\n" + schema
+    ) if schema else ""
     system_prompt += "\n\n" + "\n\n".join(
         [
             _PROMPT_QUERY,
@@ -964,7 +1050,15 @@ def build_agent(
             _PROMPT_ANSWER,
         ]
     )
-    agent = Agent(model, system_prompt=system_prompt)
+    agent = Agent(model, system_prompt=system_prompt.strip())
+
+    # The date must be a dynamic system prompt: static prompts are evaluated
+    # once and stored in the message history, so a cached agent (or a resumed
+    # session) would keep "Today is <yesterday>" forever. A dynamic prompt is
+    # re-evaluated on every model request, so the date can never go stale.
+    # (dynamic=True only works in the decorator form; the module-level function
+    # keeps the ``dynamic_ref`` stable so resumed sessions can match it.)
+    agent.system_prompt(dynamic=True)(_current_date_prompt)
 
     @agent.tool_plain
     def list_tables() -> str:
@@ -987,12 +1081,14 @@ def build_agent(
 
     @agent.tool_plain
     def today() -> str:
-        """Return the current date as YYYY-MM-DD.
+        """Return the current date as YYYY-MM-DD (Weekday).
 
         Use this (not the date in the system prompt) for any relative-date
         question — the prompt's date can be stale in a long-running session.
+        The weekday name is included so you never have to derive it from the
+        date yourself.
         """
-        return date.today().isoformat()
+        return date.today().strftime("%Y-%m-%d (%A)")
 
     @agent.tool_plain
     def run_sql(sql: str) -> str:
@@ -1007,6 +1103,21 @@ def build_agent(
         except (ValueError, QueryError) as exc:
             return _tool_error(exc)
         return json.dumps(result)
+
+    @agent.tool_plain
+    def get_day_summary(calendar_date: str) -> str:
+        """Return every stored daily metric plus activities for one date.
+
+        ``calendar_date`` is YYYY-MM-DD. Returns the day's non-null
+        daily_metrics values (sleep, resting HR, HRV, steps, weight, ...) and
+        the activities recorded that day. Use this instead of hand-writing a
+        SELECT for "how was my day X" — it returns exactly the per-day bundle
+        you need without selecting the ~60-column wide daily_metrics row.
+        """
+        try:
+            return json.dumps(db.day_summary(calendar_date), ensure_ascii=False)
+        except (ValueError, QueryError, psycopg.Error) as exc:
+            return _tool_error(exc)
 
     @agent.tool_plain
     def chart(spec: str) -> str:
@@ -1329,6 +1440,7 @@ def _ask_session(cfg: dict[str, str]) -> None:
         )
         history = state.get_session_messages(user_id) or []
         if history:
+            _refresh_resumed_prompt(history)
             print(
                 f"Resumed {len(history)} prior message(s) from the database "
                 f"(user {user_id})"

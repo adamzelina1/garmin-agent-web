@@ -25,7 +25,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from garminconnect import GarminConnectAuthenticationError
 
 from ..db import Database
-from ..fetcher import DataFetcher, sync_data
+from ..fetcher import DataFetcher, refresh_weather_forecast, sync_data
+
 from .auth import UserStore, now_iso
 from .crypto import Encryptor
 from .state import TrainingPlanStore
@@ -168,6 +169,7 @@ class SyncManager:
                 rate_limit_until=None,
             )
             logger.info("synced user %s: %s", user_id, counts)
+            self._refresh_weather(user_id, user, db)
             self._refine_start(user_id, current_start=user.get("sync_start_date"))
             self._autocomplete_plan(user_id)
             return counts
@@ -191,6 +193,32 @@ class SyncManager:
     def _backoff_active(self, user: dict[str, Any]) -> bool:
         until = _parse_iso(user.get("rate_limit_until"))
         return until is not None and until > datetime.now(timezone.utc)
+
+    def _refresh_weather(self, user_id: int, user: dict[str, Any], db: Any) -> None:
+        """Store the next 16-day forecast on the already-open sync connection.
+
+        Best-effort tied to a sync so the training-plan calendar's forecast only
+        changes when a sync runs; a failure just logs and keeps the last stored
+        forecast rather than failing the sync.
+        """
+        lat, lon = user.get("home_lat"), user.get("home_lon")
+        if not lat or not lon:
+            logger.info(
+                "skipping weather-forecast refresh for user %s (no home location)",
+                user_id,
+            )
+            return
+        try:
+            count = refresh_weather_forecast(db, float(lat), float(lon))
+            if count:
+                logger.info(
+                    "refreshed %d weather-forecast day(s) for user %s",
+                    count, user_id,
+                )
+        except Exception as exc:  # noqa: BLE001 - forecast must never break a sync
+            logger.warning(
+                "weather-forecast refresh failed for user %s: %s", user_id, exc
+            )
 
     def _autocomplete_plan(self, user_id: int) -> None:
         """Mark planned workouts completed against the freshly synced activities.
@@ -279,17 +307,17 @@ class SyncManager:
     def cron_sync(self) -> int:
         """Enqueue one sync per active user, spaced across the cron interval.
 
-        Enqueuing every active account at the same tick makes the worker hit
+        Enqueuing every opted-in account at the same tick makes the worker hit
         Garmin with a burst of logins/fetches from one IP — the fastest way to
         trigger a 429/Cloudflare block (Phase 4 hardening is a backstop, not a
-        substitute). Instead, this walks the active users and enqueues each one
-        on a stagger: the gap between accounts is ``interval_min / n_users``
-        (at least 1 minute), so with 2 users and a 60-min interval they sync
-        ~30 min apart rather than back-to-back. The stagger runs on a
-        background daemon thread so the scheduler isn't blocked. Returns the
-        number of active users scheduled.
+        substitute). Instead, this walks the users who turned on auto-sync and
+        enqueues each one on a stagger: the gap between accounts is
+        ``interval_min / n_users`` (at least 1 minute), so with 2 users and a
+        60-min interval they sync ~30 min apart rather than back-to-back. The
+        stagger runs on a background daemon thread so the scheduler isn't
+        blocked. Returns the number of auto-sync users scheduled.
         """
-        users = self.store.list_active()
+        users = self.store.list_auto_sync()
         if not users:
             return 0
         gap_min = max(1, self.cfg["sync_interval_min"] // len(users))
@@ -297,7 +325,7 @@ class SyncManager:
             target=self._staggered_enqueue, args=(users, gap_min), daemon=True
         ).start()
         logger.info(
-            "cron sync: %d active user(s), enqueuing them spread over ~%d min "
+            "cron sync: %d auto-sync user(s), enqueuing them spread over ~%d min "
             "(gap %d min)",
             len(users), gap_min * len(users), gap_min,
         )

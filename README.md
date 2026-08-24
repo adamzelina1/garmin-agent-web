@@ -56,7 +56,11 @@ even if its statement gate is ever removed.
   (including the `derived_metrics` table), validates and embeds Plotly chart
   specs (the UI re-runs the query to draw them), consults a stateless weather
   tool (Open-Meteo), keeps long-term memory, and can read/edit the training
-  plan. Conversation and memory are per-user, in Postgres.
+  plan. Every data question is answered by the model writing its own SQL
+  through `run_sql`, except per-day summaries which use the single
+  `get_day_summary` shortcut (one call returns a day's metrics + activities
+  instead of a ~60-column dump). Conversation and memory are per-user, in
+  Postgres.
 - **Operation hardening.** Per-account exponential backoff on the sync worker
   protects against Garmin's informal API and ban risk; tokens are
   auto-refreshed and re-encrypted; signup fails fast and clearly whenever
