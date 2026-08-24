@@ -24,14 +24,15 @@ even if its statement gate is ever removed.
 ## What it does
 
 - **Multi-user server.** Register/login with email+password; each account
-  supplies its own Garmin credentials at signup and logs in once (no MFA
-  flow), with the resulting OAuth tokens stored encrypted (AES-GCM, key from
-  env). `POST /sync` triggers the caller's own sync; a cron endpoint iterates
-  all active users. Syncs run on a bounded worker pool so one account never
-  blocks another.
+  supplies its own Garmin credentials at signup and logs in once (two-step
+  verification is handled as an extra code step), with the resulting OAuth
+  tokens stored encrypted (AES-GCM, key from env). `POST /sync` triggers the
+  caller's own sync; a cron endpoint iterates all active users. Syncs run on a
+  bounded worker pool so one account never blocks another.
 - **Web dashboard.** A same-origin JS frontend with tabs: **Chat** (the agent),
   **Readiness** and **ACWR** (custom derived scores with history charts),
-  **Training Plan** (a weekly workout calendar you and the agent can edit), and
+  **Training Plan** (a weekly workout calendar you and the agent can edit,
+  showing a stored daily weather forecast), and
   **Settings** (sync + per-account LLM/weather/data-type config).
 - **Custom derived metrics.** Computed once per sync and stored in
   `derived_metrics`, visible to both the UI and the agent:
@@ -61,6 +62,11 @@ even if its statement gate is ever removed.
   `get_day_summary` shortcut (one call returns a day's metrics + activities
   instead of a ~60-column dump). Conversation and memory are per-user, in
   Postgres.
+- **Weather forecast for the plan.** The Open-Meteo daily forecast is fetched
+  only when a sync runs (via the worker) and stored per account in
+  `weather_forecast`; the Training Plan calendar reads those rows, so no
+  external API is hit on a page view. The agent's stateless `weather` tool still
+  serves ad-hoc history and other locations.
 - **Operation hardening.** Per-account exponential backoff on the sync worker
   protects against Garmin's informal API and ban risk; tokens are
   auto-refreshed and re-encrypted; signup fails fast and clearly whenever
@@ -88,6 +94,7 @@ sync status).
 | `gear` | Current gear snapshot (bikes, shoes, ...) with cumulative stats — replaced each sync, no history |
 | `devices` | Current Garmin devices (model + which is primary) — replaced each sync, no history |
 | `derived_metrics` | Computed daily metrics — one row per `(calendar_date, metric)`; `readiness` (+ `readiness_*` components) and `acwr` (+ acute/chronic/daily load). Replaced wholesale each sync |
+| `weather_forecast` | Stored daily Open-Meteo forecast (min/max °C, precip mm, max wind), refreshed once per sync — the Training Plan calendar renders it from here, RLS-scoped per account |
 | `training_plan` | Per-user planned workouts (editable in the UI and by the agent) |
 | `user_state` | Per-user agent state: long-term memory, conversation history, tool-call trace |
 
@@ -141,6 +148,7 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/login \
 curl -s -X POST http://127.0.0.1:8000/sync -H "Authorization: Bearer $TOKEN"
 curl -s http://127.0.0.1:8000/readiness -H "Authorization: Bearer $TOKEN"   # readiness series + today + scale
 curl -s http://127.0.0.1:8000/acwr -H "Authorization: Bearer $TOKEN"        # ACWR series + today
+curl -s "http://127.0.0.1:8000/weather?from_date=2026-08-24&to_date=2026-08-30" -H "Authorization: Bearer $TOKEN"   # stored daily forecast
 curl -s -X POST http://127.0.0.1:8000/ask -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"question":"avg sleep last week?"}'
 
@@ -221,8 +229,9 @@ questions about them from the same table the UI renders.
 - The agent's statement gate + `_ALLOWED_TABLES` list remain as a second layer;
   the read-only role's REVOKEs are the real enforcement.
 - Background syncs back off exponentially per account on failure, and signup
-  verifies the Garmin credentials by logging in once — any login failure
-  (invalid creds, MFA, rate-limit/Cloudflare) fails signup and creates nothing.
+  verifies the Garmin credentials by logging in once — wrong credentials or a
+  rate-limit/Cloudflare block fail signup with a clear message, and two-step
+  verification keeps the account pending until the code is confirmed.
 - Run the server behind TLS for anything beyond localhost.
 
 ## Tech stack

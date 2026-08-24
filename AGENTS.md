@@ -40,10 +40,13 @@ Notes:
   `activity_detail_series`, `activity_splits`, `hr_zones`, `power_zones`,
   `race_predictions`, `gear`, `devices`. Computed daily metrics (readiness,
   ACWR, ...) live in `derived_metrics` (one row per `calendar_date`+`metric`,
-  replaced wholesale each sync).
+  replaced wholesale each sync). The daily weather forecast lives in
+  `weather_forecast` (one row per `calendar_date`), replaced wholesale each
+  sync by `fetcher.refresh_weather_forecast` — `/weather` just reads it, so a
+  page view never calls Open-Meteo.
 - `GARMIN_ADMIN_DB_URL` (`garmin:garmin`) is used only for role bootstrap.
 
-API (all JSON, `Authorization: Bearer <JWT>`): `POST /auth/register|login`, `GET /auth/me`, `POST /sync`, `GET /sync/status`, `POST /cron/sync` (daemon token), `GET /readiness`, `GET /acwr`, `POST /ask`, `POST /ask/chart`, `GET /`.
+API (all JSON, `Authorization: Bearer <JWT>`): `POST /auth/register|login`, `GET /auth/me`, `POST /sync`, `GET /sync/status`, `POST /cron/sync` (daemon token), `GET /readiness`, `GET /acwr`, `GET|POST /training-plan`, `PUT|DELETE /training-plan/{workout_id}`, `GET /weather`, `POST /ask`, `POST /ask/chart`, `GET /`.
 
 ## Architecture
 
