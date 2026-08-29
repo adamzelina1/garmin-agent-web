@@ -37,7 +37,7 @@ Build or edit a weekly schedule, and ask the AI to reshape it:
 
 ![Training Plan — weekly calendar with weather](images/training_plan.png)
 
-## The audio-mind: a read-only AI agent that can *see*
+## A read-only AI agent that can *see*
 
 This is the cool part. The agent isn't just a text-answering chatbot over your
 data — it has a **vision loop**. Its `see` tool queries the database, renders
