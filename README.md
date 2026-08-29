@@ -1,11 +1,13 @@
 # Garmin Health-Data Agent
 
-Fetch Garmin Connect data into Postgres, then ask a read-only AI agent
-questions about it — sleep, resting HR, HRV, training load, activity zones —
-and get answers with charts and weather context. A self-hosted web app
-(Chat · Readiness · ACWR · Training Plan · Settings) keeps the derived
-metrics and plan in the same database the agent queries, so the UI and the AI
-always agree.
+> **Ask questions about your Garmin data in plain English — sleep, resting HR,
+> HRV, training load, form drift, readiness and ACWR — and get answers with
+> charts, weather context and a plan you and the AI can both edit.**
+
+A self-hosted, multi-user Garmin Connect fetcher that syncs your watch into
+Postgres and gives you a read-only AI agent that can *see* and quietly reason
+about it. The UI and the agent read the **same** derived metrics, so the charts
+you look at and the answers the model gives you always agree.
 
 ```
 Garmin Connect ──▶ sync worker ──▶ Postgres (raw JSON, source of truth) ──▶ parser ──▶ typed tables
@@ -15,62 +17,88 @@ Garmin Connect ──▶ sync worker ──▶ Postgres (raw JSON, source of tru
                                      derived_metrics (readiness, ACWR)
 ```
 
-Accounts authenticate with email+password (JWT), bind their own Garmin account
-(credentials encrypted AES-GCM), and sync in background worker threads. Every
-data row is scoped per account by Postgres Row-Level Security; the LLM agent
-runs as a SELECT-only PG role, so it is provably confined to one user's rows
-even if its statement gate is ever removed.
+## What it looks like
+
+### Ask the agent anything about your training
+
+The agent does the analysis and hands back a chart with the reasoning:
+
+![Chat with the agent — dual-axis chart + 3-bullet analysis](images/chat.png)
+
+### Clarity at a glance
+
+Readiness and ACWR are computed for you, with color-coded zones and history:
+
+![Today tab — Training Readiness + ACWR](images/today_tab.png)
+
+### A plan you and the AI both own
+
+Build or edit a weekly schedule, and ask the AI to reshape it:
+
+![Training Plan — weekly calendar with weather](images/training_plan.png)
+
+## The audio-mind: a read-only AI agent that can *see*
+
+This is the cool part. The agent isn't just a text-answering chatbot over your
+data — it has a **vision loop**. Its `see` tool queries the database, renders
+the result as an image, and *looks at the actual shape* of your data (trends,
+drift, spikes, clusters, relationships between metrics) before answering. So it
+doesn't just fetch a number; it understands it.
+
+That unlocks genuinely sports-science-grade analysis:
+
+- **Lagged correlation.** It can test how last night's sleep or HRV predicts
+  today's performance, or how a metric on day *N* relates to day *N+1*.
+- **Bonk / crash root-cause analysis.** When your power or pace falls apart
+  mid-session, it looks across sleep, HRV, resting HR, prior-day load and even
+  the weather at the time of the run to explain _why_ you blew up — not just
+  _that_ you blew up.
+- **Form drift.** A pace-normalised cadence z-score (`run_cadence_drift`)
+  surfaces overstriding / breaking mechanics under fatigue, separately from raw
+  volume.
+- **Running-isolated ACWR.** `run_acwr` is built from running distance only, so
+  cycling and swimming can't mask a running-volume spike.
+- **Weather in context.** It correlates a bad night with the temperature, or
+  forecasts the next 16 days against your plan — always via stored data first.
+
+Every question is answered by the model writing its own read-only SQL through
+`run_sql`; the `see` tool is for *its own eyes*, while `chart` hands the UI a
+spec it re-runs to draw. Safety is by construction inside the database layer (see
+[Security](#security)).
 
 ## What it does
 
-- **Multi-user server.** Register/login with email+password; each account
-  supplies its own Garmin credentials at signup and logs in once (two-step
-  verification is handled as an extra code step), with the resulting OAuth
-  tokens stored encrypted (AES-GCM, key from env). `POST /sync` triggers the
-  caller's own sync; a cron endpoint iterates all active users. Syncs run on a
-  bounded worker pool so one account never blocks another.
-- **Web dashboard.** A same-origin JS frontend with tabs: **Chat** (the agent),
-  **Readiness** and **ACWR** (custom derived scores with history charts),
-  **Training Plan** (a weekly workout calendar you and the agent can edit,
-  showing a stored daily weather forecast), and
-  **Settings** (sync + per-account LLM/weather/data-type config).
-- **Custom derived metrics.** Computed once per sync and stored in
-  `derived_metrics`, visible to both the UI and the agent:
-  - **Training readiness** (0-100): a weighted composite of nightly HRV
-    (rmssd), resting HR and sleep-score z-scores against a rolling 28-day
-    baseline (`min_samples=7`, HRV clamped at +2.0), auto-scaled through a
-    rolling 90-day calibration so the score always reflects recent context.
-    Categories: Prime / Moderate / Low / Depleted.
-  - **ACWR** (acute-to-chronic workload ratio): `EMA₇(daily load) /
-    EMA₂₈(daily load)`, where daily load is the sum of each day's activity
-    training load. Categories: Sweet Spot (0.8-1.3) / Elevated (1.3-1.5) /
-    Danger (>1.5) / Detraining (<0.8).
-- **RLS-isolated data.** `user_id` is the leading key on every data table and
-  Row-Level Security filters every read/write by
-  `current_setting('app.user_id')`. The agent connects as a `garmin_readonly`
-  role with SELECT only on the agent-facing tables — the raw stores are a real
-  REVOKE.
-- **Read-only AI agent.** A Pydantic AI agent over the same per-user tables.
-  Safety is by construction: read-only PG role + RLS scoping, plus a statement
-  gate (SELECT/WITH/EXPLAIN only) as a second layer.
-- **Tool-calling agent.** The model inspects the schema, runs read-only SQL
-  (including the `derived_metrics` table), validates and embeds Plotly chart
-  specs (the UI re-runs the query to draw them), consults a stateless weather
-  tool (Open-Meteo), keeps long-term memory, and can read/edit the training
-  plan. Every data question is answered by the model writing its own SQL
-  through `run_sql`, except per-day summaries which use the single
-  `get_day_summary` shortcut (one call returns a day's metrics + activities
-  instead of a ~60-column dump). Conversation and memory are per-user, in
-  Postgres.
-- **Weather forecast for the plan.** The Open-Meteo daily forecast is fetched
-  only when a sync runs (via the worker) and stored per account in
-  `weather_forecast`; the Training Plan calendar reads those rows, so no
-  external API is hit on a page view. The agent's stateless `weather` tool still
-  serves ad-hoc history and other locations.
-- **Operation hardening.** Per-account exponential backoff on the sync worker
-  protects against Garmin's informal API and ban risk; tokens are
-  auto-refreshed and re-encrypted; signup fails fast and clearly whenever
-  Garmin blocks or rate-limits the login.
+**Sync & store**
+- Connects to Garmin Connect per account (credentials encrypted AES-GCM, MFA
+  handled as an extra code step, background sync on a bounded worker pool).
+- Stores raw JSON as the source of truth, then auto-creates typed tables.
+
+**Multi-user server**
+- Email + password login (JWT), each account scoped to its own rows by
+  PostgreSQL Row-Level Security.
+- `POST /sync` (per-user) plus a cron endpoint to sync every active account.
+
+**Web dashboard**
+- Chat · Readiness · ACWR · Training Plan · Settings — a same-origin JS frontend.
+
+**Custom derived metrics** *(computed once per sync, shared by UI and agent)*
+- **Readiness (0–100)** — z-score composite of nightly HRV, resting HR and sleep
+  score vs. a 28-day baseline, auto-scaled to a rolling 90-day context.
+- **ACWR** — `EMA₇(daily load) / EMA₂₈(daily load)`, with Sweet Spot / Elevated /
+  Danger / Detraining bands.
+- **Running ACWR + gait drift** — running-isolated workload and pace-normalised
+  cadence form tracking.
+
+**Read-only AI agent**
+- Pydantic AI agent confined by a SELECT-only PG role + a statement gate
+  (SELECT/WITH/EXPLAIN). Never writes.
+- Tool-calling: schema inspection, `run_sql`, chart specs, `see` (self-image),
+  weather, long-term memory, and training-plan read/write.
+
+**Operation hardening**
+- Exponential per-account backoff against Garmin's informal API and ban risk;
+  tokens auto-refresh and re-encrypt; signup verifies credentials with a real
+  Garmin login.
 
 ## Data model
 
@@ -100,7 +128,9 @@ sync status).
 
 ## Setup
 
-Requirements: Python 3.14, [`uv`](https://docs.astral.sh/uv/) and Docker.
+Requirements: **Python 3.14+** (required — the project targets 3.14 and enforces
+it via `requires-python` in `pyproject.toml`), [`uv`](https://docs.astral.sh/uv/)
+and Docker.
 
 ```sh
 git clone https://github.com/adamzelina1/garmin-agent-web.git
@@ -161,16 +191,19 @@ Single-user CLI (optional, legacy): `uv run garmin-fetch` syncs
 
 ## Configuration
 
-`.env` holds only server infrastructure (see `.env.example`). Everything a
-user can set lives in the website (Settings → Config) per account, stored in
-the `users` table — Garmin credentials/tokens (encrypted), LLM API key / base
-URL / model, home lat/lon for the weather tool, excluded data types, and the
-sync start date.
+`.env` holds the server infrastructure (see `.env.example`). The LLM provider
+(API key / base URL / model) is configured **here, server-wide**, and shared by
+every account — it is not set per-user. The remaining user-facing settings live
+in the website (Settings → Config) per account, stored in the `users` table —
+Garmin credentials/tokens (encrypted), home city/country (geocoded to lat/lon
+for the weather tool), excluded data types, and the sync start date.
 
 Server-level `.env` settings:
 
 - `GARMIN_DB_URL` / `GARMIN_READONLY_DB_URL` / `GARMIN_ADMIN_DB_URL` — app,
   read-only-agent, and superuser DSNs
+- `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` — the server-wide LLM provider
+  (cloud key, or a local base URL + model, e.g. Ollama)
 - `GARMIN_ENC_KEY` — base64 of a 32-byte AES-GCM key (generate with
   `uv run python -c "import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())"`)
 - `GARMIN_JWT_SECRET`, `GARMIN_CRON_TOKEN`, `GARMIN_JWT_TTL_HOURS`
@@ -202,9 +235,10 @@ the environment, but the server ignores them.
 
 ## Derived metrics
 
-Both scores are derived in `src/garmin_fetch/derived.py` and stored in
-`derived_metrics` once per sync (after parsing), so the agent can answer
-questions about them from the same table the UI renders.
+Both the cardio and the running-specific scores are derived in
+`src/garmin_fetch/derived.py` and stored in `derived_metrics` once per sync
+(after parsing), so the agent can answer questions about them from the same
+table the UI renders.
 
 - **Training readiness** (`readiness.py`) — 28-day trailing baselines
   (`min_samples=7`) for nightly HRV, resting HR and sleep score; z-scores
@@ -217,6 +251,11 @@ questions about them from the same table the UI renders.
   `activity_summaries.training_load`; `acute = EMA₇`, `chronic = EMA₂₈`,
   `ACWR = acute/chronic`. Rest days count as zero load, so tapers show up as a
   falling ratio.
+- **Running ACWR + form** (`run_workload.py`) — the same 7d/28d EMA but built
+  from running-isolated distance (foot-strike volume), so cycling/swimming
+  cannot mask low running volume. `run_cadence_drift` is a pace-normalised
+  cadence z-score versus the user's own cadence-vs-pace fit over the trailing
+  90 days (negative = overstriding / worse mechanics).
 
 ## Security
 
@@ -237,8 +276,8 @@ questions about them from the same table the UI renders.
 ## Tech stack
 
 Python 3.14 · `uv` · PostgreSQL 17 (RLS) · FastAPI · APScheduler · Pydantic AI ·
-Gradio (legacy single-user CLI UI) · Plotly · Open-Meteo · garminconnect ·
-PyJWT · bcrypt · `cryptography` (AES-GCM)
+Gradio (legacy single-user CLI UI) · Plotly · matplotlib · Open-Meteo ·
+garminconnect · PyJWT · bcrypt · `cryptography` (AES-GCM)
 
 ## Project layout
 
@@ -251,7 +290,8 @@ src/garmin_fetch/
   derived.py    # rebuilds all derived metrics (readiness + ACWR) into derived_metrics
   readiness.py  # custom training-readiness score (z-composite + rolling auto-scale)
   workload.py   # ACWR (7d/28d EMA of daily training load)
-  ask.py        # read-only AI agent (ReadOnlyDB, statement gate, RLS-scoped)
+  run_workload.py # running foot-strike ACWR + pace-normalised cadence (form) drift
+  ask.py        # read-only AI agent (ReadOnlyDB, statement gate, RLS-scoped, see/chart)
   ask_web.py    # legacy single-user Gradio UI
   trace.py      # per-turn tool-call tracing
   server/
@@ -261,7 +301,7 @@ src/garmin_fetch/
     sync_worker.py# background sync pool + APScheduler cron + backoff
     setup_db.py   # garmin_app / garmin_readonly role bootstrap
     state.py      # per-user memory/session + training-plan store
-    static/       # index.html (Chat · Readiness · ACWR · Training Plan · Settings)
+    static/       # index.html (Chat · Today · Training Plan · Settings)
 docker/
   initdb/       # 01-roles.sh (creates non-superuser roles on fresh volume)
 ```

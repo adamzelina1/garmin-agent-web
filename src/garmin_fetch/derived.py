@@ -17,6 +17,13 @@ from .readiness import (
     fetch_daily_source,
     to_metric_rows as readiness_rows,
 )
+from .run_workload import (
+    compute_gait,
+    compute_run_acwr,
+    fetch_running_runs,
+    to_gait_rows,
+    to_metric_rows as run_rows,
+)
 from .workload import (
     compute_acwr,
     fetch_activity_loads,
@@ -25,13 +32,15 @@ from .workload import (
 
 
 def build_derived(db: Any) -> dict[str, int]:
-    """Recompute readiness + ACWR from the parsed tables and store them.
+    """Recompute readiness + ACWR + running ACWR + gait drift from the parsed
+    tables.
 
     ``db`` is a user-bound ``Database``. Only readiness days that received a
-    score are stored; the ACWR series always runs from the first training day
-    to today (rest days are stored with a null ratio once chronic load decays
-    to zero). Returns {"readiness": scored_days, "acwr": days,
-    "derived": rows_written}.
+    score are stored; the cardio ACWR and running ACWR series always run from
+    the first training/run day to today (rest days are stored with a null ratio
+    once chronic load decays to zero); gait drift is stored per run day.
+    Returns {"readiness": scored_days, "acwr": days, "running_acwr": days,
+    "running_gait": days, "derived": rows_written}.
     """
     built_at = datetime.now(UTC).isoformat()
 
@@ -47,9 +56,20 @@ def build_derived(db: Any) -> dict[str, int]:
     for day in acwr_days:
         rows.extend(acwr_rows(day, built_at))
 
+    run_days = compute_run_acwr(fetch_running_runs(db.conn))
+    for day in run_days:
+        rows.extend(run_rows(day, built_at))
+
+    gait_days = compute_gait(db.conn)
+    for day in gait_days:
+        rows.extend(to_gait_rows(day, built_at))
+
     written = db.replace_derived_metrics(rows)
     return {
         "readiness": readiness_count,
         "acwr": len(acwr_days),
+        "running_acwr": len(run_days),
+        "running_gait": len(gait_days),
         "derived": written,
     }
+

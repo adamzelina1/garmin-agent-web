@@ -24,11 +24,10 @@ CREATE TABLE IF NOT EXISTS users (
     sync_error TEXT,
     sync_fail_count INTEGER NOT NULL DEFAULT 0,
     rate_limit_until TEXT,
-    llm_api_key_enc TEXT,
-    llm_base_url TEXT,
-    llm_model TEXT,
     home_lat TEXT,
     home_lon TEXT,
+    home_city TEXT,
+    home_country TEXT,
     excluded_data_types TEXT,
     sync_start_date TEXT,
     auto_sync BOOLEAN NOT NULL DEFAULT FALSE

@@ -85,11 +85,10 @@ def _ensure_user_config_columns(conn: Any) -> None:
     (NULL = fall back to the server-level .env value).
     """
     for column, column_type in (
-        ("llm_api_key_enc", "TEXT"),
-        ("llm_base_url", "TEXT"),
-        ("llm_model", "TEXT"),
         ("home_lat", "TEXT"),
         ("home_lon", "TEXT"),
+        ("home_city", "TEXT"),
+        ("home_country", "TEXT"),
         ("excluded_data_types", "TEXT"),
         ("sync_start_date", "TEXT"),
         ("auto_sync", "BOOLEAN NOT NULL DEFAULT FALSE"),

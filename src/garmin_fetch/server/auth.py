@@ -181,11 +181,10 @@ class UserStore:
         self,
         user_id: int,
         *,
-        llm_api_key_enc: str | None = None,
-        llm_base_url: str | None = None,
-        llm_model: str | None = None,
         home_lat: str | None = None,
         home_lon: str | None = None,
+        home_city: str | None = None,
+        home_country: str | None = None,
         excluded_data_types: str | None = None,
         sync_start_date: str | None = None,
         auto_sync: bool | None = None,
@@ -194,11 +193,10 @@ class UserStore:
             sets = []
             params: list[Any] = []
             for col, val in (
-                ("llm_api_key_enc", llm_api_key_enc),
-                ("llm_base_url", llm_base_url),
-                ("llm_model", llm_model),
                 ("home_lat", home_lat),
                 ("home_lon", home_lon),
+                ("home_city", home_city),
+                ("home_country", home_country),
                 ("excluded_data_types", excluded_data_types),
                 ("sync_start_date", sync_start_date),
                 ("auto_sync", auto_sync),
@@ -434,11 +432,11 @@ class AuthService:
 
         user = self.store.get(user_id) or {}
         return {
-            "llm_api_key_set": bool(user.get("llm_api_key_enc")),
-            "llm_base_url": user.get("llm_base_url") or "",
-            "llm_model": user.get("llm_model") or "",
+            "llm_configured": self.user_llm_configured(user),
             "home_lat": user.get("home_lat") or "",
             "home_lon": user.get("home_lon") or "",
+            "home_city": user.get("home_city") or "",
+            "home_country": user.get("home_country") or "",
             "excluded_data_types": [
                 n.strip()
                 for n in (user.get("excluded_data_types") or "").split(",")
@@ -453,22 +451,14 @@ class AuthService:
         self,
         user_id: int,
         *,
-        api_key: str | None = None,
-        llm_base_url: str | None = None,
-        llm_model: str | None = None,
         home_lat: str | None = None,
         home_lon: str | None = None,
+        home_city: str | None = None,
+        home_country: str | None = None,
         excluded_data_types: list[str] | None = None,
-        clear_api_key: bool = False,
         auto_sync: bool | None = None,
         sync_start_date: str | None = None,
     ) -> None:
-        # A non-empty api_key replaces the stored key; an empty/absent value
-        # leaves it untouched (the key is never echoed back to the browser, so
-        # a blank save must not wipe it). Explicitly clear via clear_api_key.
-        api_key_enc = "" if clear_api_key else None
-        if api_key:
-            api_key_enc = self.encryptor.encrypt(api_key)
         from ..datatypes import DAILY_TYPES
 
         valid_types = set(DAILY_TYPES)
@@ -497,13 +487,35 @@ class AuthService:
                 effective_start = cleaned
             else:
                 effective_start = ""
+        # A home location may be given either as raw lat/lon (existing clients)
+        # or as a city + country, which we geocode to coordinates. City/country
+        # wins when both are supplied so the UI only ever asks for a place name.
+        # A blank city is treated as "leave unchanged" so a partial save never
+        # wipes an existing location; the raw lat/lon path stays for legacy.
+        resolved_lat, resolved_lon = home_lat, home_lon
+        resolved_city, resolved_country = home_city, home_country
+        if home_city is not None or home_country is not None:
+            from .geocode import GeocodeError, geocode
+
+            if home_city is None:
+                raise AuthError(400, "city is required to set a home location")
+            if home_city.strip():
+                try:
+                    found = geocode(home_city, home_country or "")
+                except GeocodeError as exc:
+                    raise AuthError(400, str(exc)) from exc
+                resolved_lat = str(found["lat"])
+                resolved_lon = str(found["lon"])
+                resolved_city = found["city"]
+                resolved_country = found["country"]
+            else:
+                resolved_lat = resolved_lon = resolved_city = resolved_country = None
         self.store.set_config(
             user_id,
-            llm_api_key_enc=api_key_enc,
-            llm_base_url=llm_base_url,
-            llm_model=llm_model,
-            home_lat=home_lat,
-            home_lon=home_lon,
+            home_lat=resolved_lat,
+            home_lon=resolved_lon,
+            home_city=resolved_city,
+            home_country=resolved_country,
             excluded_data_types=(
                 ",".join(excluded_data_types) if excluded_data_types is not None else None
             ),
@@ -512,9 +524,12 @@ class AuthService:
         )
 
     def user_llm_configured(self, user: dict[str, Any]) -> bool:
-        if user.get("llm_api_key_enc"):
+        # The LLM provider is server-wide (see .env); a user is ready to chat
+        # whenever the server has any API key or a local base URL configured.
+        cfg = self.cfg
+        if cfg.get("llm_api_key"):
             return True
-        base = user.get("llm_base_url") or ""
+        base = cfg.get("llm_base_url") or ""
         return bool(base) and (
             "localhost" in base or "127.0.0.1" in base or "host.docker" in base
         )

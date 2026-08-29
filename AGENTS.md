@@ -46,7 +46,7 @@ Notes:
   page view never calls Open-Meteo.
 - `GARMIN_ADMIN_DB_URL` (`garmin:garmin`) is used only for role bootstrap.
 
-API (all JSON, `Authorization: Bearer <JWT>`): `POST /auth/register|login`, `GET /auth/me`, `POST /sync`, `GET /sync/status`, `POST /cron/sync` (daemon token), `GET /readiness`, `GET /acwr`, `GET|POST /training-plan`, `PUT|DELETE /training-plan/{workout_id}`, `GET /weather`, `POST /ask`, `POST /ask/chart`, `GET /`.
+API (all JSON, `Authorization: Bearer <JWT>`): `POST /auth/register|login`, `GET /auth/me`, `POST /sync`, `GET /sync/status`, `POST /cron/sync` (daemon token), `GET /readiness`, `GET /acwr`, `GET /run-acwr`, `GET|POST /training-plan`, `PUT|DELETE /training-plan/{workout_id}`, `GET /weather`, `POST /ask`, `POST /ask/chart`, `GET /`.
 
 ## Architecture
 

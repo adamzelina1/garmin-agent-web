@@ -95,13 +95,11 @@ class ChartRequest(BaseModel):
 
 
 class ConfigRequest(BaseModel):
-    api_key: str | None = None
-    llm_base_url: str | None = None
-    llm_model: str | None = None
     home_lat: str | None = None
     home_lon: str | None = None
+    home_city: str | None = None
+    home_country: str | None = None
     excluded_data_types: list[str] | None = None
-    clear_api_key: bool = False
     auto_sync: bool | None = None
     sync_start_date: str | None = None
 
@@ -138,19 +136,17 @@ def _readonly(cfg: dict[str, Any], user_id: int) -> ReadOnlyDB:
 
 
 def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dict[str, Any]:
-    """Strict per-user config for the LLM agent (no server .env fallback).
+    """Per-user config for the LLM agent.
 
-    Every LLM/weather/exclusion setting comes from the user's own row; the
-    API key is decrypted here, so it is never stored or logged in the clear.
+    The LLM provider (API key, base URL, model) is server-wide, sourced only
+    from the server ``.env`` — it is never per-account. Only the weather
+    location and the excluded data types remain user-specific overrides.
     """
     user_cfg = _per_user_cfg(cfg, user["id"])
-    user_cfg["llm_api_key"] = (
-        auth.encryptor.decrypt(user["llm_api_key_enc"])
-        if user.get("llm_api_key_enc")
-        else ""
-    )
-    user_cfg["llm_base_url"] = user.get("llm_base_url") or ""
-    user_cfg["llm_model"] = user.get("llm_model") or ""
+    user_cfg["llm_api_key"] = cfg.get("llm_api_key") or ""
+    user_cfg["llm_base_url"] = cfg.get("llm_base_url") or ""
+    user_cfg["llm_model"] = cfg.get("llm_model") or ""
+    user_cfg["llm_reasoning_effort"] = cfg.get("llm_reasoning_effort") or ""
     user_cfg["weather_home_lat"] = user.get("home_lat") or ""
     user_cfg["weather_home_lon"] = user.get("home_lon") or ""
     user_cfg["excluded_data_types"] = user.get("excluded_data_types") or ""
@@ -269,22 +265,18 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         # auto-sync toggle, the sync start date) must never reset unrelated
         # settings to empty via Pydantic defaults.
         kwargs: dict[str, Any] = {}
-        if body.api_key is not None:
-            kwargs["api_key"] = body.api_key
-        if body.llm_base_url is not None:
-            kwargs["llm_base_url"] = body.llm_base_url.strip()
-        if body.llm_model is not None:
-            kwargs["llm_model"] = body.llm_model.strip()
         if body.home_lat is not None:
             kwargs["home_lat"] = body.home_lat.strip()
         if body.home_lon is not None:
             kwargs["home_lon"] = body.home_lon.strip()
+        if body.home_city is not None:
+            kwargs["home_city"] = body.home_city.strip()
+        if body.home_country is not None:
+            kwargs["home_country"] = body.home_country.strip()
         if body.excluded_data_types is not None:
             kwargs["excluded_data_types"] = [
                 t.strip().lower() for t in body.excluded_data_types if t.strip()
             ]
-        if body.clear_api_key:
-            kwargs["clear_api_key"] = True
         if body.auto_sync is not None:
             kwargs["auto_sync"] = body.auto_sync
         if body.sync_start_date is not None:
@@ -382,6 +374,28 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         finally:
             conn.close()
         scored = [d for d in days if d.get("acwr") is not None]
+        return {"today": scored[-1] if scored else None, "days": days}
+
+    @app.get("/run-acwr")
+    def run_acwr(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
+        """The user's running-isolated Acute-to-Chronic Workload Ratio.
+
+        Read from the stored ``derived_metrics`` table (metric 'run_acwr'),
+        recomputed once per sync from the daily running distance in
+        ``activity_summaries`` — foot-strike volume only, so cycling/swimming
+        cannot mask low running volume. Returns the per-day series plus the most
+        recent day with a ratio.
+        """
+        from ..db import PostgresBackend
+        from ..run_workload import read_series
+
+        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
+        conn = backend.connect()
+        try:
+            days = read_series(conn)
+        finally:
+            conn.close()
+        scored = [d for d in days if d.get("run_acwr") is not None]
         return {"today": scored[-1] if scored else None, "days": days}
 
     # -- training plan --------------------------------------------------------
@@ -505,8 +519,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         if not auth.user_llm_configured(user):
             raise HTTPException(
                 503,
-                "the LLM agent is not configured for your account: add an API key "
-                "(or a local LLM base URL) in Settings → Config",
+                "the LLM agent is not configured: set LLM_API_KEY (or a local "
+                "LLM_BASE_URL with LLM_MODEL) in the server .env and restart",
             )
         user_cfg = _user_agent_cfg(request.app.state.cfg, user, auth)
         db = _readonly(request.app.state.cfg, user["id"])

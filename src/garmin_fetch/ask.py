@@ -118,7 +118,14 @@ _TABLE_NOTES: dict[str, str] = {
         "readiness_hrv/readiness_rhr/readiness_sleep (raw values), "
         "readiness_z_hrv/readiness_z_rhr/readiness_z_sleep (z-scores), "
         "readiness_composite, readiness_samples_hrv/rhr/sleep; 'acwr' (ratio) "
-        "with acwr_acute_load / acwr_chronic_load / acwr_daily_load. Pivot with "
+        "with acwr_acute_load / acwr_chronic_load / acwr_daily_load. "
+        "RUNNING-SPECIFIC (running activities only, so cycling/swimming cannot "
+        "inflate it): 'run_acwr' (foot-strike volume ratio) with "
+        "run_acute_km / run_chronic_km (km/day, 7d/28d EMA); 'run_cadence_drift' "
+        "(pace-normalised cadence z-score over the trailing 90d fit — negative = "
+        "overstriding / worse mechanics) with run_cadence (spm PER LEG; total "
+        "both-feet = 2x) and run_gct_ms, "
+        "qualifier Form Up/Stable/Form Dropping/Breaking Down. Pivot with "
         "WHERE metric = '<name>' (a day's components share its calendar_date)"
     ),
     "training_plan": "planned workouts; READ-ONLY via SQL — write only through the plan tools",
@@ -150,6 +157,13 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "avg_hr": "bpm",
         "max_hr": "bpm",
         "pace_min_km": "running min/km (decimal, 5.5 = 5:30); NULL for non-running",
+        "avg_cadence": (
+            "SHARED across sports. RUNNING = steps/min PER LEG (single foot, "
+            "~80-90); total both-feet cadence = 2x this value (give the 2x number "
+            "as 'total spm' when reporting cadence for a run). CYCLING/ROWING = rpm "
+            "(~85-100)."
+        ),
+        "max_cadence": "same unit as avg_cadence (per-leg spm running / rpm cycling)",
         "vo2max": "the activity's own VO2max estimate",
         "weather_temp_c": "degC",
         "weather_apparent_c": "degC",
@@ -163,6 +177,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "ts_ms": "epoch ms",
         "speed_kmh": "km/h",
         "power_w": "watts",
+        "cadence": "steps/min PER LEG for running (total both-feet = 2x); rpm for cycling; NULL if not recorded",
         "accumulated_power_w": "watts",
     },
     "activity_splits": {
@@ -170,6 +185,8 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "duration_s": "seconds",
         "start_time_s": "offset into the activity (seconds)",
         "pace_sec_per_km": "seconds/km (lower = faster)",
+        "avg_cadence": "steps/min PER LEG for running (total = 2x); rpm for cycling",
+        "max_cadence": "same unit as avg_cadence",
         "split_type": "'distance' (work) or 'rest'",
     },
     "race_predictions": {
@@ -177,6 +194,19 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "time_10k_min": "minutes",
         "time_half_marathon_min": "minutes",
         "time_marathon_min": "minutes",
+    },
+    "hr_zones": {
+        "sport": (
+            "UPPERCASE Garmin sport key. Values seen: RUNNING, CYCLING, DEFAULT. "
+            "Match the stored case exactly (e.g. sport = 'RUNNING'), never lowercase."
+        ),
+        "training_method": "UPPERCASE: HR_RESERVE or LACTATE_THRESHOLD",
+    },
+    "power_zones": {
+        "sport": (
+            "UPPERCASE Garmin sport key. Values seen: RUNNING, CYCLING, ROWING, "
+            "CROSS_COUNTRY_SKIING. Match the stored case exactly, never lowercase."
+        ),
     },
     "derived_metrics": {
         "metric": "which derived metric the row holds — see the table note for known names",
@@ -193,128 +223,179 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
     },
 }
 
-#: The prompt, split into independently-editable sections. ``_PROMPT_ROLE`` is
-#: the only one with a ``{today}`` placeholder (formatted at run time as a
-#: dynamic system prompt, so the date is always fresh); the rest are plain
-#: strings concatenated in order.
-_PROMPT_ROLE = """\
-You are an analyst with read-only access to a per-user Postgres database of personal
-Garmin health data. Today is {today}. Answer the user's questions by inspecting
-the schema and running read-only SELECT queries. You may run several queries.
-You can never write — except through the dedicated training-plan tools (see below).
+#: The agent's system prompt, rendered as one structured Markdown document so the
+#: routing and formatting guidance reads clearly. Two values are injected:
+#:   * ``{schema_text}`` — the live per-user schema from ``_schema_text``, filled
+#:     ONCE when the agent is built (the schema is static for the agent's life).
+#:   * today's date — NOT this template: it comes from ``_current_date_prompt``
+#:     (below), a module-level *dynamic* prompt re-evaluated on every turn so a
+#:     cached agent or a resumed session can never keep a stale date.
+#: The template contains literal JSON braces (``{"sql": ...}``) in the chart
+#: guidance, so it is filled with ``str.replace``, never ``str.format``.
+_PROMPT_TEMPLATE = """\
+# Role & Environment
 
-The date above is refreshed on every turn. Whenever the answer depends on
-"today"/"tomorrow"/"this week" or other relative dates, call the ``today`` tool
-and use its result — it is the authoritative current date.
+You are an expert sports scientist and data analyst with read-only access to the
+user's personal Garmin health and fitness database (PostgreSQL).
 
-Column suffixes are the units: *_kmh = km/h, *_m = metres, *_w = watts, *_hours
-= hours, *_min = minutes, *_c = degC, *_ml = ml, *_kcal = kcal. *_pct = percent
-(zone *_pct = % of activity duration spent in that zone). Heart rate is bpm,
-cadence is spm, body battery and stress are 0-100. Columns with non-obvious
-units or special meaning carry a parenthetical note in the schema below.
+- **Access Level:** Read-only queries via SQL (`run_sql`). Write access is
+  strictly limited to two areas: long-term memory (`remember_memory`) and the
+  training plan (`update_training_plan`). Everything else is inspected, never
+  written.
+
+---
+
+# Database & SQL Guidelines
+
+The schema is provided below. Do NOT call `table_schema` unless a query fails due
+to a missing column.
+
+{schema_text}
+
+### Query Rules:
+1. **Dialect:** PostgreSQL. Use Postgres-specific date/time functions (e.g.
+   `DATE_TRUNC('week', date)`, `INTERVAL '7 days'`).
+2. **Never `SELECT *`:** Select only the specific columns needed for the answer
+   (daily_metrics is ~60 columns wide, activity_summaries ~58).
+3. **Aggregations & Limits:** Result sets are capped at 200 rows. Always
+   aggregate raw rows (GROUP BY week, month, sport) and `ORDER BY` time columns
+   chronologically. Use `LIMIT 10` for exploratory probes before a full query.
+4. **Handle NULLs & Zero-Division:** Almost every column may be NULL on days/rows
+   where the value is N/A; only use aggregate functions over the rows you have.
+   Wrap denominators with `NULLIF(col, 0)` to prevent division errors.
+5. **Day Summary Shortcut:** For single-day reviews ("how was my day on X?"), call
+   `get_day_summary(YYYY-MM-DD)` instead of running multi-table SQL — it returns
+   the whole per-day bundle in one call without a ~60-column dump. For everything
+   else, write the SQL yourself; there are no ready-made query tools or shortcuts.
+
+---
+
+# Tool Usage Guidelines
+
+### 1. Vision & Self-Inspection (`see`)
+- Use `see` to inspect distributions, anomalies, relationships, and multi-week
+  trendlines as an image.
+- **Goal:** synthesize visual patterns (drifts, clusters, regime shifts, changes
+  in trend) into qualitative insights you could only see — don't just restate the
+  raw numbers (the tool also returns the data, so you can still quote exact
+  values).
+- Do not call `see` for simple single-point lookups, and do not show the user the
+  figure — it is for your eyes only.
+
+### 2. Visualization for the User (`chart`)
+- When asked for a chart, build a valid JSON spec:
+  `{"sql": "SELECT ...", "traces": [{...}], "layout": {"title": {"text": "..."}}}`.
+  The `sql` must return the plotted data itself (column names in the traces
+  reference its result). Each trace names a plotly.graph_objects class via `go`
+  ("Scatter", "Scattergl", "Violin", "Heatmap", "Pie", "Bar", "Candlestick") or
+  the compact aliases line / scatter / area / bar / pie / histogram / box. Data
+  columns are referenced by name in x / y / z, and any other numeric trace
+  argument can reference a column as `{"column": "<name>"}`. Keep points to at
+  most ~200 by aggregating (GROUP BY week/month/weekday) and ORDER BY time.
+- Send the spec to `chart` for validation. On `"OK: <spec>"`, embed the spec
+  **verbatim** (the object after `OK: `) inside `<chart> ... </chart>` tags, with
+  a single descriptive sentence. Do NOT paste query data or Python code — only
+  the spec.
+
+### 3. Weather (`weather`)
+- Stored activities already contain historical weather in `activity_summaries`
+  (`weather_temp_c`, `weather_apparent_c`, `weather_humidity`, `weather_wind_kmh`,
+  `weather_description`) — prefer those columns whenever the question is about
+  weather at the time/location of a stored activity.
+- Use `weather` only for: (a) forecast data (up to 16 days ahead), (b) historical
+  weather for days with no activity (e.g. correlate a restless night with the
+  temperature), or (c) explicit coordinate lookups (`lat`/`lon`). It is never a
+  substitute for a database value: exact answers must still come from the tables.
+
+### 4. Long-Term Memory (`get_memory`, `remember_memory`)
+- Call `get_memory()` when personal/lifestyle context may matter.
+- Call `remember_memory(key, value)` to store user-volunteered facts (goals,
+  preferences, habits, injuries, equipment) — short lowercase keys, concise
+  values. Overwrite a key when a fact changes; skip ephemeral or one-off details.
+- **NEVER** store metrics derived from the database (VO2max, FTP, LTHR, PRs, race
+  predictions, HR zones, resting HR/HRV). Those must always be queried fresh.
+
+### 5. Training Plans (`get_training_plan`, `update_training_plan`)
+- When creating or modifying a plan, derive target paces/zones from recent
+  database metrics (weekly volume, HR zones, race predictions, VO2max) so it is
+  sensible and specific to the user. Dates are YYYY-MM-DD; activity_type is
+  run/cycle/swim/strength/rest/other; intensity is easy/moderate/hard/race_pace.
+  Pass `"replace": true` for a brand-new plan (so stale workouts clear first).
+- **Rendering rule:** when showing the plan, **NEVER** format JSON or build a
+  markdown table of workouts. Instead embed the UI marker:
+  `<plan_table />` (or `<plan_table from="YYYY-MM-DD" to="YYYY-MM-DD" />`); the
+  UI renders it from the database exactly like the Training Plan tab. Keep your
+  narrative answer short.
+
+---
+
+# Output & Domain Conventions
+
+1. **Always include units:** append appropriate units to every metric (e.g.
+   `7.6 hours`, `52 ml/kg/min`, `154 bpm`, `245 W`).
+2. **Running Pacing:** convert running speeds to pace (`MM:SS /km` or
+   `MM:SS /mi`) rather than raw `km/h`. Formula: `Pace (min/km) = 60 / speed_kmh`.
+   Give pace as the headline for running questions (include the speed too if
+   useful).
+3. **Durations:** format activity durations as `HH:MM:SS` or `Xh Ym` instead of
+   raw total seconds.
+4. **Running vs. general ACWR + form.** The general `acwr` uses `training_load`
+   (a heart-rate proxy) across ALL activities, so cycling/swimming/running all
+   raise it and it cannot see tissue stress. `run_acwr` is the running-isolated
+   counterpart: the same 7d/28d ratio but built from running distance only.
+   `run_cadence_drift` is a separate, pace-normalised gauge of mechanics: a
+   negative z-score means fewer steps/min than the user normally takes at that
+   pace (overstriding), which raises impact on shins/knees/patellar tendon. When
+   the user asks about running volume or progression, prefer `run_acwr`; when
+   they mention leg/joint/tendon aches or "form breaking down", look at
+   `run_cadence_drift` (persistently negative = form deteriorating under
+   fatigue). A high `run_acwr` with a modest general `acwr` means cross-training
+   is masking a running-volume spike. Always read both fresh from
+   `derived_metrics`; never assume readiness equals running tolerance; give pace
+   (`MM:SS /km`) for running questions.
+5. **Column Unit Reference:**
+   - `*_kmh`: km/h | `*_m`: meters | `*_w`: watts | `*_hours`: hours | `*_min`: minutes
+   - `*_c`: degC | `*_ml`: ml | `*_kcal`: kcal | `*_pct`: percentage (0–100)
+   - Heart rate: bpm | Cadence: running = steps/min PER LEG (single foot, ~80-90;
+     TOTAL both-feet cadence = 2x the stored value — quote the 2x number when
+     reporting cadence) · cycling/rowing = rpm | Stress & Body
+     Battery: 0–100 scale
 """
 
-_PROMPT_QUERY = """\
-Almost every column may be NULL on days/rows where the value is N/A; only use
-aggregate functions over the rows you have. Result sets are capped at 200 rows,
-so prefer aggregated queries (GROUP BY weeks/months/weekdays) over dumping raw
-rows. Never use SELECT *; list only the columns you need (daily_metrics is ~60
-columns wide and activity_summaries ~58). Keep result sets tiny: select a handful
-of columns and aggregate to at most ~100-200 rows, ORDER BY time columns so
-trends read naturally. Prefer small probes — e.g. query with LIMIT 10 to
-sanity-check columns before a full aggregation.
-
-Write the SQL yourself for every data question. There are no ready-made query
-tools and no shortcuts: use the schema given above and the ``run_sql`` tool for
-all data access (metric time series, recent activities, splits, per-tick series,
-per-day summaries — everything). Derive each answer directly from the tables.
-
-One exception: for "how was my day X" questions, call ``get_day_summary(YYYY-MM-DD)``
-instead of writing a SELECT — it returns the whole per-day bundle (every stored
-daily metric plus that day's activities) in one call without a ~60-column
-daily_metrics dump. For anything else, write the SQL yourself.
+#: The date note, emitted by the module-level *dynamic* system prompt. Kept as its
+#: own (date-only) part so it is the sole thing re-evaluated each turn — the static
+#: template above is built once and never needs touching again.
+_TODAY_PROMPT = """\
+Today's date is {today}. This line is refreshed on every turn, but for any question
+that depends on NOW — "today", "tomorrow", "this week", "last Monday" — call the
+`today` tool and trust its result: it is the authoritative current date and its
+weekday is already computed for you.
 """
 
-_PROMPT_CHARTS = """\
-When asked for a chart or visualization: call the chart tool to validate a
-spec. The spec is a JSON object of your OWN design (you write the graph, not
-the data): {"sql": "SELECT ...", "traces": [{...}], "layout": {"title":
-{"text": "..."}}}. The `sql` must return the plotted data itself (column
-names in the traces reference its result). You are free to draw ANY Plotly
-figure: each trace names a plotly.graph_objects class via "go" (e.g. "Scatter",
-"Scattergl", "Violin", "Heatmap", "Pie", "Bar", "Candlestick") — the compact
-aliases line / scatter / area / bar / pie / histogram / box also work. Data
-columns are referenced by name in x / y / z, and any other numeric trace
-argument can reference a column as {"column": "<name>"} (e.g. for a pie:
-{"labels": {"column": "sport_type"}, "values": {"column": "hours"}}).
-Every remaining key in a trace is passed straight to the Plotly constructor
-(mode, marker, line, opacity, orientation, colorscale, text, ...). Keep points
-to at most ~200 by aggregating (GROUP BY week/month/weekday) and ORDER BY time
-columns. The chart tool runs the query, checks every referenced column exists
-and the trace can be built, and returns "OK: <spec> (query returned N rows)" if
-valid. Embed only the spec JSON — the object after "OK: " — VERBATIM in the
-final answer wrapped in <chart> ... </chart> (one per chart) and add a short
-one-sentence description of what it shows as normal text. Do NOT paste query
-data or Python code into your answer — only the spec.
-"""
+#: The long-term-memory note, also a *dynamic* system prompt (registered as a
+#: closure in ``build_agent`` so it can read the per-agent ``memory`` and be
+#: re-evaluated every turn, like the date). Because it is dynamic, a fact the
+#: model stores mid-session is visible on the next turn and across resumed
+#: sessions without the static template ever being touched.
+_MEMORY_PROMPT_TITLE = "## Long-term memory about this athlete (persistent facts)"
 
-_PROMPT_WEATHER = """\
-Weather: observed conditions during a workout are already stored per activity
-in activity_summaries (weather_temp_c, weather_apparent_c, weather_humidity,
-weather_wind_kmh, weather_description) — prefer those columns whenever a
-question is about the weather at the time/location of a stored activity. The
-`weather` tool is for what the stored data does NOT cover: (1) the short forecast
-(up to 16 days ahead), (2) historical weather for days with no activity (e.g.
-correlate a restless night with the temperature), and (3) weather at any location
-via explicit `lat`/`lon` (default: GARMIN_HOME_LAT/GARMIN_HOME_LON). It returns
-per-day min/max temp (degC), precipitation (mm) and max wind (km/h) for a range
-fully before today (historical) or starting today (forecast). It is never a
-substitute for a database value: exact answers must still come from the tables.
-"""
 
-_PROMPT_MEMORY = """\
-Long-term memory: you keep a persistent profile of the user across sessions.
-Call get_memory() when personal context may matter. Save with
-remember_memory(key, value) — short lowercase keys, concise values — only
-facts the user volunteers that are not in the database (goals, preferences,
-habits, equipment, lifestyle). NEVER save anything you could query from the
-database, including anything inferred from it: no fitness markers (VO2max,
-FTP, LTHR), no personal records, no race predictions, no training zones, no
-baseline resting HR/HRV — those all belong in the tables and are re-derived
-on demand. Memory exists solely to hold what the database cannot tell you.
-Overwrite a key when a fact changes, and skip ephemeral or one-off details.
-"""
+def _memory_prompt(memory: _Memory) -> str | None:
+    """Render the user's durable facts as a system-prompt section, or ``None``
+    when there is nothing to say (so no empty block is injected)."""
+    facts = memory.get()
+    if not facts:
+        return None
+    lines = "\n".join(f"- **{key}**: {value}" for key, value in facts.items())
+    return (
+        _MEMORY_PROMPT_TITLE
+        + "\n\nThe facts below were recorded in earlier conversations and stay "
+        "available every turn. Rely on them for personalisation, but NEVER "
+        "duplicate database-queryable metrics (VO2max, FTP, PRs, zones, HR) "
+        "here — always query those fresh.\n\n"
+        + lines
+    )
 
-_PROMPT_PLAN = """\
-Training plan: the user keeps a training plan (a set of planned workouts) shown
-on the site and editable both manually and through you. Read it with
-get_training_plan() and update it with update_training_plan(). When the user
-asks to create or adjust a training plan (e.g. "build a 12-week half-marathon
-plan starting Monday", "move my Thursday run to Friday", "add an easy swim on
-Wednesday"), plan the workouts yourself — dates (YYYY-MM-DD), activity_type
-(run/cycle/swim/strength/rest/other), title, duration_min, distance_km,
-intensity (easy/moderate/hard/race_pace) — and call update_training_plan with
-the complete set. Pass "replace": true when the user wants a brand-new plan
-(so stale workouts are cleared first). Use the schema and existing data (e.g.
-recent weekly mileage, race predictions, VO2max, hr_zones) to make the plan
-sensible and specific to the user. After updating, tell the user what you
-added/changed (a concise weekly summary is ideal).
-
-When the user wants to SEE the plan (or a slice of it) in the chat, call
-get_training_plan() to inspect it, then do NOT transcribe the workouts into a
-markdown table and NEVER paste the raw JSON the tool returns. Instead embed
-this exact marker in your answer: <plan_table /> — optionally with date
-bounds, e.g. <plan_table from="2026-08-10" to="2026-08-16" />. The UI replaces
-the marker with the user's stored plan rendered directly from the database
-(identical to the Training Plan tab), so you never burn tokens writing the
-table out. Keep your narrative answer short — the marker renders the table
-for you.
-"""
-
-_PROMPT_ANSWER = """\
-When returning an answer, refer to every number with its unit (e.g. "7.6
-hours of sleep", "22:35").
-"""
 
 #: Label placed ahead of a compacted summary when it seeds a new session.
 _SUMMARY_LABEL = "This is a compact summary of our previous conversation. Read it as context and continue normally."
@@ -523,6 +604,242 @@ def _build_chart_figure(
     return fig
 
 
+def _infer_series(result: dict[str, Any]) -> dict[str, list[str]]:
+    """Guess an x column and the y columns to plot for a raw query result.
+
+    Used by the ``see`` context tool, which does not have a hand-written Plotly
+    spec. Prefers a date-like column for x (a trend over time) and plots every
+    remaining numeric column. Falls back to index-based x when nothing is
+    date-like or numeric.
+    """
+    columns = result.get("columns") or []
+    rows = result.get("rows") or []
+    if not columns:
+        return {"x": "", "y": []}
+    _DATE_HINTS = ("date", "day", "year", "month", "week", "time")
+
+    def _numeric(col: str) -> bool:
+        i = columns.index(col)
+        vals = [r[i] for r in rows if r[i] is not None and r[i] != ""]
+        if not vals:
+            return False
+        try:
+            for v in vals:
+                float(v)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _date_like(col: str) -> bool:
+        """True when a column's values look like dates (name hint or values)."""
+        if any(h in col.lower() for h in _DATE_HINTS):
+            return True
+        i = columns.index(col)
+        for r in rows:
+            v = r[i]
+            if v is None or v == "":
+                continue
+            s = str(v)
+            if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+                return True
+        return False
+
+    def _row_index(col: str) -> bool:
+        """True when a column is just a sequential row number (0..N-1 or 1..N).
+
+        The model often returns ``row_number`` alongside its metric when it
+        works around a missing date column; plotting it adds a meaningless
+        second series, so it is skipped here. Requiring the sequence to start
+        at 0 or 1 avoids flagging a real metric that merely steps by one.
+        """
+        i = columns.index(col)
+        nums: list[int] = []
+        for r in rows:
+            try:
+                nums.append(int(r[i]))
+            except (TypeError, ValueError):
+                return False
+        if len(nums) < 2:
+            return False
+        start = nums[0]
+        if start not in (0, 1):
+            return False
+        return all(nums[k] == start + k for k in range(len(nums)))
+
+    x_col = next((c for c in columns if _date_like(c) and not _numeric(c)), "")
+    y_cols = [c for c in columns if c != x_col and _numeric(c) and not _row_index(c)]
+    if y_cols:
+        return {"x": x_col, "y": y_cols}
+    # No numeric y column fell out: if nothing is date-like, plot all non-x, and
+    # if only one column exists, plot it against an implicit index.
+    if not x_col:
+        y_cols = columns[1:] or columns
+    return {"x": x_col, "y": y_cols}
+
+
+def _render_series_png(
+    result: dict[str, Any], kind: str = "line"
+) -> bytes:
+    """Render a raw query result (columns+rows) to PNG without a Plotly spec.
+
+    This backs the ``see`` tool so the model can visually inspect whatever data
+    it queried — a trend, a distribution, a relationship — and extract context
+    about the user. ``kind`` is one of ``line``/``area``/``scatter``/``bar``/
+    ``histogram``/``box``. Raises ``ValueError`` with a model-facing message if
+    the result cannot be plotted.
+    """
+    import io
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    columns = result.get("columns") or []
+    rows = result.get("rows") or []
+    if not rows or not columns:
+        raise ValueError("the query returned no rows to plot")
+    kind = (kind or "line").lower()
+    if kind not in ("line", "area", "scatter", "bar", "histogram", "box"):
+        raise ValueError(f"kind must be line/area/scatter/bar/histogram/box, not {kind!r}")
+
+    series = _infer_series(result)
+    x_col = series["x"]
+    y_cols = series["y"]
+    if not y_cols:
+        raise ValueError("the query returned no numeric column to plot")
+
+    def _col(c: str) -> list[Any]:
+        return [r[columns.index(c)] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(9, 4.4), dpi=110)
+
+    def _floats(vals: list[Any]) -> list[float]:
+        out = []
+        for v in vals:
+            try:
+                out.append(float(v))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _parse_x(v: Any) -> Any:
+        """Coerce an x value to a plottable date/float, or None if unparseable."""
+        if v is None or v == "":
+            return None
+        s = str(v).strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            try:
+                return date.fromisoformat(s)
+            except ValueError:
+                return None
+        if re.match(r"^\d{4}-\d{2}-\d{2}[T ]", s):
+            try:
+                return datetime.fromisoformat(s)
+            except ValueError:
+                return None
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    def _series(col: str) -> tuple[list[Any], list[float]]:
+        """Aligned (x, y) pairs for one y column, skipping non-numeric rows.
+
+        When ``x_col`` is date-like the x values are parsed to real dates (so a
+        time series plots on a date axis instead of crashing); otherwise x is a
+        running index. x and y are always the same length, so every series plots
+        without a dimension mismatch.
+        """
+        i = columns.index(col)
+        xs: list[Any] = []
+        ys: list[float] = []
+        for r in rows:
+            yv = r[i]
+            if yv is None or yv == "":
+                continue
+            try:
+                yf = float(yv)
+            except (TypeError, ValueError):
+                continue
+            if x_col:
+                xv = _parse_x(r[columns.index(x_col)])
+                if xv is None:
+                    continue
+            else:
+                xv = len(xs)
+            xs.append(xv)
+            ys.append(yf)
+        return xs, ys
+
+    if kind in ("histogram", "box"):
+        col = y_cols[0]
+        vals = _floats(_col(col))
+        if not vals:
+            plt.close(fig)
+            raise ValueError(f"column {col!r} has no numeric values to plot")
+        if kind == "histogram":
+            ax.hist(vals, bins="auto", edgecolor="black", alpha=0.75)
+        else:
+            ax.boxplot(vals, vert=True)
+            ax.set_xticklabels(["all"])
+        ax.set_xlabel(col)
+    else:
+        if kind == "bar":
+            ax.clear()
+            width = max(0.6, 0.8 / max(len(y_cols), 1))
+            offset = -0.4 + width / 2
+            labels: list[str] = []
+            for k, col in enumerate(y_cols):
+                xs, ys = _series(col)
+                if not ys:
+                    continue
+                lab = [str(v) for v in xs]
+                if not labels:
+                    labels = lab
+                ticks = range(len(lab))
+                ax.bar([t + offset + k * width for t in ticks], ys,
+                       width=width, label=col)
+                ax.set_xticks(list(ticks))
+                ax.set_xticklabels(lab, rotation=45, ha="right", fontsize=8)
+        else:
+            for col in y_cols:
+                xs, ys = _series(col)
+                if not ys:
+                    continue
+                ax.plot(xs, ys, marker="o", markersize=4, label=col,
+                        linestyle="" if kind == "scatter" else "-")
+                if kind == "area":
+                    ax.fill_between(xs, ys, min(ys), alpha=0.25)
+        if x_col:
+            ax.set_xlabel(x_col)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _data_notes(result: dict[str, Any]) -> str:
+    """A short textual summary of a query result for the model to quote.
+
+    Complements the ``see`` image: the model can read the numbers here (so it
+    never has to guess values from the pixels) while the picture shows the shape.
+    """
+    columns = result.get("columns") or []
+    rows = result.get("rows") or []
+    if not columns or not rows:
+        return "the query returned no rows"
+    n = len(rows)
+    head = "  ".join(f"{c}={rows[0][columns.index(c)]}" for c in columns)
+    tail = "  ".join(f"{c}={rows[-1][columns.index(c)]}" for c in columns)
+    note = f"{n} row(s). First: {head}"
+    if n > 1:
+        note += f" | Last: {tail}"
+    return note
+
+
 class QueryError(Exception):
     """A read-only query was rejected by the Postgres driver."""
 
@@ -690,6 +1007,11 @@ class ReadOnlyDB:
                 "ORDER BY start_time_local DESC NULLS LAST",
                 (day,),
             ).fetchall()
+            running = conn.execute(
+                "SELECT metric, value, qualifier FROM derived_metrics "
+                "WHERE calendar_date = %s AND metric LIKE 'run_%' ORDER BY metric",
+                (day,),
+            ).fetchall()
         metrics: dict[str, Any] = {}
         if row:
             metrics = {
@@ -701,6 +1023,7 @@ class ReadOnlyDB:
             "calendar_date": day,
             "metrics": metrics,
             "activities": _jsonify_rows([dict(r) for r in activities]),
+            "running": _jsonify_rows([dict(r) for r in running]),
         }
 
     def run_sql(self, sql: str) -> dict[str, Any]:
@@ -961,33 +1284,43 @@ def _schema_text(db: ReadOnlyDB) -> str:
 
 
 def _current_date_prompt() -> str:
-    """The role prompt with today's date, re-evaluated as a dynamic prompt.
+    """The date note, re-evaluated as a dynamic system prompt on every turn.
 
     Includes the weekday name (e.g. ``2026-08-16 (Sunday)``) so the model never
     has to compute the day of week from the date itself — models reliably get
-    that arithmetic wrong by a day.
+    that arithmetic wrong by a day. This is the ONLY dynamic part of the prompt;
+    everything else is the (static) ``_PROMPT_TEMPLATE`` built once per agent.
     """
-    return _PROMPT_ROLE.format(
+    return _TODAY_PROMPT.format(
         today=date.today().strftime("%Y-%m-%d (%A)")
     )
 
 
 def _refresh_resumed_prompt(messages: list[Any]) -> list[Any]:
-    """Stamp the current date onto any stored system prompt in resumed history.
+    """Stamp the current date onto any stored *date* system prompt in history.
 
     Sessions persisted before the date prompt became dynamic carry a
     ``SystemPromptPart`` with an old date and no ``dynamic_ref``, so Pydantic AI
     can never re-evaluate it — the resumed agent keeps thinking "today" is the
-    day the session started. Rewrite those parts in place with the fresh date
-    and the current ``dynamic_ref`` so they keep refreshing on later turns.
+    day the session started. Rewrite only that date part in place with the fresh
+    date and the current ``dynamic_ref`` so it keeps refreshing on later turns.
+
+    The other system-prompt parts (the static role/schema template and the
+    dynamic long-term-memory note) are content-stable and must be left alone:
+    rewrites here would strip the role instructions or stomp on the memory
+    profile already evaluated for this run. The date part is recognised by its
+    own ``dynamic_ref`` (current sessions) or by content (legacy sessions).
     """
     from pydantic_ai.messages import SystemPromptPart
 
     fresh = _current_date_prompt()
     ref = _current_date_prompt.__qualname__
+    old_prefix = "Today's date is"
     for message in messages:
         for part in getattr(message, "parts", []):
             if not isinstance(part, SystemPromptPart):
+                continue
+            if part.dynamic_ref != ref and not part.content.startswith(old_prefix):
                 continue
             if part.content == fresh and part.dynamic_ref == ref:
                 continue
@@ -1033,22 +1366,11 @@ def build_agent(
             settings=model_settings,
         )
     schema = _schema_text(db)
-    system_prompt = (
-        "The current database schema is given below. You do NOT need to "
-        "call table_schema for these tables — the columns (with units/notes) "
-        "are already listed here. Write queries directly against these "
-        "columns; if a column you expect is missing, re-check with "
-        "table_schema once.\n\n" + schema
-    ) if schema else ""
-    system_prompt += "\n\n" + "\n\n".join(
-        [
-            _PROMPT_QUERY,
-            _PROMPT_CHARTS,
-            _PROMPT_WEATHER,
-            _PROMPT_MEMORY,
-            _PROMPT_PLAN,
-            _PROMPT_ANSWER,
-        ]
+    # ``str.replace`` (not ``.format``) because the template's chart guidance
+    # contains literal JSON braces (``{"sql": ...}``). The schema is filled once
+    # here; the date is injected separately as a dynamic prompt below.
+    system_prompt = _PROMPT_TEMPLATE.replace(
+        "{schema_text}", schema or "(no tables available in the database)"
     )
     agent = Agent(model, system_prompt=system_prompt.strip())
 
@@ -1059,6 +1381,20 @@ def build_agent(
     # (dynamic=True only works in the decorator form; the module-level function
     # keeps the ``dynamic_ref`` stable so resumed sessions can match it.)
     agent.system_prompt(dynamic=True)(_current_date_prompt)
+
+    # The long-term-memory profile is injected the same way: a *dynamic* system
+    # prompt, so it is re-evaluated every turn (a fact the model stores via
+    # ``remember_memory`` mid-session shows up on the next turn) and stays fresh
+    # across resumed sessions. It is a closure, so its ``dynamic_ref`` is stable
+    # (``build_agent.<locals>._memory_dynamic_prompt``) and resumed history can
+    # match it. When there are no facts it renders nothing, so no empty block is
+    # sent.
+    if memory is not None:
+
+        def _memory_dynamic_prompt() -> str | None:
+            return _memory_prompt(memory)
+
+        agent.system_prompt(dynamic=True)(_memory_dynamic_prompt)
 
     @agent.tool_plain
     def list_tables() -> str:
@@ -1173,6 +1509,43 @@ def build_agent(
             "OK: " + _json.dumps(parsed, ensure_ascii=False)
             + f" (query returned {len(rows)} rows)"
         )
+
+    @agent.tool_plain
+    def see(sql: str, kind: str = "line") -> str:
+        """Query the database and return the result as an IMAGE you can look at.
+
+        ``sql`` is a read-only SELECT/WITH/EXPLAIN statement. ``kind`` is an
+        optional plot type: line | area | scatter | bar | histogram | box
+        (default line). It plots whatever the query returns — usually a series
+        over time, or one column as a histogram/box — and returns both a
+        rendered image AND the data, so you can visually read the shape (trend,
+        drift, spikes, clusters, relationships) and still quote exact numbers.
+        Column names are shown in the plot legend, so you can tell which series
+        is which. Call this when a picture would help you understand the user
+        better — a trend over time, how two metrics move together, the shape of
+        a distribution, an outlier. It is for gathering insight about the user
+        from their data, not for checking a chart's appearance; prefer
+        line/area/scatter for time series, histogram/box for a single column's
+        distribution. Do not show the user this figure — it is for your eyes.
+        """
+        import base64
+        import json as _json
+
+        from pydantic_ai.messages import ImageUrl
+
+        if not isinstance(sql, str) or not sql.strip():
+            return "ERROR: pass a read-only SQL string"
+        try:
+            result = db.run_sql(sql)
+            png = _render_series_png(result, kind)
+        except (ValueError, QueryError) as exc:
+            return f"ERROR: {exc}"
+        return [
+            "Here is the data you asked to see, as an image plus the underlying "
+            "rows:",
+            ImageUrl(url="data:image/png;base64," + base64.b64encode(png).decode()),
+            "Data: " + _data_notes(result),
+        ]
 
     if weather is not None:
 
