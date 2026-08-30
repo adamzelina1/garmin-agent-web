@@ -37,7 +37,7 @@ expand on click into the full breakdown, colour-coded zones and history:
 Build or edit a weekly schedule, drag workouts between days, and see a daily
 briefing (with your notes) below the week — or ask the AI to reshape it:
 
-![Training Plan — weekly calendar with weather, drag-and-drop and a daily briefing](images/training_plan_v2.png)
+![Training Plan — weekly calendar with weather, drag-and-drop and a daily briefing](images/training_plan_v3.png)
 
 ## A read-only AI agent that can *see*
 
