@@ -44,12 +44,24 @@
   label { font-size:12px; color:var(--muted); display:block; margin-top:8px; }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
           padding:20px; margin-top:16px; }
-  .today-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; }
+  .today-grid { display:grid; grid-template-columns:1fr; gap:12px; align-items:start; }
   .today-grid .card { margin-top:0; }
-  @media (max-width: 820px) {
-    .today-grid { grid-template-columns:1fr; }
-    .today-grid .card { margin-top:16px; }
-  }
+  .td-card { padding:0; overflow:hidden; }
+  .td-head { display:flex; align-items:center; gap:12px; width:100%; background:none;
+             border:none; cursor:pointer; padding:15px 18px; text-align:left; }
+  .td-head:hover { background:var(--panel2); }
+  .td-head .td-chev { flex:none; color:var(--muted); font-size:12px; transition:transform .15s ease; }
+  .td-card.open .td-chev { transform:rotate(90deg); }
+  .td-head .td-ttl { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1; }
+  .td-head .td-t { font-weight:700; font-size:15px; color:var(--text); }
+  .td-head .td-sub { font-size:12px; color:var(--muted); }
+  .td-head .td-val { flex:none; display:flex; flex-direction:column; align-items:flex-end;
+                     font-size:34px; font-weight:800; line-height:1; padding-left:16px;
+                     border-left:1px solid var(--border); font-variant-numeric:tabular-nums;
+                     letter-spacing:-.01em; }
+  .td-head .td-val .td-val-unit { font-size:11px; font-weight:600; color:var(--muted);
+                          letter-spacing:.06em; text-transform:uppercase; margin-top:5px; }
+  .td-details { padding:0 18px 18px; }
   .tabs { display:flex; gap:8px; margin-bottom:14px; }
   .tabs button { background:var(--panel2); color:var(--muted); border:1px solid var(--border); }
   .tabs button.active { color:#fff; border-color:var(--accent); }
@@ -57,6 +69,47 @@
   .banner.warn { background:#3b2f10; border:1px solid #7a5c14; color:#f5d67b; }
   .banner.err { background:#3b1216; border:1px solid #7a222a; color:#f5a3a3; }
   .banner.ok { background:#0f2f1a; border:1px solid #1f5c34; color:#a3e6bd; }
+  .briefing { background:linear-gradient(180deg,#12283d,0,#0f1f30); border:1px solid #1f4a6d;
+              border-radius:10px; padding:16px 18px; margin-top:14px; font-size:14px; color:#cfe4f5; }
+  .briefing .bf-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  .briefing .bf-title { font-size:16px; font-weight:700; color:#e6f3fb; letter-spacing:.02em; }
+  .briefing .bf-date { font-size:12px; color:#7fa8c9; }
+  .briefing .bf-close { background:none; border:none; color:var(--muted); cursor:pointer;
+               font-size:20px; line-height:1; padding:0 4px; }
+  .briefing .bf-close:hover { color:#fff; }
+  .briefing .bf-grid { display:grid; grid-template-columns:1.3fr 1fr 1fr; gap:18px; }
+  .briefing .bf-sec { background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.06);
+              border-radius:8px; padding:12px 14px; min-width:0; }
+  .briefing .bf-sec > .bf-label { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+              font-weight:700; color:#7fa8c9; margin-bottom:8px; }
+  .briefing .bf-empty { color:#7fa8c9; font-size:13px; }
+  .briefing .bf-w { display:flex; align-items:flex-start; gap:10px; padding:6px 0; border-bottom:1px solid rgba(255,255,255,.06); }
+  .briefing .bf-w:last-child { border-bottom:none; }
+  .briefing .bf-w .bf-badge { flex:none; font-size:9px; text-transform:uppercase; letter-spacing:.07em;
+              font-weight:700; color:#0b1220; padding:3px 6px; border-radius:4px; margin-top:1px; }
+  .briefing .bf-w .bf-wname { font-weight:600; color:#e6f3fb; font-size:14px; }
+  .briefing .bf-w .bf-wmeta { font-size:12px; color:#9fc3dd; margin-top:1px; }
+  .briefing .bf-w .bf-wnote { font-size:12px; color:#bfe0f5; margin-top:3px; line-height:1.4;
+              max-height:180px; overflow-y:auto; overscroll-behavior:contain; }
+  .briefing .bf-w .bf-wnote p { margin:4px 0; }
+  .briefing .bf-w .bf-wnote p:first-child { margin-top:0; }
+  .briefing .bf-w .bf-wnote p:last-child { margin-bottom:0; }
+  .briefing .bf-score { display:flex; align-items:center; gap:14px; }
+  .briefing .bf-score-ring { flex:none; width:64px; height:64px; border-radius:50%; display:flex;
+              align-items:center; justify-content:center; font-size:20px; font-weight:800;
+              color:#fff; position:relative; }
+  .briefing .bf-score-ring span { position:absolute; }
+  .briefing .bf-score .bf-cat { font-size:15px; font-weight:700; }
+  .briefing .bf-score .bf-advice { font-size:13px; color:#cfe4f5; margin-top:3px; line-height:1.35; }
+  .briefing .bf-vitals { display:flex; gap:14px; margin-top:12px; flex-wrap:wrap; }
+  .briefing .bf-vital { font-size:12px; color:#9fc3dd; }
+  .briefing .bf-vital b { display:block; font-size:16px; color:#e6f3fb; font-weight:700; }
+  .briefing .bf-wx { display:flex; align-items:center; gap:12px; }
+  .briefing .bf-wx .bf-wxtemp { font-size:22px; font-weight:700; color:#e6f3fb; }
+  .briefing .bf-wx .bf-wxrow { font-size:13px; color:#9fc3dd; line-height:1.5; }
+  @media (max-width:760px) {
+    .briefing .bf-grid { grid-template-columns:1fr; }
+  }
   #auth { max-width:460px; margin:48px auto; }
   #app { display:none; }
   .chatbox { background:var(--panel); border:1px solid var(--border); border-radius:10px;
@@ -112,10 +165,22 @@
   .plan-day .wx { display:flex; align-items:baseline; gap:8px; font-size:11px; margin:0 0 8px; }
   .plan-day .wx .wt { color:var(--text); font-weight:600; }
   .plan-day .wx .wr { color:var(--muted); font-size:10px; }
-  .plan-card { background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent);
+  .plan-card { position:relative; background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent);
                border-radius:6px; padding:7px 8px; margin-bottom:6px; cursor:pointer; font-size:12px;
                line-height:1.35; }
   .plan-card:hover { box-shadow:0 1px 4px rgba(0,0,0,.35); background:var(--panel2); }
+  #plan-tip { position:fixed; z-index:80; max-width:320px; max-height:45vh; overflow-y:auto;
+              overscroll-behavior:contain; pointer-events:none; visibility:hidden;
+              background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+              color:var(--text); padding:9px 11px; font-size:12px; line-height:1.5;
+              box-shadow:0 6px 16px rgba(0,0,0,.45); opacity:0; transition:opacity .12s ease; }
+  #plan-tip.show { opacity:1; visibility:visible; pointer-events:auto; }
+  #plan-tip strong { color:#fff; }
+  #plan-tip em { color:#cfe0ef; }
+  #plan-tip code { background:#00000042; border-radius:3px; padding:0 3px; }
+  #plan-tip p { margin:4px 0; }
+  #plan-tip p:first-child { margin-top:0; }
+  #plan-tip p:last-child { margin-bottom:0; }
   .plan-card .pc-type { display:inline-block; font-size:9px; text-transform:uppercase; letter-spacing:.07em;
                         font-weight:700; color:var(--accent); }
   .plan-card .pc-title { font-weight:600; color:var(--text); margin:3px 0; }
@@ -132,6 +197,8 @@
   .plan-card.done .pc-title { color:#9fb8aa; text-decoration:line-through; text-decoration-color:rgba(34,197,94,.6); }
   .plan-card.done .pc-meta { color:var(--muted); opacity:.75; }
   .plan-card.done:hover { background:#123a20; }
+  .plan-card.dragging { opacity:.5; }
+  .plan-day.drag-over { border-color:var(--accent); box-shadow:0 0 0 1px rgba(59,130,246,.45); }
   .plan-add { width:100%; background:transparent; border:1px dashed var(--border); color:var(--muted);
               border-radius:6px; padding:5px; font-size:12px; cursor:pointer; margin-top:auto; }
   .plan-add:hover { color:var(--accent); border-color:var(--accent); }
@@ -214,42 +281,60 @@
 
     <div id="tab-today" class="hidden">
       <div class="today-grid">
-      <div class="card">
-        <div class="readiness-head">
-          <h3 style="margin:0">Training Readiness</h3>
-          <span class="muted">Custom score from your nightly HRV, resting HR and sleep.</span>
+      <div class="card td-card" data-load="readiness">
+        <button class="td-head" aria-expanded="false">
+          <span class="td-chev">▸</span>
+          <span class="td-ttl">
+            <span class="td-t">Training Readiness</span>
+            <span class="td-sub">Custom score from your nightly HRV, resting HR and sleep</span>
+          </span>
+          <span class="td-val"><span id="readiness-headval">–</span><span class="td-val-unit">score</span></span>
+        </button>
+        <div class="td-details hidden">
+          <div class="banner warn hidden" id="readiness-hint">Needs at least 7 days of logged
+            sleep, HRV and resting heart rate. It will appear automatically once enough data has
+            been synced.</div>
+          <div id="readiness-summary"></div>
+          <div id="readiness-chart"></div>
         </div>
-        <div class="banner warn hidden" id="readiness-hint">Needs at least 7 days of logged
-          sleep, HRV and resting heart rate. It will appear automatically once enough data has
-          been synced.</div>
-        <div id="readiness-summary"></div>
-        <div id="readiness-chart"></div>
       </div>
 
-      <div class="card">
-        <div class="readiness-head">
-          <h3 style="margin:0">Acute-to-Chronic Workload Ratio</h3>
-          <span class="muted">7-day vs 28-day training load (EMA) · injury / overtraining risk</span>
+      <div class="card td-card" data-load="acwr">
+        <button class="td-head" aria-expanded="false">
+          <span class="td-chev">▸</span>
+          <span class="td-ttl">
+            <span class="td-t">Acute-to-Chronic Workload Ratio</span>
+            <span class="td-sub">7-day vs 28-day training load (EMA) · injury / overtraining risk</span>
+          </span>
+          <span class="td-val"><span id="acwr-headval">–</span><span class="td-val-unit">ratio</span></span>
+        </button>
+        <div class="td-details hidden">
+          <div class="banner warn hidden" id="acwr-hint">No training-load data yet — ACWR will appear
+            once activities with a training load have been synced.</div>
+          <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
+            0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated</div>
+          <div id="acwr-summary"></div>
+          <div id="acwr-chart"></div>
         </div>
-        <div class="banner warn hidden" id="acwr-hint">No training-load data yet — ACWR will appear
-          once activities with a training load have been synced.</div>
-        <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
-          0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated</div>
-        <div id="acwr-summary"></div>
-        <div id="acwr-chart"></div>
       </div>
 
-      <div class="card">
-        <div class="readiness-head">
-          <h3 style="margin:0">Running ACWR</h3>
-          <span class="muted">7-day vs 28-day running distance (EMA) · foot-strike volume only</span>
+      <div class="card td-card" data-load="runacwr">
+        <button class="td-head" aria-expanded="false">
+          <span class="td-chev">▸</span>
+          <span class="td-ttl">
+            <span class="td-t">Running ACWR</span>
+            <span class="td-sub">7-day vs 28-day running distance (EMA) · foot-strike volume only</span>
+          </span>
+          <span class="td-val"><span id="runacwr-headval">–</span><span class="td-val-unit">ratio</span></span>
+        </button>
+        <div class="td-details hidden">
+          <div class="banner warn hidden" id="runacwr-hint">No running data yet — Running ACWR will appear
+            once running activities (with distance) have been synced.</div>
+          <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
+            0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated · running only</div>
+          <div id="runacwr-summary"></div>
+          <div id="runacwr-chart"></div>
         </div>
-        <div class="banner warn hidden" id="runacwr-hint">No running data yet — Running ACWR will appear
-          once running activities (with distance) have been synced.</div>
-        <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
-          0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated · running only</div>
-        <div id="runacwr-summary"></div>
-        <div id="runacwr-chart"></div>
       </div>
       </div>
     </div>
@@ -266,6 +351,7 @@
           Chat to build or change it (e.g. "create a 12-week half-marathon plan").</div>
         <div class="banner err hidden" id="plan-error"></div>
         <div class="plan-week" id="plan-week"></div>
+        <div id="plan-briefing" class="briefing hidden"></div>
       </div>
     </div>
 
@@ -427,7 +513,7 @@ function switchAppTab(which) {
   $("tab-plan").classList.toggle("hidden", which !== "plan");
   $("tab-settings").classList.toggle("hidden", which !== "settings");
   if (which === "today") loadToday();
-  if (which === "plan") loadPlan();
+  if (which === "plan") { loadPlan(); loadBriefing(); }
 }
 
 function switchSettingsSubTab(which) {
@@ -904,7 +990,208 @@ async function loadWeather(fromStr, toStr) {
   }
 }
 
+function briefingCat(score) {
+  if (score >= 80) return "Prime";
+  if (score >= 60) return "Moderate";
+  if (score >= 40) return "Low";
+  return "Depleted";
+}
+
+const CAT_COLORS = { Prime:"#22c55e", Moderate:"#eab308", Low:"#f97316", Depleted:"#ef4444" };
+
+function briefingAdvice(cat) {
+  if (cat === "Prime") return "You're fresh and ready — a great day to push the volume or hit the key session hard.";
+  if (cat === "Moderate") return "A solid day to train. Keep the plan as written.";
+  if (cat === "Low") return "You're a little run down. Consider easing the effort or cutting volume.";
+  return "Listen to your body — today is best kept to rest, recovery or a very easy session.";
+}
+
+async function loadBriefing() {
+  const box = $("plan-briefing");
+  if (!box) return;
+  const now = new Date();
+  const today = fmt(now);
+  if (localStorage.getItem("briefing_dismissed") === today) { box.classList.add("hidden"); return; }
+  let planRes, rdyRes, wxRes;
+  try {
+    [planRes, rdyRes, wxRes] = await Promise.all([
+      api("/training-plan?from_date=" + today + "&to_date=" + today, undefined, "GET"),
+      api("/readiness", undefined, "GET"),
+      api("/weather?from_date=" + today + "&to_date=" + today, undefined, "GET"),
+    ]);
+  } catch (e) { box.classList.add("hidden"); return; }
+
+  const workouts = planRes.workouts || [];
+  const rdy = rdyRes.today || null;
+  const score = rdy && rdy.score != null ? Number(rdy.score) : null;
+  const cat = score != null ? briefingCat(score) : null;
+  const wx = (wxRes.days || [])[0] || null;
+
+  box.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "bf-head";
+  const title = document.createElement("span");
+  title.className = "bf-title";
+  title.textContent = "Today's Briefing";
+  const dt = document.createElement("span");
+  dt.className = "bf-date";
+  dt.textContent = now.toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short", year:"numeric" });
+  const close = document.createElement("button");
+  close.className = "bf-close";
+  close.title = "Hide for today";
+  close.textContent = "×";
+  close.addEventListener("click", () => {
+    localStorage.setItem("briefing_dismissed", today);
+    box.classList.add("hidden");
+  });
+  const titleWrap = document.createElement("div");
+  titleWrap.appendChild(title); titleWrap.appendChild(dt);
+  titleWrap.style.display = "flex"; titleWrap.style.alignItems = "baseline"; titleWrap.style.gap = "10px";
+  head.appendChild(titleWrap); head.appendChild(close);
+
+  const grid = document.createElement("div");
+  grid.className = "bf-grid";
+
+  // Workouts column
+  const wSec = document.createElement("div");
+  wSec.className = "bf-sec";
+  const wLabel = document.createElement("div");
+  wLabel.className = "bf-label";
+  wLabel.textContent = workouts.length ? "Workout" : "No workout planned";
+  wSec.appendChild(wLabel);
+  if (!workouts.length) {
+    const e = document.createElement("div");
+    e.className = "bf-empty";
+    e.textContent = "Nothing scheduled today — a chance to rest or slot something in.";
+    wSec.appendChild(e);
+  } else {
+    for (const w of workouts) {
+      const color = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
+      const row = document.createElement("div");
+      row.className = "bf-w";
+      const badge = document.createElement("span");
+      badge.className = "bf-badge";
+      badge.style.background = color;
+      badge.textContent = w.activity_type;
+      const info = document.createElement("div");
+      info.style.minWidth = "0";
+      const name = document.createElement("div");
+      name.className = "bf-wname";
+      name.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
+      const metaParts = [];
+      if (w.distance_km != null) metaParts.push(Number(w.distance_km) + " km");
+      if (w.duration_min != null) metaParts.push(Number(w.duration_min) + " min");
+      if (w.intensity) metaParts.push(w.intensity.replace("_", " "));
+      if (w.completed) metaParts.push("done");
+      info.appendChild(name);
+      if (metaParts.length) {
+        const m = document.createElement("div");
+        m.className = "bf-wmeta";
+        m.textContent = metaParts.join("  ·  ");
+        info.appendChild(m);
+      }
+      if (w.description && w.description.trim()) {
+        const n = document.createElement("div");
+        n.className = "bf-wnote";
+        n.innerHTML = renderMarkdown(w.description);
+        info.appendChild(n);
+      }
+      row.appendChild(badge); row.appendChild(info);
+      wSec.appendChild(row);
+    }
+  }
+
+  // Readiness column
+  const rSec = document.createElement("div");
+  rSec.className = "bf-sec";
+  const rLabel = document.createElement("div");
+  rLabel.className = "bf-label";
+  rLabel.textContent = "Readiness";
+  rSec.appendChild(rLabel);
+  if (score == null) {
+    const e = document.createElement("div");
+    e.className = "bf-empty";
+    e.textContent = "No readiness score yet (needs overnight HRV, RHR and sleep).";
+    rSec.appendChild(e);
+  } else {
+    const color = CAT_COLORS[cat] || "#3b82f6";
+    const wrap = document.createElement("div");
+    wrap.className = "bf-score";
+    const ring = document.createElement("div");
+    ring.className = "bf-score-ring";
+    ring.style.background = "conic-gradient(" + color + " " + (score * 3.6) + "deg, rgba(255,255,255,.12) 0deg)";
+    const inner = document.createElement("div");
+    inner.style.width = "50px"; inner.style.height = "50px"; inner.style.borderRadius = "50%";
+    inner.style.background = "#12283d"; inner.style.display = "flex";
+    inner.style.alignItems = "center"; inner.style.justifyContent = "center";
+    const sc = document.createElement("span");
+    sc.style.position = "relative";
+    sc.textContent = Math.round(score);
+    inner.appendChild(sc);
+    ring.appendChild(inner);
+    const info = document.createElement("div");
+    const catEl = document.createElement("div");
+    catEl.className = "bf-cat";
+    catEl.style.color = color;
+    catEl.textContent = cat + " · " + Math.round(score) + "/100";
+    const adv = document.createElement("div");
+    adv.className = "bf-advice";
+    adv.textContent = briefingAdvice(cat);
+    info.appendChild(catEl); info.appendChild(adv);
+    wrap.appendChild(ring); wrap.appendChild(info);
+    rSec.appendChild(wrap);
+
+    const vitals = document.createElement("div");
+    vitals.className = "bf-vitals";
+    const v = (label, val) => {
+      const el = document.createElement("div");
+      el.className = "bf-vital";
+      el.innerHTML = "<b></b>" + label;
+      el.querySelector("b").textContent = val == null ? "—" : String(val);
+      vitals.appendChild(el);
+    };
+    v("Sleep score", rdy.sleep_score != null ? Math.round(rdy.sleep_score) : null);
+    v("HRV (ms)", rdy.hrv != null ? Math.round(rdy.hrv) : null);
+    v("Resting HR", rdy.rhr != null ? Math.round(rdy.rhr) : null);
+    rSec.appendChild(vitals);
+  }
+
+  // Weather column
+  const xSec = document.createElement("div");
+  xSec.className = "bf-sec";
+  const xLabel = document.createElement("div");
+  xLabel.className = "bf-label";
+  xLabel.textContent = "Weather";
+  xSec.appendChild(xLabel);
+  if (!wx) {
+    const e = document.createElement("div");
+    e.className = "bf-empty";
+    e.textContent = "No forecast available for today.";
+    xSec.appendChild(e);
+  } else {
+    const wrapX = document.createElement("div");
+    wrapX.className = "bf-wx";
+    const temp = document.createElement("div");
+    temp.className = "bf-wxtemp";
+    temp.textContent = fmtWx(wx);
+    const det = document.createElement("div");
+    det.className = "bf-wxrow";
+    const lines = [];
+    if (wx.precip_mm > 0) lines.push("Precip: " + Math.round(wx.precip_mm) + " mm");
+    else lines.push("Precip: dry");
+    if (wx.wind_max_kmh != null) lines.push("Wind: " + Math.round(wx.wind_max_kmh) + " km/h");
+    det.textContent = lines.join("\n");
+    wrapX.appendChild(temp); wrapX.appendChild(det);
+    xSec.appendChild(wrapX);
+  }
+
+  grid.appendChild(wSec); grid.appendChild(rSec); grid.appendChild(xSec);
+  box.appendChild(head); box.appendChild(grid);
+  box.classList.remove("hidden");
+}
+
 function renderPlan(workouts) {
+  hideCardTip(true);
   const byDate = {};
   for (const w of workouts) {
     (byDate[w.planned_date] = byDate[w.planned_date] || []).push(w);
@@ -942,6 +1229,7 @@ function renderPlan(workouts) {
     add.addEventListener("click", () => openPlanModal(null, iso));
     day.appendChild(list);
     day.appendChild(add);
+    installDayDrop(day);
     grid.appendChild(day);
   }
   const end = new Date(planWeekStart);
@@ -956,6 +1244,10 @@ function workoutCard(w) {
     + (w.activity_type === "rest" ? " rest" : "")
     + (w.completed ? " done" : "");
   card.style.borderLeftColor = w.completed ? "#22c55e" : color;
+  if (w.description && w.description.trim()) {
+    card.addEventListener("mouseenter", () => showCardTip(card, renderMarkdown(w.description)));
+    card.addEventListener("mouseleave", hideCardTip);
+  }
   const head = document.createElement("div");
   const t = document.createElement("span");
   t.className = "pc-type";
@@ -984,7 +1276,96 @@ function workoutCard(w) {
   }
   card.appendChild(head); card.appendChild(title); card.appendChild(m);
   card.addEventListener("click", () => openPlanModal(w, w.planned_date));
+  card.draggable = true;
+  card.style.cursor = "grab";
+  card.addEventListener("dragstart", (e) => {
+    hideCardTip(true);
+    dragWorkout = w;
+    card.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", String(w.id));
+    try { e.dataTransfer.setDragImage(card, 20, 20); } catch (_) {}
+  });
+  card.addEventListener("dragend", () => {
+    dragWorkout = null;
+    card.classList.remove("dragging");
+    clearDragOver();
+  });
   return card;
+}
+
+function cardTipEl() {
+  let tip = document.getElementById("plan-tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "plan-tip";
+    document.body.appendChild(tip);
+  }
+  return tip;
+}
+
+function showCardTip(card, html) {
+  const tip = cardTipEl();
+  tip.innerHTML = html || "";
+  tipHovered = false;
+  tip.classList.remove("show");
+  const r = card.getBoundingClientRect();
+  const tw = tip.offsetWidth;
+  const th = tip.offsetHeight;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  let top = r.top - th - 8;
+  if (top < 8) top = r.bottom + 8;
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+  tip.classList.add("show");
+  tip.onmouseenter = () => { tipHovered = true; };
+  tip.onmouseleave = () => { tipHovered = false; };
+}
+
+function hideCardTip(immediate) {
+  if (tipHiddenTimer) clearTimeout(tipHiddenTimer);
+  const doHide = () => {
+    const tip = document.getElementById("plan-tip");
+    if (tip && !tipHovered) tip.classList.remove("show");
+  };
+  if (immediate) { doHide(); return; }
+  tipHiddenTimer = setTimeout(doHide, 120);
+}
+
+let tipHovered = false;
+let tipHiddenTimer = null;
+
+let dragWorkout = null;
+
+function clearDragOver() {
+  document.querySelectorAll(".plan-day.drag-over").forEach((el) => el.classList.remove("drag-over"));
+}
+
+function installDayDrop(day) {
+  day.addEventListener("dragover", (e) => {
+    if (!dragWorkout) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    day.classList.add("drag-over");
+  });
+  day.addEventListener("dragleave", (e) => {
+    if (!day.contains(e.relatedTarget)) day.classList.remove("drag-over");
+  });
+  day.addEventListener("dragenter", (e) => { if (dragWorkout) e.preventDefault(); });
+  day.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    clearDragOver();
+    const target = day.getAttribute("data-date");
+    const w = dragWorkout;
+    dragWorkout = null;
+    if (!w || target === w.planned_date) return;
+    try {
+      setErr($("plan-error"), "");
+      await api("/training-plan/" + w.id, {...w, planned_date: target}, "PUT");
+      loadPlan();
+    } catch (err) { setErr($("plan-error"), err.message); }
+  });
 }
 
 function openPlanModal(workout, date) {
@@ -1048,6 +1429,7 @@ async function loadReadiness() {
     const days = data.days || [];
     const today = data.today;
     if (!today) {
+      setTodayHead("readiness", "–", "");
       $("readiness-hint").classList.remove("hidden");
       chart.innerHTML = "";
       return;
@@ -1055,6 +1437,7 @@ async function loadReadiness() {
     $("readiness-hint").classList.add("hidden");
 
     const color = READINESS_COLORS[today.category] || "#fff";
+    setTodayHead("readiness", Math.round(today.score), color);
     const row = document.createElement("div");
     row.className = "readiness-score-row";
     const score = document.createElement("div");
@@ -1114,10 +1497,56 @@ async function loadReadiness() {
           .join(" · ");
       box.appendChild(foot);
     }
-    renderReadinessChart(chart, days);
+    renderTodayChart("readiness", chart, days, renderReadinessChart);
   } catch (e) {
     box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
   }
+}
+
+const TODAY_CARDS = { readiness: {}, acwr: {}, runacwr: {} };
+
+function setTodayHead(key, text, color) {
+  const el = document.getElementById(key + "-headval");
+  if (!el) return;
+  if (text == null || text === "") text = "–";
+  el.textContent = text;
+  el.style.color = color || "";
+}
+
+function todayCardOpen(key) {
+  const card = document.querySelector('.td-card[data-load="' + key + '"]');
+  return card ? card.classList.contains("open") : false;
+}
+
+function renderTodayChart(key, chart, days, render) {
+  TODAY_CARDS[key] = { chart, days, render, pending: false };
+  if (todayCardOpen(key)) {
+    render(chart, days);
+  } else {
+    TODAY_CARDS[key].pending = true;
+  }
+}
+
+let accordionsWired = false;
+
+function wireTodayAccordions() {
+  if (accordionsWired) return;
+  accordionsWired = true;
+  document.querySelectorAll(".td-card").forEach((card) => {
+    const key = card.dataset.load;
+    const head = card.querySelector(".td-head");
+    const details = card.querySelector(".td-details");
+    head.addEventListener("click", () => {
+      const opening = details.classList.contains("hidden");
+      details.classList.toggle("hidden", !opening);
+      card.classList.toggle("open", opening);
+      head.setAttribute("aria-expanded", opening ? "true" : "false");
+      if (opening) {
+        const td = TODAY_CARDS[key];
+        if (td && td.pending) { td.render(td.chart, td.days); td.pending = false; }
+      }
+    });
+  });
 }
 
 function rollingAvg(vals, win = 7) {
@@ -1192,6 +1621,7 @@ async function loadACWR() {
     const days = data.days || [];
     const today = data.today;
     if (!today) {
+      setTodayHead("acwr", "–", "");
       $("acwr-hint").classList.remove("hidden");
       chart.innerHTML = "";
       return;
@@ -1199,6 +1629,7 @@ async function loadACWR() {
     $("acwr-hint").classList.add("hidden");
 
     const color = ACWR_COLORS[today.category] || "#fff";
+    setTodayHead("acwr", Number(today.acwr).toFixed(2), color);
     const row = document.createElement("div");
     row.className = "readiness-score-row";
     const score = document.createElement("div");
@@ -1240,7 +1671,7 @@ async function loadACWR() {
       grid.appendChild(c);
     }
     box.appendChild(grid);
-    renderAcwrChart(chart, days);
+    renderTodayChart("acwr", chart, days, renderAcwrChart);
   } catch (e) {
     box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
   }
@@ -1298,6 +1729,7 @@ async function loadRunACWR() {
     const days = data.days || [];
     const today = data.today;
     if (!today) {
+      setTodayHead("runacwr", "–", "");
       $("runacwr-hint").classList.remove("hidden");
       chart.innerHTML = "";
       return;
@@ -1305,6 +1737,7 @@ async function loadRunACWR() {
     $("runacwr-hint").classList.add("hidden");
 
     const color = ACWR_COLORS[today.category] || "#fff";
+    setTodayHead("runacwr", Number(today.run_acwr).toFixed(2), color);
     const row = document.createElement("div");
     row.className = "readiness-score-row";
     const score = document.createElement("div");
@@ -1356,7 +1789,7 @@ async function loadRunACWR() {
       grid.appendChild(c);
     }
     box.appendChild(grid);
-    renderRunAcwrChart(chart, days);
+    renderTodayChart("runacwr", chart, days, renderRunAcwrChart);
   } catch (e) {
     box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
   }
@@ -1404,6 +1837,7 @@ function renderRunAcwrChart(el, days) {
 }
 
 function loadToday() {
+  wireTodayAccordions();
   loadReadiness();
   loadACWR();
   loadRunACWR();
