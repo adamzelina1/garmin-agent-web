@@ -499,7 +499,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         try:
             rows = conn.execute(
                 "SELECT calendar_date AS date, temp_max_c, temp_min_c, precip_mm, "
-                "wind_max_kmh, source "
+                "wind_max_kmh, condition_code, source "
                 "FROM weather_forecast "
                 "WHERE user_id = %s AND calendar_date >= %s AND calendar_date <= %s "
                 "ORDER BY calendar_date",

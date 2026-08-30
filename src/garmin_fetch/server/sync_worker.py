@@ -169,7 +169,7 @@ class SyncManager:
                 rate_limit_until=None,
             )
             logger.info("synced user %s: %s", user_id, counts)
-            self._refresh_weather(user_id, user, db)
+            self._refresh_weather(user_id, user)
             self._refine_start(user_id, current_start=user.get("sync_start_date"))
             self._autocomplete_plan(user_id)
             return counts
@@ -194,12 +194,13 @@ class SyncManager:
         until = _parse_iso(user.get("rate_limit_until"))
         return until is not None and until > datetime.now(timezone.utc)
 
-    def _refresh_weather(self, user_id: int, user: dict[str, Any], db: Any) -> None:
-        """Store the next 16-day forecast on the already-open sync connection.
+    def _refresh_weather(self, user_id: int, user: dict[str, Any]) -> None:
+        """Store the next 16-day forecast for the user.
 
         Best-effort tied to a sync so the training-plan calendar's forecast only
         changes when a sync runs; a failure just logs and keeps the last stored
-        forecast rather than failing the sync.
+        forecast rather than failing the sync. Opens its own connection because
+        ``sync_data`` closes the sync connection before this runs.
         """
         lat, lon = user.get("home_lat"), user.get("home_lon")
         if not lat or not lon:
@@ -208,6 +209,7 @@ class SyncManager:
                 user_id,
             )
             return
+        db = Database(self.cfg["db_url"], user_id=user_id)
         try:
             count = refresh_weather_forecast(db, float(lat), float(lon))
             if count:
@@ -219,6 +221,8 @@ class SyncManager:
             logger.warning(
                 "weather-forecast refresh failed for user %s: %s", user_id, exc
             )
+        finally:
+            db.close()
 
     def _autocomplete_plan(self, user_id: int) -> None:
         """Mark planned workouts completed against the freshly synced activities.

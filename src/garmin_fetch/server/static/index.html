@@ -504,7 +504,7 @@ function switchTab(which) {
   $("btn-register").textContent = "Create account";
 }
 
-function switchAppTab(which) {
+async function switchAppTab(which) {
   for (const b of document.querySelectorAll("#app-tabs button")) {
     b.classList.toggle("active", b.dataset.tab === which);
   }
@@ -513,7 +513,7 @@ function switchAppTab(which) {
   $("tab-plan").classList.toggle("hidden", which !== "plan");
   $("tab-settings").classList.toggle("hidden", which !== "settings");
   if (which === "today") loadToday();
-  if (which === "plan") { loadPlan(); loadBriefing(); }
+  if (which === "plan") { await loadPlan(); loadBriefing(); }
 }
 
 function switchSettingsSubTab(which) {
@@ -945,7 +945,7 @@ async function loadPlan() {
     renderPlan(data.workouts || []);
     setErr($("plan-error"), "");
   } catch (e) { setErr($("plan-error"), e.message); }
-  loadWeather(fromStr, toStr);
+  await loadWeather(fromStr, toStr);
 }
 
 function fmtWx(wx) {
@@ -954,6 +954,23 @@ function fmtWx(wx) {
   if (tMax != null && tMin != null) return tMax + "\u00B0/" + tMin + "\u00B0";
   if (tMax != null) return tMax + "\u00B0";
   return "--";
+}
+
+function wxCondition(code) {
+  if (code == null) return { sym: "", label: "" };
+  const c = Number(code);
+  if (c === 0) return { sym: "☀️", label: "Clear" };
+  if (c === 1) return { sym: "🌤️", label: "Mostly clear" };
+  if (c === 2) return { sym: "⛅", label: "Partly cloudy" };
+  if (c === 3) return { sym: "☁️", label: "Overcast" };
+  if (c === 45 || c === 48) return { sym: "🌫️", label: "Fog" };
+  if (c >= 51 && c <= 57) return { sym: "🌦️", label: "Drizzle" };
+  if (c >= 61 && c <= 67) return { sym: "🌧️", label: "Rain" };
+  if (c >= 71 && c <= 77) return { sym: "🌨️", label: "Snow" };
+  if (c >= 80 && c <= 82) return { sym: "🌧️", label: "Rain showers" };
+  if (c === 85 || c === 86) return { sym: "🌨️", label: "Snow showers" };
+  if (c >= 95) return { sym: "⛈️", label: "Thunderstorm" };
+  return { sym: "🌡️", label: "" };
 }
 
 async function loadWeather(fromStr, toStr) {
@@ -970,6 +987,7 @@ async function loadWeather(fromStr, toStr) {
   } catch (e) { return; } // no coords / forecast unavailable -> just hide weather
   const map = {};
   for (const d of days) map[d.date] = d;
+  planWeatherByDate = map;
   for (const c of cells) {
     const wx = map[c.dataset.date];
     if (!wx) continue;
@@ -979,6 +997,14 @@ async function loadWeather(fromStr, toStr) {
     wt.className = "wt";
     wt.textContent = fmtWx(wx);
     el.appendChild(wt);
+    const cond = wxCondition(wx.condition_code);
+    if (cond.sym) {
+      const wc = document.createElement("span");
+      wc.className = "wr";
+      wc.title = cond.label;
+      wc.textContent = cond.sym;
+      el.appendChild(wc);
+    }
     if (wx.precip_mm > 0) {
       const wr = document.createElement("span");
       wr.className = "wr";
@@ -989,6 +1015,8 @@ async function loadWeather(fromStr, toStr) {
     c.insertBefore(el, head.nextSibling);
   }
 }
+
+let planWeatherByDate = {};
 
 function briefingCat(score) {
   if (score >= 80) return "Prime";
@@ -1012,20 +1040,27 @@ async function loadBriefing() {
   const now = new Date();
   const today = fmt(now);
   if (localStorage.getItem("briefing_dismissed") === today) { box.classList.add("hidden"); return; }
-  let planRes, rdyRes, wxRes;
+  let planRes, rdyRes;
   try {
-    [planRes, rdyRes, wxRes] = await Promise.all([
+    [planRes, rdyRes] = await Promise.all([
       api("/training-plan?from_date=" + today + "&to_date=" + today, undefined, "GET"),
       api("/readiness", undefined, "GET"),
-      api("/weather?from_date=" + today + "&to_date=" + today, undefined, "GET"),
     ]);
   } catch (e) { box.classList.add("hidden"); return; }
+
+  let wx = planWeatherByDate[today] || null;
+  if (!wx) {
+    try {
+      const wRes = await api("/weather?from_date=" + today + "&to_date=" + today, undefined, "GET");
+      for (const d of (wRes.days || [])) planWeatherByDate[d.date] = d;
+      wx = planWeatherByDate[today] || null;
+    } catch (e2) { /* weather is optional */ }
+  }
 
   const workouts = planRes.workouts || [];
   const rdy = rdyRes.today || null;
   const score = rdy && rdy.score != null ? Number(rdy.score) : null;
   const cat = score != null ? briefingCat(score) : null;
-  const wx = (wxRes.days || [])[0] || null;
 
   box.innerHTML = "";
   const head = document.createElement("div");
@@ -1171,12 +1206,14 @@ async function loadBriefing() {
   } else {
     const wrapX = document.createElement("div");
     wrapX.className = "bf-wx";
+    const cond = wxCondition(wx.condition_code);
     const temp = document.createElement("div");
     temp.className = "bf-wxtemp";
-    temp.textContent = fmtWx(wx);
+    temp.textContent = (cond.sym ? cond.sym + " " : "") + fmtWx(wx);
     const det = document.createElement("div");
     det.className = "bf-wxrow";
     const lines = [];
+    if (cond.label) lines.push(cond.label);
     if (wx.precip_mm > 0) lines.push("Precip: " + Math.round(wx.precip_mm) + " mm");
     else lines.push("Precip: dry");
     if (wx.wind_max_kmh != null) lines.push("Wind: " + Math.round(wx.wind_max_kmh) + " km/h");

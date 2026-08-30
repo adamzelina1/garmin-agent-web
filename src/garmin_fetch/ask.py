@@ -1092,13 +1092,14 @@ class Weather:
     FORECAST_DAYS = 16
     _DAILY_FIELDS = (
         "temperature_2m_max,temperature_2m_min,precipitation_sum,"
-        "wind_speed_10m_max"
+        "wind_speed_10m_max,weather_code"
     )
     _FIELD_ALIASES = {
         "temperature_2m_max": "temp_max_c",
         "temperature_2m_min": "temp_min_c",
         "precipitation_sum": "precip_mm",
         "wind_speed_10m_max": "wind_max_kmh",
+        "weather_code": "condition_code",
     }
 
     def __init__(

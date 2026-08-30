@@ -284,6 +284,7 @@ CREATE TABLE IF NOT EXISTS weather_forecast (
     temp_min_c DOUBLE PRECISION,
     precip_mm DOUBLE PRECISION,
     wind_max_kmh DOUBLE PRECISION,
+    condition_code INTEGER,
     source TEXT,
     fetched_at TEXT,
     PRIMARY KEY (user_id, calendar_date)
@@ -330,6 +331,7 @@ _AGENT_TABLES = (
 #: (``_ensure_columns`` migration on the PG side; a brand-new PG schema already
 #: carries every column, so this only fires when a column is added later).
 _PG_MIGRATION_TYPES: dict[str, dict[str, str]] = {
+    "weather_forecast": {"condition_code": "INTEGER"},
     "activities": {
         "details_json": "TEXT",
         "details_fetched_at": "TEXT",
@@ -649,6 +651,7 @@ class Database:
         )
         self._ensure_columns("metrics", ["parsed_at"])
         self._ensure_columns("training_plan", ["completed_activity_id"])
+        self._ensure_columns("weather_forecast", ["condition_code"])
         self._ensure_columns("activities", [
             "summary_parsed_at", "details_parsed_at", "weather_parsed_at",
             "splits_json", "splits_fetched_at", "splits_parsed_at",
@@ -1451,12 +1454,13 @@ class Database:
             self._execute(
                 "INSERT INTO weather_forecast "
                 "(user_id, calendar_date, temp_max_c, temp_min_c, precip_mm, "
-                "wind_max_kmh, source, fetched_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "wind_max_kmh, condition_code, source, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     uid, row["calendar_date"], row.get("temp_max_c"),
                     row.get("temp_min_c"), row.get("precip_mm"),
-                    row.get("wind_max_kmh"), row.get("source"), row.get("fetched_at"),
+                    row.get("wind_max_kmh"), row.get("condition_code"),
+                    row.get("source"), row.get("fetched_at"),
                 ),
             )
         self.conn.commit()
@@ -1514,6 +1518,10 @@ def ensure_schema(url: str) -> None:
         backend.ensure_columns(
             conn, "training_plan", ["completed_activity_id"],
             {"completed_activity_id": "BIGINT"},
+        )
+        backend.ensure_columns(
+            conn, "weather_forecast", ["condition_code"],
+            {"condition_code": "INTEGER"},
         )
         conn.commit()
     finally:

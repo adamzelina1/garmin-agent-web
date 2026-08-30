@@ -475,6 +475,7 @@ def refresh_weather_forecast(db: Database, lat: float, lon: float) -> int:
                 "temp_min_c": day.get("temp_min_c"),
                 "precip_mm": day.get("precip_mm"),
                 "wind_max_kmh": day.get("wind_max_kmh"),
+                "condition_code": day.get("condition_code"),
                 "source": data.get("source", "forecast"),
                 "fetched_at": _now_iso(),
             }
