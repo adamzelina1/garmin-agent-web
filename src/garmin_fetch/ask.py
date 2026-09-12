@@ -37,11 +37,12 @@ from contextlib import contextmanager
 from decimal import Decimal
 from argparse import ArgumentParser, Namespace
 from datetime import date, datetime, time, timedelta
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 import psycopg
 
 from .config import load_config
+from .parser import TYPE_COLUMNS
 
 
 class _Memory(Protocol):
@@ -67,6 +68,26 @@ class _Plan(Protocol):
 
     def apply(self, spec: dict[str, Any]) -> dict[str, Any]: ...
 
+    def week_view(
+        self, week_start: str | None = None, goal_id: int | None = None
+    ) -> dict[str, Any]: ...
+
+
+class _Anchor(Protocol):
+    """The per-user long-term anchor interface (implemented by
+    ``server.state.TrainingAnchor``). An account may hold many goals; each goal
+    has its own periodised blocks, and each block may carry a repeating wave
+    (weekly microcycle) of targets. ``resolve_goal`` is the single composition
+    of the goal/block/wave resolution; ``apply`` writes one spec atomically."""
+
+    def list_goals(self) -> list[dict[str, Any]]: ...
+
+    def resolve_goal(
+        self, goal_id: int, day: str | None = None
+    ) -> dict[str, Any] | None: ...
+
+    def apply(self, spec: dict[str, Any]) -> dict[str, Any]: ...
+
 
 #: Guard a statement is a read-only query and not a write.
 _SELECT_PREFIX = re.compile(r"^\s*(?:SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
@@ -76,7 +97,7 @@ _WRITE_WORDS = re.compile(
     re.IGNORECASE,
 )
 
-_MAX_ROWS = 200
+_MAX_ROWS = 500
 
 #: Training-plan tool guardrails: by default ``get_training_plan`` returns only
 #: this window (recent past + upcoming) so a long completed history is never
@@ -85,6 +106,14 @@ _PLAN_PAST_DAYS = 30
 _PLAN_FUTURE_DAYS = 180
 _PLAN_MAX_WORKOUTS = 200
 
+#: Approximate token budget for a stored conversation. When a session's history
+#: (system prompt + every prior turn, including raw tool results) grows past this
+#: it is folded into a compact summary so the next request stays cheap. The
+#: static system prompt is re-sent on *every* request regardless (chat APIs are
+#: stateless), so this is the real lever for long conversations. A rough 4
+#: chars/token estimate is used — the budget is a trigger, not a precise count.
+_AUTO_COMPACT_MAX_TOKENS = 200000
+
 #: Tables the agent may see and query. Everything else (raw ``metrics``,
 #: ``activities``, ``user_profile``, ``sync_state``) stays invisible to the
 #: model — and, at the database level, unreadable by the agent's SELECT-only
@@ -92,31 +121,59 @@ _PLAN_MAX_WORKOUTS = 200
 _ALLOWED_TABLES = (
     "daily_metrics", "activity_summaries", "activity_detail_series",
     "activity_splits", "hr_zones", "power_zones", "race_predictions", "gear",
-    "devices", "derived_metrics", "training_plan",
+    "devices", "derived_metrics", "training_plan", "training_goal",
+    "training_block", "training_wave", "weather_forecast",
 )
 
-#: Data-driven schema annotations: table-level notes and per-column unit/semantic
-#: hints. ``_schema_text`` generates the agent-facing schema from these plus the
-#: live columns, so a schema change needs at most one dict entry here — never a
+#: Data-driven schema annotations: table-level overviews and per-column
+#: unit/semantic hints. ``_schema_text`` renders the agent-facing *table
+#: overview* from ``_TABLE_NOTES`` (the prompt deliberately lists NO columns —
+#: those are fetched dynamically via ``table_schema``, so auto-created columns
+#: are always picked up); ``_COLUMN_DOCS`` feeds ``table_schema``'s per-column
+#: descriptions. A schema change needs at most one dict entry here — never a
 #: prose edit that can drift out of sync.
 _TABLE_NOTES: dict[str, str] = {
-    "daily_metrics": "one row per calendar_date (YYYY-MM-DD)",
-    "activity_summaries": "one row per activity",
-    "activity_detail_series": (
-        "one row per tick (activity_id + tick); prefer aggregate/interval "
-        "queries; a metric may be NULL on every tick if the device didn't record it"
+    "daily_metrics": (
+        "one row per calendar_date (YYYY-MM-DD). The day's core health + "
+        "activity scalars: sleep stages/score/duration, resting/max/min HR, HRV, "
+        "stress, respiration, SpO2, steps, intensity minutes, body battery, "
+        "VO2max, lactate threshold, sweat loss, weight/body composition. Wide "
+        "table — never SELECT *; pick columns."
     ),
-    "activity_splits": "one row per split (activity_id + split_type + split_number)",
-    "hr_zones": "configured HR zone boundaries, one row per sport; current snapshot",
-    "power_zones": "configured power zones (watts) + FTP, one row per sport; current snapshot",
-    "race_predictions": "single current-fitness snapshot",
-    "gear": "one row per item; current snapshot (each sync replaces it)",
-    "devices": "one row per device; current snapshot",
+    "activity_summaries": (
+        "one row per activity: type, start time, duration/elapsed/moving, "
+        "distance, speed, running pace, HR avg/max + time-in-zone, power, "
+        "cadence, respiration, calories, training load, elevation, per-activity "
+        "weather"
+    ),
+    "activity_detail_series": (
+        "one row per intra-activity tick (activity_id + tick): HR, cadence, "
+        "power, speed, elevation, cumulative distance, respiration. Prefer "
+        "aggregate/interval queries; a metric may be NULL on every tick if the "
+        "device didn't record it"
+    ),
+    "activity_splits": (
+        "one row per split/lap (activity_id + split_number): distance, duration, "
+        "pace, start time, HR/power/cadence, elevation gain (work vs rest)"
+    ),
+    "hr_zones": (
+        "configured HR zone boundaries (zone1..zone5 min/max) + training method, "
+        "one row per sport; current snapshot"
+    ),
+    "power_zones": (
+        "configured power zones (watts) + functional threshold power, one row per "
+        "sport; current snapshot"
+    ),
+    "race_predictions": "single current-fitness snapshot of 5k/10k/half/marathon finish times",
+    "gear": "one row per equipment item (type, name, cumulative distance, activity count, last use, retired); current snapshot",
+    "devices": "one row per Garmin device (model name); current snapshot",
     "derived_metrics": (
         "one row per (calendar_date, metric); daily derived scores recomputed "
         "and stored each sync. metric = 'readiness' (0-100 score) with "
-        "readiness_hrv/readiness_rhr/readiness_sleep (raw values), "
-        "readiness_z_hrv/readiness_z_rhr/readiness_z_sleep (z-scores), "
+        "readiness_hrv (ms) / readiness_rhr (bpm) raw values, readiness_sleep "
+        "(hours asleep) + readiness_sleep_quality (restorative deep+rem share, "
+        "0-1), readiness_z_hrv/readiness_z_rhr/readiness_z_sleep (z-scores; the "
+        "sleep z blends duration and quality), "
         "readiness_composite, readiness_samples_hrv/rhr/sleep; 'acwr' (ratio) "
         "with acwr_acute_load / acwr_chronic_load / acwr_daily_load. "
         "RUNNING-SPECIFIC (running activities only, so cycling/swimming cannot "
@@ -128,7 +185,34 @@ _TABLE_NOTES: dict[str, str] = {
         "qualifier Form Up/Stable/Form Dropping/Breaking Down. Pivot with "
         "WHERE metric = '<name>' (a day's components share its calendar_date)"
     ),
-    "training_plan": "planned workouts; READ-ONLY via SQL — write only through the plan tools",
+    "training_plan": (
+        "planned workouts; READ-ONLY via SQL — write only through the plan tools. "
+        "goal_id/block_id link a workout to the long-term anchor. status is "
+        "planned/completed/partial/skipped (completed boolean is derived from it); "
+        "target_* columns hold the prescribed pace/HR-zone/power"
+    ),
+    "training_goal": (
+        "one row per long-term goal/target (an event such as a marathon or a "
+        "half-marathon); an account may hold many. read-only via SQL — write only "
+        "through the anchor tool. notes holds free-form plan content"
+    ),
+    "training_block": (
+        "one row per periodized phase of a goal: name/focus/notes are free text, "
+        "start_date/end_date MAY be NULL (undated block); "
+        "read-only via SQL — write only through the anchor tool"
+    ),
+    "training_wave": (
+        "one row per (block_id, week_index): the built-in weekly microcycle / wave "
+        "target for a block — distance_km and/or duration_min, optional intensity "
+        "intent and is_deload flag, 1-based week_index relative to the block start. "
+        "The block's waves REPEAT (cycle) for longer blocks, so a 4-week "
+        "[50,55,60,45km] deload wave re-tunes a 12-week season. "
+        "read-only via SQL — write only through the anchor tool"
+    ),
+    "weather_forecast": (
+        "stored daily Open-Meteo weather forecast refreshed each sync (calendar_date, "
+        "temp_max_c, temp_min_c, precip_mm, wind_max_kmh, condition_code WMO integer)"
+    ),
 }
 
 #: Per-column hints for columns whose unit or meaning is non-obvious. Keyed by
@@ -140,7 +224,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "sleep_end_local": "wall-clock HH:MM",
         "sleep_score": "0-100",
         "hrv_last_night_avg": "HRV score (ms)",
-        "vo2max": "precise VO2max estimate, forward-filled",
+        "vo2max": "precise VO2max estimate; Garmin's most-recent value, already populated daily",
         "resting_hr": "bpm; no 7-day avg stored — compute rolling averages yourself",
         "lactate_threshold_hr": "bpm, forward-filled",
         "lactate_threshold_speed_kmh": "km/h, forward-filled",
@@ -217,19 +301,60 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "activity_type": "run/cycle/swim/strength/rest/other",
         "duration_min": "planned minutes",
         "distance_km": "planned km",
+        "target_pace_min_km": "prescribed running pace as DECIMAL min/km (5.5 = 5:30)",
+        "target_hr_zone": "prescribed HR zone/target, free text (e.g. 'Z2' or '140-150')",
+        "target_power_w": "prescribed power in watts (int)",
+        "status": "planned/completed/partial/skipped; 'partial' and 'completed' both count as done",
+        "goal_id": "training_goal.id the workout anchors to",
+        "block_id": "training_block.id (phase) the workout belongs to",
         "completed_activity_id": (
             "activity_summaries.activity_id that satisfied it — join for actual stats"
         ),
+    },
+    "training_goal": {
+        "sport": "free text; the goal's discipline",
+        "event_type": "free text; target event (marathon/half/5k/tri...)",
+        "target_date": "YYYY-MM-DD; the event/race day, may be NULL",
+        "target_time": "free text goal finish time (e.g. 3:45:00)",
+        "notes": "free-form plan content (rationale, philosophy)",
+        "target_id": "optional opaque external id (unused by the app)",
+        "meta": "optional opaque JSON blob (unused by the app)",
+    },
+    "training_block": {
+        "name": "free text phase label (Base/Build/Peak/Taper or any custom name)",
+        "focus": "free text training focus",
+        "start_date": "YYYY-MM-DD, may be NULL (undated block)",
+        "end_date": "YYYY-MM-DD, may be NULL (undated block); must be on/after start_date",
+        "notes": "free-form block content (weekly volume intentions, rationale, prescriptions)",
+        "meta": "optional opaque JSON blob (unused by the app)",
+    },
+    "training_wave": {
+        "week_index": "1-based position in the microcycle (1..N, contiguous); the wave pattern cycles for longer blocks",
+        "distance_km": "target km for this week (NULL if only time is tracked)",
+        "duration_min": "target minutes for this week; careful about per-week totals vs a single session",
+        "intensity": "free-text intensity intent for the week (e.g. 'easy volume', '2 quality sessions')",
+        "is_deload": "true when this week is a planned recovery/deload week",
+        "notes": "free-text intent for this week (key session, deload, ...)",
+    },
+    "weather_forecast": {
+        "calendar_date": "YYYY-MM-DD",
+        "temp_max_c": "degC",
+        "temp_min_c": "degC",
+        "precip_mm": "mm",
+        "wind_max_kmh": "km/h",
+        "condition_code": "WMO weather condition code (0=clear, 1-3=cloudy, 51-67=rain, 71-77=snow)",
     },
 }
 
 #: The agent's system prompt, rendered as one structured Markdown document so the
 #: routing and formatting guidance reads clearly. Two values are injected:
-#:   * ``{schema_text}`` — the live per-user schema from ``_schema_text``, filled
-#:     ONCE when the agent is built (the schema is static for the agent's life).
-#:   * today's date — NOT this template: it comes from ``_current_date_prompt``
-#:     (below), a module-level *dynamic* prompt re-evaluated on every turn so a
-#:     cached agent or a resumed session can never keep a stale date.
+#:   * ``{overview_text}`` — the per-user *table overviews* from ``_schema_text``
+#:     (table-level descriptions only, NO columns), filled ONCE when the agent is
+#:     built. Columns are introspected on demand via the ``table_schema`` tool.
+#:   * today's date + data freshness — NOT this template: it comes from
+#:     ``_current_date_prompt`` (below), a *dynamic* prompt re-evaluated on every
+#:     turn so a cached agent or a resumed session can never keep a stale date
+#:     or answer "today" questions from days-old rows.
 #: The template contains literal JSON braces (``{"sql": ...}``) in the chart
 #: guidance, so it is filled with ``str.replace``, never ``str.format``.
 _PROMPT_TEMPLATE = """\
@@ -238,128 +363,157 @@ _PROMPT_TEMPLATE = """\
 You are an expert sports scientist and data analyst with read-only access to the
 user's personal Garmin health and fitness database (PostgreSQL).
 
-- **Access Level:** Read-only queries via SQL (`run_sql`). Write access is
-  strictly limited to two areas: long-term memory (`remember_memory`) and the
-  training plan (`update_training_plan`). Everything else is inspected, never
-  written.
+- **Access Level:** Read-only SQL (`run_sql`). Writes are limited to long-term
+  memory (`remember_memory`) and the planning tools when they are available.
+- **Be genuinely helpful:** give thorough, accurate, insight-driven answers the
+  user can act on. Connect metrics, flag trends, anomalies and relationships, and
+  add concise context rather than just returning raw numbers.
 
 ---
 
 # Database & SQL Guidelines
 
-The schema is provided below. Do NOT call `table_schema` unless a query fails due
-to a missing column.
+Only a high-level overview of each table is listed below — no columns, so the
+prompt stays lean. Call `table_schema` before querying a table to see its live
+columns and a short description of each, then SELECT only what you need.
 
-{schema_text}
+{overview_text}
 
-### Query Rules:
-1. **Dialect:** PostgreSQL. Use Postgres-specific date/time functions (e.g.
-   `DATE_TRUNC('week', date)`, `INTERVAL '7 days'`).
-2. **Never `SELECT *`:** Select only the specific columns needed for the answer
-   (daily_metrics is ~60 columns wide, activity_summaries ~58).
-3. **Aggregations & Limits:** Result sets are capped at 200 rows. Always
-   aggregate raw rows (GROUP BY week, month, sport) and `ORDER BY` time columns
-   chronologically. Use `LIMIT 10` for exploratory probes before a full query.
-4. **Handle NULLs & Zero-Division:** Almost every column may be NULL on days/rows
-   where the value is N/A; only use aggregate functions over the rows you have.
-   Wrap denominators with `NULLIF(col, 0)` to prevent division errors.
-5. **Day Summary Shortcut:** For single-day reviews ("how was my day on X?"), call
-   `get_day_summary(YYYY-MM-DD)` instead of running multi-table SQL — it returns
-   the whole per-day bundle in one call without a ~60-column dump. For everything
-   else, write the SQL yourself; there are no ready-made query tools or shortcuts.
+### Core Columns Quick Reference (common columns — write SQL immediately without calling table_schema):
+- **daily_metrics**: `calendar_date`, `resting_hr` (bpm), `hrv_last_night_avg` (ms), `sleep_score` (0-100), `sleep_time_hours` (hours), `vo2max`, `total_steps`, `total_distance_m` (METRES, not km!), `body_battery_max/min`, `stress_avg`, `weight_kg`
+- **activity_summaries**: `activity_id`, `activity_name`, `activity_type` (running, cycling, ...), `start_date`, `duration_hours`, `distance_km` (KM), `avg_hr`, `max_hr`, `pace_min_km` (decimal min/km; 5.5 = 5:30), `avg_cadence` (PER LEG; 2x for total spm), `avg_power_w`, `training_load`, `elevation_gain_m`, `weather_temp_c`
+- **derived_metrics**: `calendar_date`, `metric` ('readiness', 'acwr', 'run_acwr', 'run_cadence_drift'), `value`, `qualifier`
+- **weather_forecast**: `calendar_date`, `temp_max_c`, `temp_min_c`, `precip_mm`, `wind_max_kmh`, `condition_code`
+Call `table_schema` only when you need other columns or want to inspect a table's full schema.
 
----
-
-# Tool Usage Guidelines
-
-### 1. Vision & Self-Inspection (`see`)
-- Use `see` to inspect distributions, anomalies, relationships, and multi-week
-  trendlines as an image.
-- **Goal:** synthesize visual patterns (drifts, clusters, regime shifts, changes
-  in trend) into qualitative insights you could only see — don't just restate the
-  raw numbers (the tool also returns the data, so you can still quote exact
-  values).
-- Do not call `see` for simple single-point lookups, and do not show the user the
-  figure — it is for your eyes only.
-
-### 2. Visualization for the User (`chart`)
-- When asked for a chart, build a valid JSON spec:
-  `{"sql": "SELECT ...", "traces": [{...}], "layout": {"title": {"text": "..."}}}`.
-  The `sql` must return the plotted data itself (column names in the traces
-  reference its result). Each trace names a plotly.graph_objects class via `go`
-  ("Scatter", "Scattergl", "Violin", "Heatmap", "Pie", "Bar", "Candlestick") or
-  the compact aliases line / scatter / area / bar / pie / histogram / box. Data
-  columns are referenced by name in x / y / z, and any other numeric trace
-  argument can reference a column as `{"column": "<name>"}`. Keep points to at
-  most ~200 by aggregating (GROUP BY week/month/weekday) and ORDER BY time.
-- Send the spec to `chart` for validation. On `"OK: <spec>"`, embed the spec
-  **verbatim** (the object after `OK: `) inside `<chart> ... </chart>` tags, with
-  a single descriptive sentence. Do NOT paste query data or Python code — only
-  the spec.
-
-### 3. Weather (`weather`)
-- Stored activities already contain historical weather in `activity_summaries`
-  (`weather_temp_c`, `weather_apparent_c`, `weather_humidity`, `weather_wind_kmh`,
-  `weather_description`) — prefer those columns whenever the question is about
-  weather at the time/location of a stored activity.
-- Use `weather` only for: (a) forecast data (up to 16 days ahead), (b) historical
-  weather for days with no activity (e.g. correlate a restless night with the
-  temperature), or (c) explicit coordinate lookups (`lat`/`lon`). It is never a
-  substitute for a database value: exact answers must still come from the tables.
-
-### 4. Long-Term Memory (`get_memory`, `remember_memory`)
-- Call `get_memory()` when personal/lifestyle context may matter.
-- Call `remember_memory(key, value)` to store user-volunteered facts (goals,
-  preferences, habits, injuries, equipment) — short lowercase keys, concise
-  values. Overwrite a key when a fact changes; skip ephemeral or one-off details.
-- **NEVER** store metrics derived from the database (VO2max, FTP, LTHR, PRs, race
-  predictions, HR zones, resting HR/HRV). Those must always be queried fresh.
-
-### 5. Training Plans (`get_training_plan`, `update_training_plan`)
-- When creating or modifying a plan, derive target paces/zones from recent
-  database metrics (weekly volume, HR zones, race predictions, VO2max) so it is
-  sensible and specific to the user. Dates are YYYY-MM-DD; activity_type is
-  run/cycle/swim/strength/rest/other; intensity is easy/moderate/hard/race_pace.
-  Pass `"replace": true` for a brand-new plan (so stale workouts clear first).
-- **Rendering rule:** when showing the plan, **NEVER** format JSON or build a
-  markdown table of workouts. Instead embed the UI marker:
-  `<plan_table />` (or `<plan_table from="YYYY-MM-DD" to="YYYY-MM-DD" />`); the
-  UI renders it from the database exactly like the Training Plan tab. Keep your
-  narrative answer short.
+### Query rules
+1. PostgreSQL dialect: use `DATE_TRUNC`, `INTERVAL '7 days'`, etc.
+2. Never `SELECT *`; pick only the columns you need.
+3. Results are capped at 100 rows — aggregate (GROUP BY week/month/sport) and
+   `ORDER BY` time columns chronologically; `LIMIT 10` to probe first.
+4. Almost any column may be NULL when a value is N/A; aggregate over the rows you
+   have and wrap denominators in `NULLIF(col, 0)`.
+5. For a single day ("how was my day on X?"), call `get_day_summary(YYYY-MM-DD)`
+   instead of multi-table SQL — it returns the whole day in one call. Otherwise
+   write the SQL yourself.
+6. Date-like columns (`calendar_date`, `start_date`, `start_time_local`,
+   `sleep_start_local`, `sleep_end_local`, …) are stored as TEXT in
+   `'YYYY-MM-DD'` / `'HH:MM'` form — you cannot pass them straight to
+   `DATE_TRUNC`/`EXTRACT` (that throws "function date_trunc(unknown, text) does
+   not exist"). Cast with `::date` first (`calendar_date::date`) or compare
+   ranges lexicographically (`'2026-08-01' <= calendar_date <= '2026-08-31'`).
+   Check a column's exact name via `table_schema` before writing SQL if unsure —
+   a wrong name fails the whole query.
+7. Explore freely. Start with a small `LIMIT` to check a table's shape, then
+   refine. Running a corrective or additional query is fine — accuracy matters
+   more than query count.
 
 ---
 
-# Output & Domain Conventions
+# Tool usage
 
-1. **Always include units:** append appropriate units to every metric (e.g.
-   `7.6 hours`, `52 ml/kg/min`, `154 bpm`, `245 W`).
-2. **Running Pacing:** convert running speeds to pace (`MM:SS /km` or
-   `MM:SS /mi`) rather than raw `km/h`. Formula: `Pace (min/km) = 60 / speed_kmh`.
-   Give pace as the headline for running questions (include the speed too if
-   useful).
-3. **Durations:** format activity durations as `HH:MM:SS` or `Xh Ym` instead of
-   raw total seconds.
-4. **Running vs. general ACWR + form.** The general `acwr` uses `training_load`
-   (a heart-rate proxy) across ALL activities, so cycling/swimming/running all
-   raise it and it cannot see tissue stress. `run_acwr` is the running-isolated
-   counterpart: the same 7d/28d ratio but built from running distance only.
-   `run_cadence_drift` is a separate, pace-normalised gauge of mechanics: a
-   negative z-score means fewer steps/min than the user normally takes at that
-   pace (overstriding), which raises impact on shins/knees/patellar tendon. When
-   the user asks about running volume or progression, prefer `run_acwr`; when
-   they mention leg/joint/tendon aches or "form breaking down", look at
-   `run_cadence_drift` (persistently negative = form deteriorating under
-   fatigue). A high `run_acwr` with a modest general `acwr` means cross-training
-   is masking a running-volume spike. Always read both fresh from
-   `derived_metrics`; never assume readiness equals running tolerance; give pace
-   (`MM:SS /km`) for running questions.
-5. **Column Unit Reference:**
-   - `*_kmh`: km/h | `*_m`: meters | `*_w`: watts | `*_hours`: hours | `*_min`: minutes
-   - `*_c`: degC | `*_ml`: ml | `*_kcal`: kcal | `*_pct`: percentage (0–100)
-   - Heart rate: bpm | Cadence: running = steps/min PER LEG (single foot, ~80-90;
-     TOTAL both-feet cadence = 2x the stored value — quote the 2x number when
-     reporting cadence) · cycling/rowing = rpm | Stress & Body
-     Battery: 0–100 scale
+- **`get_metric_trend(metric, days=30)`** — high-level shortcut for core metric
+  trends (readiness, acwr, run_acwr, run_cadence_drift, sleep_score, resting_hr,
+  hrv_last_night_avg, vo2max, total_steps, etc.). Computes min, max, avg, and
+  trend change in one call without writing SQL.
+- **`get_recent_activities(sport=None, days=30, limit=10, date_start=None, date_end=None)`** —
+  high-level
+  shortcut for recent activities. Automatically formats pace (MM:SS /km), 2x
+  total running cadence, duration, elevation, and load so you don't have to write
+  multi-column SQL or do pace math. Pass `date_start`/`date_end` (Y-M-D) to scope
+  to an explicit date range instead of a trailing window.
+- **Query freely.** It's cheap and safe to run multiple queries — probe,
+  iterate, and dig into the data before answering. Don't over-optimize for a few
+  tool calls; run whichever queries help you get an accurate, well-grounded
+  answer. `get_day_summary` is just a convenient one-call shortcut for a single
+  day, not a restriction — you're welcome to write your own SQL.
+- **`chart`** — when asked for a chart, build a spec
+  `{"sql": "...", "traces": [...], "layout": {"title": {"text": "..."}}}` whose
+  `sql` returns the data; the `chart` tool validates it. On `"OK: <spec>"`, embed
+  the spec verbatim in `<chart> ... </chart>` with one descriptive sentence (do
+  NOT paste query data or Python). Trace columns are referenced by name in
+  x/y/z or `{"column": "<name>"}`; aggregate to ≤200 points.
+- **`weather`** — prefer the historical weather columns on `activity_summaries`
+  when it's about a stored activity. Use `weather` only for a forecast, a day
+  with no activity, or explicit lat/lon. Never a substitute for a stored value.
+- **`get_memory` / `remember_memory`** — store user-volunteered facts (goals,
+  preferences, habits, injuries, equipment) with short lowercase keys; overwrite
+  on change. NEVER store database-queryable metrics (VO2max, FTP, LTHR, PRs,
+  zones, resting HR/HRV) — query those fresh.
+{plan_tools}
+{anchor_tools}
+{week_tools}
+
+---
+
+# Output conventions
+
+1. Always include units (`7.6 hours`, `154 bpm`, `245 W`).
+2. Give running as pace (`MM:SS /km`, from `60 / speed_kmh`), not km/h; lead with it.
+3. Durations as `HH:MM:SS` or `Xh Ym`.
+4. Cadence: the stored value is running steps/min PER LEG — total both-feet
+   cadence is 2x (quote the 2x); cycling/rowing is rpm.
+5. ACWR vs running form: general `acwr` uses training load across ALL activities
+   and can't see tissue stress — prefer `run_acwr` (foot-strike volume) for
+   running load, and `run_cadence_drift` (negative = overstriding) when the user
+   mentions leg/joint/tendon aches or form breaking down. Read both fresh from
+   `derived_metrics`; never assume readiness equals running tolerance.
+6. Present numbers, units and ranges as plain text, not LaTeX. Write
+   `20 km/wk → 75–78 km/wk`, `154 bpm`, `MM:SS /km` directly. Do NOT emit
+   math markup such as `$...$`, LaTeX text commands or fraction notation —
+   those render as raw text in the chat. Only use `$...$` for an actual
+   formula, and keep it short.
+"""
+
+#: The training-plan bullet of the system prompt, injected via ``{plan_tools}``
+#: (omitted when the entry point does not pass a plan store).
+_PLAN_TOOLS_GUIDE = """\
+- **`get_training_plan` / `update_training_plan`** — the dated workouts. Derive
+  target paces/zones from recent metrics (volume, HR zones, race predictions,
+  VO2max) and store them ON the workout: `target_pace_min_km` (decimal min/km,
+  5.5 = 5:30/km), `target_hr_zone`, `target_power_w`. Dates are YYYY-MM-DD;
+  activity_type run/cycle/swim/strength/rest/other; intensity
+  easy/moderate/hard/race_pace; status planned/completed/partial/skipped. A
+  workout with an `id` is PATCHed (send only what changes); one without creates.
+  Destructive specs (`replace`, `delete_ids`, `delete_range`) snapshot first and
+  are restorable with `undo: true`. Prefer
+  `shift` ({days, from, to}) or `repeat_week` ({week_start, weeks}) over
+  enumerating workouts, and `detail: false` (the default) over dumping long
+  lists. When showing a plan, embed `<plan_table />` (or
+  `<plan_table from="..." to="..." />`); never format JSON or a markdown table.
+"""
+
+#: The one-call week-view bullet, injected via ``{week_tools}``. It needs BOTH a
+#: plan store (the planned workouts) and an anchor store (the resolved wave
+#: target), so an entry point that wires only one of them omits it instead of
+#: advertising a tool that would answer with an error.
+_WEEK_TOOLS_GUIDE = """\
+- **`get_training_week(week_start?)`** — one call for "how is my week going?":
+  the covering block + its resolved wave target, the planned workouts and the
+  actual activities. Prefer this over assembling the anchor + plan + SQL
+  yourself.
+"""
+
+#: The long-term-anchor bullet of the system prompt, injected via
+#: ``{anchor_tools}``. Kept as its own constant so an entry point that does NOT
+#: pass an anchor store can omit the guidance instead of advertising a tool the
+#: model does not have.
+_ANCHOR_TOOLS_GUIDE = """\
+- **`get_training_anchor` / `update_training_anchor`** — the long-term plan the
+  daily/weekly plan derives from. Call `get` BEFORE building or reshaping a week:
+  it returns ALL goals (event, target date/time), each with its blocks, each
+  block's `waves` (the repeating weekly microcycle, e.g. 50/55/60/45km deload),
+  the `current_block` and the resolved `weekly_target` for the requested day. An
+  account may hold several goals — pick the one the plan belongs to by `goal_id`.
+  To change one phase, send ONLY that block with its `id` in `blocks` (upsert;
+  block ids and calendar links stay stable). `replace_blocks` rebuilds the whole
+  season and `delete_blocks`/`delete_goal_ids` delete — all destructive but
+  snapshotted, so `undo: true` restores the last such edit. Mark recovery weeks
+  with `is_deload: true`. Block dates are optional:
+  back-schedule from the event date when known, otherwise leave them blank. Use
+  each block's `notes` for weekly volume intentions and workout content the UI
+  echoes on hover. When the user sets a new target, reshape the anchor and
+  re-derive the near-term plan.
 """
 
 #: The date note, emitted by the module-level *dynamic* system prompt. Kept as its
@@ -371,6 +525,28 @@ that depends on NOW — "today", "tomorrow", "this week", "last Monday" — call
 `today` tool and trust its result: it is the authoritative current date and its
 weekday is already computed for you.
 """
+
+#: Appended to the date note when the store is behind today. Kept as its own
+#: template (not merged into ``_TODAY_PROMPT``) so the freshness report can be
+#: dropped entirely when the data is current or there is none yet — the model
+#: is never told a precise gap that does not exist.
+_STALENESS_PROMPT = """\
+# Data freshness
+
+The most recent date with stored data is {data_until}, which is {gap} day(s) behind
+today. For any question that is about NOW — "today", "last night", "this week",
+"current" or "most recent" form — never present a value from {data_until} or earlier
+as if it were today's. If the user asks about a window that extends beyond
+{data_until}, say explicitly that the data is only up to {data_until} ({gap} day(s)
+stale) and reason about the trend instead of inventing a value for the missing days.
+"""
+
+#: Stable identity of the date+freshness dynamic system prompt. Pydantic AI keys
+#: a dynamic prompt by ``func.__qualname__`` and re-evaluates a resumed
+#: ``SystemPromptPart`` only when its ``dynamic_ref`` equals that key, so this is
+#: pinned to a constant (rather than a ``build_agent.<locals>`` name that would
+#: drift) to keep ``_refresh_resumed_prompt`` able to re-stamp persisted history.
+_DATE_PROMPT_REF = "garmin_fetch.ask.dynamic_date_prompt"
 
 #: The long-term-memory note, also a *dynamic* system prompt (registered as a
 #: closure in ``build_agent`` so it can read the per-agent ``memory`` and be
@@ -604,242 +780,6 @@ def _build_chart_figure(
     return fig
 
 
-def _infer_series(result: dict[str, Any]) -> dict[str, list[str]]:
-    """Guess an x column and the y columns to plot for a raw query result.
-
-    Used by the ``see`` context tool, which does not have a hand-written Plotly
-    spec. Prefers a date-like column for x (a trend over time) and plots every
-    remaining numeric column. Falls back to index-based x when nothing is
-    date-like or numeric.
-    """
-    columns = result.get("columns") or []
-    rows = result.get("rows") or []
-    if not columns:
-        return {"x": "", "y": []}
-    _DATE_HINTS = ("date", "day", "year", "month", "week", "time")
-
-    def _numeric(col: str) -> bool:
-        i = columns.index(col)
-        vals = [r[i] for r in rows if r[i] is not None and r[i] != ""]
-        if not vals:
-            return False
-        try:
-            for v in vals:
-                float(v)
-        except (TypeError, ValueError):
-            return False
-        return True
-
-    def _date_like(col: str) -> bool:
-        """True when a column's values look like dates (name hint or values)."""
-        if any(h in col.lower() for h in _DATE_HINTS):
-            return True
-        i = columns.index(col)
-        for r in rows:
-            v = r[i]
-            if v is None or v == "":
-                continue
-            s = str(v)
-            if re.match(r"^\d{4}-\d{2}-\d{2}", s):
-                return True
-        return False
-
-    def _row_index(col: str) -> bool:
-        """True when a column is just a sequential row number (0..N-1 or 1..N).
-
-        The model often returns ``row_number`` alongside its metric when it
-        works around a missing date column; plotting it adds a meaningless
-        second series, so it is skipped here. Requiring the sequence to start
-        at 0 or 1 avoids flagging a real metric that merely steps by one.
-        """
-        i = columns.index(col)
-        nums: list[int] = []
-        for r in rows:
-            try:
-                nums.append(int(r[i]))
-            except (TypeError, ValueError):
-                return False
-        if len(nums) < 2:
-            return False
-        start = nums[0]
-        if start not in (0, 1):
-            return False
-        return all(nums[k] == start + k for k in range(len(nums)))
-
-    x_col = next((c for c in columns if _date_like(c) and not _numeric(c)), "")
-    y_cols = [c for c in columns if c != x_col and _numeric(c) and not _row_index(c)]
-    if y_cols:
-        return {"x": x_col, "y": y_cols}
-    # No numeric y column fell out: if nothing is date-like, plot all non-x, and
-    # if only one column exists, plot it against an implicit index.
-    if not x_col:
-        y_cols = columns[1:] or columns
-    return {"x": x_col, "y": y_cols}
-
-
-def _render_series_png(
-    result: dict[str, Any], kind: str = "line"
-) -> bytes:
-    """Render a raw query result (columns+rows) to PNG without a Plotly spec.
-
-    This backs the ``see`` tool so the model can visually inspect whatever data
-    it queried — a trend, a distribution, a relationship — and extract context
-    about the user. ``kind`` is one of ``line``/``area``/``scatter``/``bar``/
-    ``histogram``/``box``. Raises ``ValueError`` with a model-facing message if
-    the result cannot be plotted.
-    """
-    import io
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    columns = result.get("columns") or []
-    rows = result.get("rows") or []
-    if not rows or not columns:
-        raise ValueError("the query returned no rows to plot")
-    kind = (kind or "line").lower()
-    if kind not in ("line", "area", "scatter", "bar", "histogram", "box"):
-        raise ValueError(f"kind must be line/area/scatter/bar/histogram/box, not {kind!r}")
-
-    series = _infer_series(result)
-    x_col = series["x"]
-    y_cols = series["y"]
-    if not y_cols:
-        raise ValueError("the query returned no numeric column to plot")
-
-    def _col(c: str) -> list[Any]:
-        return [r[columns.index(c)] for r in rows]
-
-    fig, ax = plt.subplots(figsize=(9, 4.4), dpi=110)
-
-    def _floats(vals: list[Any]) -> list[float]:
-        out = []
-        for v in vals:
-            try:
-                out.append(float(v))
-            except (TypeError, ValueError):
-                pass
-        return out
-
-    def _parse_x(v: Any) -> Any:
-        """Coerce an x value to a plottable date/float, or None if unparseable."""
-        if v is None or v == "":
-            return None
-        s = str(v).strip()
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-            try:
-                return date.fromisoformat(s)
-            except ValueError:
-                return None
-        if re.match(r"^\d{4}-\d{2}-\d{2}[T ]", s):
-            try:
-                return datetime.fromisoformat(s)
-            except ValueError:
-                return None
-        try:
-            return float(s)
-        except (TypeError, ValueError):
-            return None
-
-    def _series(col: str) -> tuple[list[Any], list[float]]:
-        """Aligned (x, y) pairs for one y column, skipping non-numeric rows.
-
-        When ``x_col`` is date-like the x values are parsed to real dates (so a
-        time series plots on a date axis instead of crashing); otherwise x is a
-        running index. x and y are always the same length, so every series plots
-        without a dimension mismatch.
-        """
-        i = columns.index(col)
-        xs: list[Any] = []
-        ys: list[float] = []
-        for r in rows:
-            yv = r[i]
-            if yv is None or yv == "":
-                continue
-            try:
-                yf = float(yv)
-            except (TypeError, ValueError):
-                continue
-            if x_col:
-                xv = _parse_x(r[columns.index(x_col)])
-                if xv is None:
-                    continue
-            else:
-                xv = len(xs)
-            xs.append(xv)
-            ys.append(yf)
-        return xs, ys
-
-    if kind in ("histogram", "box"):
-        col = y_cols[0]
-        vals = _floats(_col(col))
-        if not vals:
-            plt.close(fig)
-            raise ValueError(f"column {col!r} has no numeric values to plot")
-        if kind == "histogram":
-            ax.hist(vals, bins="auto", edgecolor="black", alpha=0.75)
-        else:
-            ax.boxplot(vals, vert=True)
-            ax.set_xticklabels(["all"])
-        ax.set_xlabel(col)
-    else:
-        if kind == "bar":
-            ax.clear()
-            width = max(0.6, 0.8 / max(len(y_cols), 1))
-            offset = -0.4 + width / 2
-            labels: list[str] = []
-            for k, col in enumerate(y_cols):
-                xs, ys = _series(col)
-                if not ys:
-                    continue
-                lab = [str(v) for v in xs]
-                if not labels:
-                    labels = lab
-                ticks = range(len(lab))
-                ax.bar([t + offset + k * width for t in ticks], ys,
-                       width=width, label=col)
-                ax.set_xticks(list(ticks))
-                ax.set_xticklabels(lab, rotation=45, ha="right", fontsize=8)
-        else:
-            for col in y_cols:
-                xs, ys = _series(col)
-                if not ys:
-                    continue
-                ax.plot(xs, ys, marker="o", markersize=4, label=col,
-                        linestyle="" if kind == "scatter" else "-")
-                if kind == "area":
-                    ax.fill_between(xs, ys, min(ys), alpha=0.25)
-        if x_col:
-            ax.set_xlabel(x_col)
-
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    return buf.getvalue()
-
-
-def _data_notes(result: dict[str, Any]) -> str:
-    """A short textual summary of a query result for the model to quote.
-
-    Complements the ``see`` image: the model can read the numbers here (so it
-    never has to guess values from the pixels) while the picture shows the shape.
-    """
-    columns = result.get("columns") or []
-    rows = result.get("rows") or []
-    if not columns or not rows:
-        return "the query returned no rows"
-    n = len(rows)
-    head = "  ".join(f"{c}={rows[0][columns.index(c)]}" for c in columns)
-    tail = "  ".join(f"{c}={rows[-1][columns.index(c)]}" for c in columns)
-    note = f"{n} row(s). First: {head}"
-    if n > 1:
-        note += f" | Last: {tail}"
-    return note
-
-
 class QueryError(Exception):
     """A read-only query was rejected by the Postgres driver."""
 
@@ -925,15 +865,61 @@ class ReadOnlyDB:
     thread.
     """
 
-    def __init__(self, url: str, *, user_id: int | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        user_id: int | None = None,
+        excluded_types: Iterable[str] | str = (),
+    ) -> None:
         self.path = url
         self.user_id = user_id
         self._backend = _PgReadOnlyBackend(url)
+        self._excluded = self._normalize_excluded(excluded_types)
+        self._enabled_cols: set[str] | None = None
+        self._claimed_cols: set[str] | None = None
 
     @classmethod
-    def from_url(cls, url: str, *, user_id: int | None = None) -> "ReadOnlyDB":
-        """A Postgres-backed read-only handle from a ``postgres://`` DSN."""
-        return cls(url, user_id=user_id)
+    def from_url(
+        cls,
+        url: str,
+        *,
+        user_id: int | None = None,
+        excluded_types: Iterable[str] | str = (),
+    ) -> "ReadOnlyDB":
+        """A Postgres-backed read-only handle from a ``postgres://`` DSN.
+
+        ``excluded_types`` is the account's disabled daily data types (a comma
+        list string or an iterable). Columns that no *enabled* type can write
+        (e.g. a SpO2 column when spo2 is excluded) are hidden from the agent's
+        schema so it never pays tokens to introspect metrics it has no data for.
+        """
+        return cls(url, user_id=user_id, excluded_types=excluded_types)
+
+    @staticmethod
+    def _normalize_excluded(excluded_types: Iterable[str] | str) -> set[str]:
+        if isinstance(excluded_types, str):
+            return {s.strip() for s in excluded_types.split(",") if s.strip()}
+        return {s.strip() for s in excluded_types if s.strip()}
+
+    def _daily_enabled_cols(self) -> tuple[set[str], set[str]]:
+        """(enabled, claimed) column sets for ``daily_metrics``.
+
+        ``claimed`` is every column some daily type can write; ``enabled`` is the
+        subset still written by a non-excluded type (mirrors
+        ``db.prune_excluded_types``). A column a disabled type exclusively writes
+        is dropped so the agent only sees columns it can actually have data for.
+        """
+        if self._enabled_cols is None:
+            enabled: set[str] = set()
+            claimed: set[str] = set()
+            for name, cols in TYPE_COLUMNS.items():
+                claimed |= cols
+                if name not in self._excluded:
+                    enabled |= cols
+            self._enabled_cols = enabled
+            self._claimed_cols = claimed
+        return self._enabled_cols, self._claimed_cols
 
     @contextmanager
     def _connect(self) -> Any:
@@ -966,7 +952,14 @@ class ReadOnlyDB:
         if table not in _ALLOWED_TABLES:
             raise ValueError(f"unknown table: {table!r}")
         with self._connect() as conn:
-            return self._backend.columns(conn, table)
+            cols = self._backend.columns(conn, table)
+        if table != "daily_metrics":
+            return cols
+        # Only the day-metric columns are gated by the per-user data-type
+        # toggles: drop columns no *enabled* type can write (keeps system
+        # columns like user_id/calendar_date/fetched_at, which no type claims).
+        enabled, claimed = self._daily_enabled_cols()
+        return [c for c in cols if c["name"] not in claimed or c["name"] in enabled]
 
     def date_range(self) -> dict[str, Any]:
         try:
@@ -982,6 +975,40 @@ class ReadOnlyDB:
             "max": row["max_date"],
             "rows": row["n"],
         }
+
+    def latest_date(self) -> date | None:
+        """The most recent calendar_date with any stored data (or ``None``).
+
+        Looks across ``daily_metrics``, ``derived_metrics`` and
+        ``activity_summaries`` so the agent can tell how stale the store is
+        relative to today (a user who has not synced lately would otherwise be
+        served "today" answers from days-old rows). Every date column is TEXT
+        in ``YYYY-MM-DD`` form (db.py), so ``MAX`` is lexicographic and the
+        values are parsed back to real ``date`` objects here.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT"
+                    " (SELECT MAX(calendar_date) FROM daily_metrics) AS d,"
+                    " (SELECT MAX(calendar_date) FROM derived_metrics) AS m,"
+                    " (SELECT MAX(start_date) FROM activity_summaries) AS a"
+                ).fetchone()
+        except _DB_ERROR_TYPES:
+            return None
+        candidates = [row[k] for k in ("d", "m", "a") if row and row[k]]
+        if not candidates:
+            return None
+        parsed: list[date] = []
+        for value in candidates:
+            if isinstance(value, date):
+                parsed.append(value)
+                continue
+            try:
+                parsed.append(date.fromisoformat(str(value).strip()[:10]))
+            except ValueError:
+                continue
+        return max(parsed) if parsed else None
 
     def day_summary(self, calendar_date: str) -> dict[str, Any]:
         """Every stored daily metric plus activities for one calendar date."""
@@ -1025,6 +1052,155 @@ class ReadOnlyDB:
             "activities": _jsonify_rows([dict(r) for r in activities]),
             "running": _jsonify_rows([dict(r) for r in running]),
         }
+
+    def metric_trend(self, metric: str, days: int = 30) -> dict[str, Any]:
+        """Query time series and summary stats for a core metric over N trailing days."""
+        days = max(1, min(int(days), 365))
+        m = metric.strip().lower()
+        derived_names = {"readiness", "acwr", "run_acwr", "run_cadence_drift"}
+        daily_cols = {
+            "sleep_score", "sleep_time_hours", "resting_hr", "hrv_last_night_avg", "vo2max",
+            "total_steps", "total_distance_m", "stress_avg", "body_battery_max",
+            "body_battery_min", "weight_kg", "sweat_loss_ml"
+        }
+        if m not in derived_names and m not in daily_cols:
+            raise ValueError(
+                f"unsupported metric '{metric}'. Supported: "
+                + ", ".join(sorted(derived_names | daily_cols))
+                + " (or write custom SQL with run_sql)"
+            )
+        start = (date.today() - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            if m in derived_names:
+                rows = conn.execute(
+                    "SELECT calendar_date, value, qualifier FROM derived_metrics "
+                    "WHERE metric = %s AND calendar_date >= %s ORDER BY calendar_date ASC",
+                    (m, start),
+                ).fetchall()
+                series = [
+                    {"date": r["calendar_date"], "value": _jsonable(r["value"]), "qualifier": r["qualifier"]}
+                    for r in rows
+                ]
+            else:
+                rows = conn.execute(
+                    f"SELECT calendar_date, {m} FROM daily_metrics "
+                    f"WHERE calendar_date >= %s AND {m} IS NOT NULL ORDER BY calendar_date ASC",
+                    (start,),
+                ).fetchall()
+                series = [
+                    {"date": r["calendar_date"], "value": _jsonable(r[m])}
+                    for r in rows
+                ]
+        vals = [s["value"] for s in series if isinstance(s.get("value"), (int, float))]
+        summary: dict[str, Any] = {"count": len(series)}
+        if vals:
+            summary["min"] = min(vals)
+            summary["max"] = max(vals)
+            summary["avg"] = round(sum(vals) / len(vals), 2)
+            summary["latest"] = vals[-1]
+            summary["latest_date"] = series[-1]["date"]
+            if len(vals) >= 2:
+                summary["change_vs_start"] = round(vals[-1] - vals[0], 2)
+        return {
+            "metric": m,
+            "days_requested": days,
+            "summary": summary,
+            "series": series,
+        }
+
+    def recent_activities(
+        self,
+        sport: str | None = None,
+        days: int = 30,
+        limit: int = 10,
+        date_start: str | None = None,
+        date_end: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return formatted recent activities with pace and cadence converted.
+
+        If ``date_start`` and/or ``date_end`` (ISO YYYY-MM-DD) are given the
+        window is scoped to that inclusive date range; otherwise it uses the
+        trailing ``days`` window. ``limit`` caps the rows (max 50).
+        """
+        days = max(1, min(int(days), 180))
+        limit = max(1, min(int(limit), 50))
+        if date_start is not None:
+            date_start = date.fromisoformat(date_start).isoformat()
+        if date_end is not None:
+            date_end = date.fromisoformat(date_end).isoformat()
+        if date_start and date_end and date_start > date_end:
+            date_start, date_end = date_end, date_start
+        start = date_start or (date.today() - timedelta(days=days)).isoformat()
+        params: list[Any] = [start]
+        sql = (
+            "SELECT activity_id, activity_name, activity_type, start_date, start_time_local, "
+            "duration_hours, distance_km, avg_hr, max_hr, pace_min_km, avg_speed_kmh, "
+            "avg_cadence, avg_power_w, training_load, elevation_gain_m, weather_temp_c, is_pr "
+            "FROM activity_summaries WHERE start_date >= %s "
+        )
+        if date_end:
+            sql += "AND start_date <= %s "
+            params.append(date_end)
+        if sport and sport.strip():
+            sql += "AND activity_type ILIKE %s "
+            params.append(f"%{sport.strip()}%")
+        sql += "ORDER BY start_date DESC, start_time_local DESC NULLS LAST LIMIT %s"
+        params.append(limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            dur = r["duration_hours"]
+            dur_fmt = None
+            if dur is not None and dur > 0:
+                h = int(dur)
+                m = int(round((dur - h) * 60))
+                dur_fmt = f"{h}h {m}m" if h else f"{m}m"
+
+            pace_val = r["pace_min_km"]
+            if pace_val is None and r["avg_speed_kmh"] and r["avg_speed_kmh"] > 0:
+                pace_val = 60.0 / r["avg_speed_kmh"]
+            pace_fmt = None
+            if pace_val is not None and pace_val > 0:
+                p_m = int(pace_val)
+                p_s = int(round((pace_val - p_m) * 60))
+                if p_s >= 60:
+                    p_m += 1
+                    p_s = 0
+                pace_fmt = f"{p_m}:{p_s:02d} /km"
+
+            cad = r["avg_cadence"]
+            cad_total = None
+            cad_unit = "rpm"
+            act_type = (r["activity_type"] or "").lower()
+            if cad is not None:
+                if "run" in act_type:
+                    cad_total = round(cad * 2)
+                    cad_unit = "total spm (both feet)"
+                else:
+                    cad_total = round(cad)
+                    cad_unit = "rpm"
+
+            out.append({
+                "activity_id": r["activity_id"],
+                "activity_name": r["activity_name"],
+                "activity_type": r["activity_type"],
+                "start_date": r["start_date"],
+                "duration": dur_fmt,
+                "distance_km": round(r["distance_km"], 2) if r["distance_km"] else None,
+                "pace": pace_fmt,
+                "cadence": f"{cad_total} {cad_unit}" if cad_total else None,
+                "avg_hr": round(r["avg_hr"]) if r["avg_hr"] else None,
+                "max_hr": round(r["max_hr"]) if r["max_hr"] else None,
+                "avg_power_w": round(r["avg_power_w"]) if r["avg_power_w"] else None,
+                "training_load": round(r["training_load"]) if r["training_load"] else None,
+                "elevation_gain_m": round(r["elevation_gain_m"]) if r["elevation_gain_m"] else None,
+                "weather_temp_c": r["weather_temp_c"],
+                "is_pr": bool(r["is_pr"]),
+            })
+        return out
 
     def run_sql(self, sql: str) -> dict[str, Any]:
         """Validate and execute a read-only query, returning rows as JSON-safe."""
@@ -1109,11 +1285,13 @@ class Weather:
         default_lon: float | None = None,
         http_get: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
         today: date | None = None,
+        db: ReadOnlyDB | None = None,
     ) -> None:
         self._default_lat = default_lat
         self._default_lon = default_lon
         self._http_get = http_get
         self._today = today or date.today()
+        self._db = db
 
     def _get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         if self._http_get is not None:
@@ -1126,12 +1304,13 @@ class Weather:
 
     @classmethod
     def from_config(
-        cls, cfg: dict[str, str], **kwargs: Any
+        cls, cfg: dict[str, str], *, db: ReadOnlyDB | None = None, **kwargs: Any
     ) -> "Weather":
         """Build from config strings (empty strings become no default)."""
         return cls(
             default_lat=_float_or_none(cfg.get("weather_home_lat")),
             default_lon=_float_or_none(cfg.get("weather_home_lon")),
+            db=db,
             **kwargs,
         )
 
@@ -1197,6 +1376,33 @@ class Weather:
                     f"the forecast only covers up to {forecast_end.isoformat()} "
                     f"({self.FORECAST_DAYS} days)"
                 )
+            # Try stored forecast from database first when querying home location
+            if self._db is not None and lat == self._default_lat and lon == self._default_lon:
+                try:
+                    sql = (
+                        "SELECT calendar_date AS date, temp_max_c, temp_min_c, "
+                        "precip_mm, wind_max_kmh, condition_code "
+                        "FROM weather_forecast "
+                        f"WHERE calendar_date >= '{start.isoformat()}' "
+                        f"AND calendar_date <= '{end.isoformat()}' "
+                        "ORDER BY calendar_date"
+                    )
+                    res = self._db.run_sql(sql)
+                    cols = res.get("columns") or []
+                    rows = res.get("rows") or []
+                    if rows:
+                        days_list = [dict(zip(cols, r)) for r in rows]
+                        return {
+                            "source": "forecast",
+                            "location": {"lat": lat, "lon": lon},
+                            "days": days_list,
+                            "note": (
+                                "Stored Open-Meteo daily forecast from local database. "
+                                f"Covered {start.isoformat()}..{end.isoformat()}."
+                            ),
+                        }
+                except Exception:
+                    pass
             url = self.FORECAST_URL
         else:
             raise ValueError(
@@ -1264,47 +1470,227 @@ def _tool_error(exc: BaseException) -> str:
     return msg if msg.startswith("ERROR: ") else f"ERROR: {msg}"
 
 
-def _schema_text(db: ReadOnlyDB) -> str:
-    """Render the agent-facing schema, annotating tables and tricky columns.
+#: Bookkeeping columns the agent never needs (they only cost tokens).
+_ANCHOR_DROP = ("created_at", "updated_at", "meta", "target_id")
 
-    Table notes come from ``_TABLE_NOTES`` and per-column unit/semantic hints
-    from ``_COLUMN_DOCS``, so the prompt can never drift from the real columns:
-    a new column simply appears (with a hint only if one is defined here).
+
+def _slim(d: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop bookkeeping keys from one anchor row (None passes through)."""
+    if d is None:
+        return None
+    return {k: v for k, v in d.items() if k not in _ANCHOR_DROP}
+
+
+def _anchor_goal_dump(
+    anchor: Any, goal_id: int, day: str
+) -> dict[str, Any] | None:
+    """Slim one resolved goal for the agent (None when it does not exist).
+
+    ``anchor.resolve_goal`` is the single composition of the goal/block/wave
+    resolution; this only drops bookkeeping columns and flattens the weekly
+    target so the model never re-derives the block/wave arithmetic.
+    """
+    resolved = anchor.resolve_goal(goal_id, day)
+    if resolved is None:
+        return None
+    out = _slim(resolved["goal"]) or {}
+    out["blocks"] = [
+        {**(_slim(block) or {}),
+         "waves": [_slim(w) or {} for w in block.get("waves", [])]}
+        for block in resolved["blocks"]
+    ]
+    out["current_block"] = _slim(resolved["current_block"])
+    out["week_index"] = resolved["week_index"]
+    target = resolved["weekly_target"]
+    out["weekly_target"] = (
+        None
+        if target is None
+        else {
+            "block_id": target["block"]["id"],
+            "block": target["block"]["name"],
+            "week_index": resolved["week_index"],
+            "wave": _slim(target["wave"]),
+        }
+    )
+    return out
+
+
+#: Column-name patterns -> short auto-description, used when ``_COLUMN_DOCS``
+#: has no explicit hint for a column. Ordered longest-first so the most
+#: specific suffix wins.
+_COLUMN_NAME_DOCS: tuple[tuple[str, str], ...] = (
+    ("total_steps", "step count"),
+    ("accumulated_power_w", "accumulated work (watts)"),
+    ("sleep_time_hours", "time asleep (hours, 4dp)"),
+    ("pace_min_km", "running pace (decimal min/km; 5.5 = 5:30)"),
+    ("distance_km", "distance (km)"),
+    ("speed_kmh", "speed (km/h)"),
+    ("spo2_avg_sleep", "blood-oxygen saturation during sleep (%)"),
+    ("spo2_avg", "blood-oxygen saturation (%)"),
+    ("spo2_latest", "blood-oxygen saturation (%)"),
+    ("spo2_lowest", "blood-oxygen saturation (%)"),
+    ("spo2_last_7d_avg", "7-day average blood-oxygen saturation (%)"),
+    ("weight_kg", "body weight (kg)"),
+    ("bmi", "body mass index"),
+    ("body_fat_pct", "body-fat percentage"),
+    ("total_distance_m", "distance (metres)"),
+    ("avg_speed_kmh", "average speed (km/h)"),
+    ("max_speed_kmh", "max speed (km/h)"),
+    ("_kmh", "value (km/h)"),
+    ("_sec_per_km", "pace (seconds/km)"),
+    ("_hours", "duration (hours)"),
+    ("_watts", "power (watts)"),
+    ("_kcal", "energy (kcal)"),
+    ("_ml", "volume (ml)"),
+    ("_pct", "percentage (0-100)"),
+    ("_min", "minutes"),
+    ("_spm", "steps/min"),
+    ("_km", "distance (km)"),
+    ("_m", "distance (metres)"),
+    ("_w", "power (watts)"),
+    ("_hr", "heart rate (bpm)"),
+    ("_c", "temperature (degC)"),
+    ("cadence", "steps/min PER LEG for running (total both-feet = 2x); rpm for cycling"),
+    ("hr_time_zone", "% of activity duration spent in this HR zone"),
+    ("power_time_zone", "% of activity duration spent in this power zone"),
+    ("calories", "energy (kcal)"),
+    ("latitude", "WGS84 latitude"),
+    ("longitude", "WGS84 longitude"),
+)
+
+_TEXT_TYPE = frozenset({
+    "text", "character varying", "varchar", "uuid", "json", "jsonb",
+})
+_NUM_TYPE = frozenset({
+    "integer", "bigint", "smallint", "numeric", "real", "double precision",
+    "decimal",
+})
+_DATE_TYPE_HINTS = ("timestamp", "date", "time")
+
+
+def _auto_col_desc(name: str, type: str) -> str:
+    """A short description for a column that has no curated hint in ``_COLUMN_DOCS``.
+
+    Uses the column name's unit/semantic suffix first, then the data type, so
+    even a lazily auto-created column gets a meaningful description in the
+    ``table_schema`` tool output. Never raises.
+    """
+    n = name.lower()
+    t = (type or "").lower()
+    for suffix, desc in _COLUMN_NAME_DOCS:
+        if n == suffix or n.endswith(suffix):
+            return desc
+    # Name hints beat the generic data-type fallback: several columns store a
+    # date/timestamp as *text* (e.g. calendar_date, fetched_at, start_date).
+    if "date" in n and t in _TEXT_TYPE:
+        return "date (YYYY-MM-DD)"
+    if any(h in t for h in _DATE_TYPE_HINTS):
+        return "timestamp"
+    if t == "boolean":
+        return "boolean flag"
+    if t in _TEXT_TYPE:
+        return "text / category"
+    if t in _NUM_TYPE:
+        return "numeric value"
+    return "value"
+
+
+def _column_descriptions(db: ReadOnlyDB, table: str) -> list[dict[str, str]]:
+    """Live columns for ``table``, each annotated with a short description.
+
+    Uses ``_COLUMN_DOCS`` (curated) when available, otherwise ``_auto_col_desc``
+    (generated from the name/unit + data type), so the description list stays
+    complete even for columns created dynamically at sync time.
+    """
+    docs = _COLUMN_DOCS.get(table, {})
+    out: list[dict[str, str]] = []
+    for col in db.columns(table):
+        name = col["name"]
+        out.append({
+            "name": name,
+            "type": col["type"],
+            "description": docs.get(name) or _auto_col_desc(name, col["type"]),
+        })
+    return out
+
+
+def _schema_text(db: ReadOnlyDB) -> str:
+    """Render the agent-facing *table overview* (no columns).
+
+    Each table gets its semantic description from ``_TABLE_NOTES`` only — the
+    prompt deliberately omits the column list. Columns (and their short
+    descriptions) are fetched on demand through ``table_schema``, so the prompt
+    stays lean and never goes stale as columns are added dynamically.
     """
     lines: list[str] = []
     for table in db.tables():
         note = _TABLE_NOTES.get(table)
-        header = f"{table}: " + (f"[{note}] " if note else "")
-        parts: list[str] = []
-        for col in db.columns(table):
-            name = col["name"]
-            hint = _COLUMN_DOCS.get(table, {}).get(name)
-            parts.append(name if hint is None else f"{name} ({hint})")
-        lines.append(header + ", ".join(parts))
+        lines.append(f"{table}: " + (note if note else "see table_schema"))
     return "\n".join(lines)
 
 
-def _current_date_prompt() -> str:
-    """The date note, re-evaluated as a dynamic system prompt on every turn.
+def _render_system_prompt(
+    overview: str, *, has_plan: bool, has_anchor: bool
+) -> str:
+    """Fill the static system prompt for the tools this agent actually has.
+
+    ``str.replace`` (not ``.format``) because the template's chart guidance
+    contains literal JSON braces (``{"sql": ...}``). The plan/anchor bullets are
+    emitted only when those stores are wired, so the prompt never advertises a
+    tool the model cannot call; the week bullet additionally requires BOTH.
+    """
+    prompt = (
+        _PROMPT_TEMPLATE
+        .replace("{overview_text}", overview or "(no tables available in the database)")
+        .replace("{plan_tools}", _PLAN_TOOLS_GUIDE if has_plan else "")
+        .replace("{anchor_tools}", _ANCHOR_TOOLS_GUIDE if has_anchor else "")
+        .replace(
+            "{week_tools}",
+            _WEEK_TOOLS_GUIDE if (has_plan and has_anchor) else "",
+        )
+    )
+    return re.sub(r"\n{3,}", "\n\n", prompt).strip()
+
+
+def _current_date_prompt(db: ReadOnlyDB | None = None) -> str:
+    """The date + data-freshness note, re-evaluated as a dynamic system prompt.
 
     Includes the weekday name (e.g. ``2026-08-16 (Sunday)``) so the model never
     has to compute the day of week from the date itself — models reliably get
-    that arithmetic wrong by a day. This is the ONLY dynamic part of the prompt;
-    everything else is the (static) ``_PROMPT_TEMPLATE`` built once per agent.
+    that arithmetic wrong by a day. When a ``db`` is given it also reports the
+    most recent date with stored data and how far behind today it is, so the
+    model never presents stale rows as current. Everything else is the (static)
+    ``_PROMPT_TEMPLATE`` built once per agent.
     """
-    return _TODAY_PROMPT.format(
-        today=date.today().strftime("%Y-%m-%d (%A)")
+    text = _TODAY_PROMPT.format(today=date.today().strftime("%Y-%m-%d (%A)"))
+    if db is None:
+        return text
+    try:
+        data_until = db.latest_date()
+    except Exception:
+        return text
+    if data_until is None:
+        return text + "\n\n# Data freshness\n\nNo data has been synced yet."
+    gap = (date.today() - data_until).days
+    if gap <= 0:
+        return text
+    return text + "\n\n" + _STALENESS_PROMPT.format(
+        data_until=data_until.isoformat(), gap=gap
     )
 
 
-def _refresh_resumed_prompt(messages: list[Any]) -> list[Any]:
-    """Stamp the current date onto any stored *date* system prompt in history.
+def _refresh_resumed_prompt(
+    messages: list[Any], db: ReadOnlyDB | None = None
+) -> list[Any]:
+    """Stamp the current date (and freshness, given a ``db``) onto any stored
+    *date* system prompt in history.
 
     Sessions persisted before the date prompt became dynamic carry a
-    ``SystemPromptPart`` with an old date and no ``dynamic_ref``, so Pydantic AI
-    can never re-evaluate it — the resumed agent keeps thinking "today" is the
-    day the session started. Rewrite only that date part in place with the fresh
-    date and the current ``dynamic_ref`` so it keeps refreshing on later turns.
+    ``SystemPromptPart`` with an old date (and no freshness note) and a stale or
+    absent ``dynamic_ref``, so Pydantic AI can never re-evaluate it — the resumed
+    agent keeps thinking "today" is the day the session started. Rewrite only
+    that date part in place with the fresh content and the current
+    ``dynamic_ref`` so it keeps refreshing on later turns.
 
     The other system-prompt parts (the static role/schema template and the
     dynamic long-term-memory note) are content-stable and must be left alone:
@@ -1314,8 +1700,8 @@ def _refresh_resumed_prompt(messages: list[Any]) -> list[Any]:
     """
     from pydantic_ai.messages import SystemPromptPart
 
-    fresh = _current_date_prompt()
-    ref = _current_date_prompt.__qualname__
+    fresh = _current_date_prompt(db)
+    ref = _DATE_PROMPT_REF
     old_prefix = "Today's date is"
     for message in messages:
         for part in getattr(message, "parts", []):
@@ -1330,6 +1716,61 @@ def _refresh_resumed_prompt(messages: list[Any]) -> list[Any]:
     return messages
 
 
+def _gemini_thinking_level(effort: str | None) -> str:
+    """Map a unified reasoning-effort level to a Gemini thinking level.
+
+    ``gemini-3.8-flash`` (and newer Gemini models) accept explicit levels;
+    fall back to ``MINIMAL`` for anything unrecognized so reasoning never
+    silently turns off.
+    """
+    return {
+        "minimal": "MINIMAL",
+        "low": "LOW",
+        "medium": "MEDIUM",
+        "high": "HIGH",
+        "xhigh": "HIGH",
+    }.get((effort or "").lower(), "MINIMAL")
+
+
+def _build_model(
+    provider: str,
+    model_name: str,
+    *,
+    base_url: str | None,
+    api_key: str | None,
+    reasoning_effort: str | None,
+) -> Any:
+    """Construct the chat model for ``provider`` ('openai' or 'gemini')."""
+    if provider == "gemini":
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google import GoogleProvider
+
+        settings = None
+        if reasoning_effort:
+            settings = {
+                "google_thinking_config": {
+                    "thinking_level": _gemini_thinking_level(reasoning_effort)
+                }
+            }
+        return GoogleModel(
+            model_name,
+            provider=GoogleProvider(api_key=api_key),
+            settings=settings,
+        )
+    # Default: any OpenAI-compatible base_url (DeepSeek, Ollama, OpenAI, ...).
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    model_settings = (
+        {"openai_reasoning_effort": reasoning_effort} if reasoning_effort else None
+    )
+    return OpenAIChatModel(
+        model_name,
+        provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+        settings=model_settings,
+    )
+
+
 def build_agent(
     db: ReadOnlyDB,
     *,
@@ -1337,51 +1778,58 @@ def build_agent(
     base_url: str | None = None,
     api_key: str | None = None,
     reasoning_effort: str | None = None,
+    provider: str | None = None,
     model: Any = None,
     memory: _Memory | None = None,
     weather: "Weather | None" = None,
     plan: _Plan | None = None,
+    anchor: _Anchor | None = None,
+    chart_cache: dict[str, Any] | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> Any:
     """Build the Pydantic AI agent wired to ``db`` tools.
 
     Pass ``model`` (e.g. ``TestModel``) to override the transport for tests.
     Pass ``reasoning_effort`` to request a reasoning effort level from the
-    underlying model (``low``/``medium``/``high``). Pass ``memory`` to give
-    the agent get/remember/forget tools over a durable user profile (long-term
-    memory between sessions). Pass ``plan`` (a ``server.state.TrainingPlan``)
-    to give the agent read/update tools over the user's training plan.
+    underlying model (``low``/``medium``/``high``). ``provider`` selects the
+    transport: ``openai`` (default, any OpenAI-compatible ``base_url``) or
+    ``gemini`` (native google-genai). Pass ``memory`` to give the agent
+    get/remember/forget tools over a durable user profile (long-term memory
+    between sessions). Pass ``plan`` (a ``server.state.TrainingPlan``) to give
+    the agent read/update tools over the user's training plan. Pass ``anchor``
+    (a ``server.state.TrainingAnchor``) to give the agent read/update tools
+    over the user's long-term plan / periodized blocks.
     """
     from pydantic_ai import Agent
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
 
     if model is None:
-        model_settings = (
-            {"openai_reasoning_effort": reasoning_effort}
-            if reasoning_effort
-            else None
-        )
-        model = OpenAIChatModel(
+        model = _build_model(
+            provider or "openai",
             model_name,
-            provider=OpenAIProvider(base_url=base_url, api_key=api_key),
-            settings=model_settings,
+            base_url=base_url,
+            api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
-    schema = _schema_text(db)
-    # ``str.replace`` (not ``.format``) because the template's chart guidance
-    # contains literal JSON braces (``{"sql": ...}``). The schema is filled once
-    # here; the date is injected separately as a dynamic prompt below.
-    system_prompt = _PROMPT_TEMPLATE.replace(
-        "{schema_text}", schema or "(no tables available in the database)"
+    overview = _schema_text(db)
+    # Columns are NOT in the prompt — the model introspects them via the
+    # ``table_schema`` tool on demand; the date is injected separately as a
+    # dynamic prompt below.
+    system_prompt = _render_system_prompt(
+        overview, has_plan=plan is not None, has_anchor=anchor is not None
     )
-    agent = Agent(model, system_prompt=system_prompt.strip())
+    agent = Agent(model, system_prompt=system_prompt)
 
     # The date must be a dynamic system prompt: static prompts are evaluated
     # once and stored in the message history, so a cached agent (or a resumed
     # session) would keep "Today is <yesterday>" forever. A dynamic prompt is
-    # re-evaluated on every model request, so the date can never go stale.
-    # (dynamic=True only works in the decorator form; the module-level function
-    # keeps the ``dynamic_ref`` stable so resumed sessions can match it.)
-    agent.system_prompt(dynamic=True)(_current_date_prompt)
+    # re-evaluated on every model request, so the date can never go stale. The
+    # closure pins ``__qualname__`` to ``_DATE_PROMPT_REF`` so resumed history
+    # (matched by ``_refresh_resumed_prompt``) keeps refreshing on later turns.
+    def _date_dynamic_prompt() -> str:
+        return _current_date_prompt(db)
+
+    _date_dynamic_prompt.__qualname__ = _DATE_PROMPT_REF
+    agent.system_prompt(dynamic=True)(_date_dynamic_prompt)
 
     # The long-term-memory profile is injected the same way: a *dynamic* system
     # prompt, so it is re-evaluated every turn (a fact the model stores via
@@ -1405,9 +1853,16 @@ def build_agent(
 
     @agent.tool_plain
     def table_schema(table: str) -> str:
-        """Return the columns of a table (names and types)."""
+        """Return a table's live columns (name, type, description each).
+
+        Call this before writing a query against a table — the system prompt
+        only lists table overviews. Columns are queried live, so newly-added
+        columns appear automatically.
+        """
+        if on_status is not None:
+            on_status(f"Inspecting schema for {table}…")
         try:
-            return json.dumps(db.columns(table))
+            return json.dumps(_column_descriptions(db, table), ensure_ascii=False)
         except ValueError as exc:
             return _tool_error(exc)
 
@@ -1433,8 +1888,10 @@ def build_agent(
 
         Only SELECT / WITH / EXPLAIN statements are allowed. List only
         the columns you need (never SELECT *), aggregate with GROUP BY, and use
-        small limits — results are capped at 200 rows.
+        small limits — results are capped at 500 rows.
         """
+        if on_status is not None:
+            on_status("Running database query…")
         try:
             result = db.run_sql(sql)
         except (ValueError, QueryError) as exc:
@@ -1449,11 +1906,64 @@ def build_agent(
         daily_metrics values (sleep, resting HR, HRV, steps, weight, ...) and
         the activities recorded that day. Use this instead of hand-writing a
         SELECT for "how was my day X" — it returns exactly the per-day bundle
-        you need without selecting the ~60-column wide daily_metrics row.
+        you need without selecting the wide daily_metrics row.
         """
+        if on_status is not None:
+            on_status(f"Fetching summary for {calendar_date}…")
         try:
             return json.dumps(db.day_summary(calendar_date), ensure_ascii=False)
         except (ValueError, QueryError, psycopg.Error) as exc:
+            return _tool_error(exc)
+
+    @agent.tool_plain
+    def get_metric_trend(metric: str, days: int = 30) -> str:
+        """Return daily values and summary statistics (min/max/avg/trend) for a core metric.
+
+        ``metric`` is one of:
+        - Readiness & load: 'readiness' (0-100), 'acwr' (acute/chronic load ratio),
+          'run_acwr' (running distance ACWR), 'run_cadence_drift' (gait z-score)
+        - Daily health: 'sleep_score' (0-100), 'resting_hr' (bpm),
+          'hrv_last_night_avg' (ms), 'vo2max', 'total_steps', 'total_distance_m',
+          'stress_avg', 'weight_kg'
+        ``days`` is the trailing window (default 30, up to 365).
+        Use this instead of writing SQL when asked for trends or averages of these core metrics.
+        """
+        if on_status is not None:
+            on_status(f"Analyzing {metric} trend…")
+        try:
+            return json.dumps(db.metric_trend(metric, days), ensure_ascii=False)
+        except (ValueError, psycopg.Error) as exc:
+            return _tool_error(exc)
+
+    @agent.tool_plain
+    def get_recent_activities(
+        sport: str | None = None,
+        days: int = 30,
+        limit: int = 10,
+        date_start: str | None = None,
+        date_end: str | None = None,
+    ) -> str:
+        """Return recent activities with formatted pace (MM:SS /km) and 2x total cadence.
+
+        ``sport`` is an optional filter (e.g. 'run', 'cycling', 'swimming').
+        ``days`` is the trailing window (default 30) used when ``date_start`` and
+        ``date_end`` are omitted. Pass ``date_start`` / ``date_end`` (ISO YYYY-MM-DD)
+        to scope to an explicit inclusive date range instead — useful for comparing
+        epochs without writing multi-column SQL; if only one is given the other is
+        open-ended.
+        ``limit`` is max activities to return (default 10, max 50).
+        Returns human-friendly summaries with converted running paces, duration,
+        and total both-feet cadence. Use this instead of multi-column SQL for
+        'what were my last runs' or 'show recent workouts'.
+        """
+        if on_status is not None:
+            on_status("Retrieving recent activities…")
+        try:
+            return json.dumps(
+                db.recent_activities(sport, days, limit, date_start, date_end),
+                ensure_ascii=False,
+            )
+        except (ValueError, psycopg.Error) as exc:
             return _tool_error(exc)
 
     @agent.tool_plain
@@ -1486,6 +1996,8 @@ def build_agent(
         wrapped in <chart> ... </chart> tags. It never returns the data
         itself — the UI reruns the query to draw the chart.
         """
+        if on_status is not None:
+            on_status("Validating chart…")
         try:
             import json as _json
 
@@ -1502,7 +2014,14 @@ def build_agent(
         except (ValueError, QueryError) as exc:
             return f"ERROR: {exc}"
         try:
-            _build_chart_figure(parsed, result)
+            fig = _build_chart_figure(parsed, result)
+            if chart_cache is not None:
+                try:
+                    fig_dict = _json.loads(fig.to_json())
+                    chart_cache[sql.strip()] = fig_dict
+                    chart_cache[_json.dumps(parsed, sort_keys=True)] = fig_dict
+                except Exception:
+                    pass
         except ValueError as exc:
             return _tool_error(exc)
         rows = result.get("rows") or []
@@ -1510,43 +2029,6 @@ def build_agent(
             "OK: " + _json.dumps(parsed, ensure_ascii=False)
             + f" (query returned {len(rows)} rows)"
         )
-
-    @agent.tool_plain
-    def see(sql: str, kind: str = "line") -> str:
-        """Query the database and return the result as an IMAGE you can look at.
-
-        ``sql`` is a read-only SELECT/WITH/EXPLAIN statement. ``kind`` is an
-        optional plot type: line | area | scatter | bar | histogram | box
-        (default line). It plots whatever the query returns — usually a series
-        over time, or one column as a histogram/box — and returns both a
-        rendered image AND the data, so you can visually read the shape (trend,
-        drift, spikes, clusters, relationships) and still quote exact numbers.
-        Column names are shown in the plot legend, so you can tell which series
-        is which. Call this when a picture would help you understand the user
-        better — a trend over time, how two metrics move together, the shape of
-        a distribution, an outlier. It is for gathering insight about the user
-        from their data, not for checking a chart's appearance; prefer
-        line/area/scatter for time series, histogram/box for a single column's
-        distribution. Do not show the user this figure — it is for your eyes.
-        """
-        import base64
-        import json as _json
-
-        from pydantic_ai.messages import ImageUrl
-
-        if not isinstance(sql, str) or not sql.strip():
-            return "ERROR: pass a read-only SQL string"
-        try:
-            result = db.run_sql(sql)
-            png = _render_series_png(result, kind)
-        except (ValueError, QueryError) as exc:
-            return f"ERROR: {exc}"
-        return [
-            "Here is the data you asked to see, as an image plus the underlying "
-            "rows:",
-            ImageUrl(url="data:image/png;base64," + base64.b64encode(png).decode()),
-            "Data: " + _data_notes(result),
-        ]
 
     if weather is not None:
 
@@ -1571,6 +2053,8 @@ def build_agent(
             Example: weather_fc(date_start="2026-07-01", date_end="2026-07-07")
             returns that week's observed weather around home.
             """
+            if on_status is not None:
+                on_status("Checking weather forecast…")
             try:
                 return json.dumps(
                     weather.query(date_start, date_end, lat, lon),
@@ -1593,6 +2077,8 @@ def build_agent(
             Use short lowercase keys and concise values. Overwrite an existing
             key with remember_memory when the fact has changed.
             """
+            if on_status is not None:
+                on_status("Updating memory…")
             try:
                 memory.remember(key, value)
                 return "saved"
@@ -1613,22 +2099,25 @@ def build_agent(
         def get_training_plan(
             date_start: str | None = None,
             date_end: str | None = None,
+            detail: bool = False,
         ) -> str:
-            """Return the user's training plan as JSON (recent + upcoming).
+            """Return the user's planned workouts as JSON.
 
-            ``date_start``/``date_end`` are optional inclusive YYYY-MM-DD
-            bounds. With neither given, only the last 30 days plus the next
-            180 days are returned — older completed history is NOT included;
-            pass explicit dates to page further back. With both given, that
-            exact range is returned. Results are capped at 200 workouts (the
-            ``truncated`` flag is set when rows were dropped, so pass a
-            narrower range to see the rest). Each workout has id, planned_date,
-            activity_type (run/cycle/swim/strength/rest/other), title,
-            description, duration_min, distance_km, intensity, completed, and
-            completed_activity_id (the activity_summaries.activity_id that
-            satisfied it, when auto-detected — join on it for the actual
-            workout's stats).
+            ``date_start``/``date_end`` are optional inclusive YYYY-MM-DD bounds;
+            with neither, the last 30 days + next 180 days are returned. Capped
+            at 200 workouts (``total``/``dropped`` report what was left out —
+            pass a narrower range for the rest). Each workout has id,
+            planned_date, activity_type (run/cycle/swim/strength/rest/other),
+            title, duration_min, distance_km, intensity, target_pace_min_km
+            (decimal min/km), target_hr_zone, target_power_w, status
+            (planned/completed/partial/skipped), completed and
+            completed_activity_id (join activity_summaries on it for actuals).
+
+            ``detail=False`` (default) omits the long ``description`` and reports
+            ``has_description``; pass ``detail=True`` only when you need the text.
             """
+            if on_status is not None:
+                on_status("Checking training plan…")
             try:
                 if (date_start is None) != (date_end is None):
                     return "ERROR: pass both date_start and date_end, or neither"
@@ -1643,49 +2132,242 @@ def build_agent(
                     date.fromisoformat(date_start)
                     date.fromisoformat(date_end)
                 workouts = plan.list(date_start, date_end)
-                truncated = len(workouts) > _PLAN_MAX_WORKOUTS
-                if truncated:
+                total = len(workouts)
+                dropped = max(0, total - _PLAN_MAX_WORKOUTS)
+                if dropped:
                     workouts = workouts[:_PLAN_MAX_WORKOUTS]
+                if not detail:
+                    for w in workouts:
+                        w["has_description"] = bool(w.get("description"))
+                        w.pop("description", None)
                 return json.dumps(
-                    {"workouts": workouts, "truncated": truncated},
+                    {
+                        "workouts": workouts,
+                        "total": total,
+                        "dropped": dropped,
+                        "from_date": date_start,
+                        "to_date": date_end,
+                    },
                     ensure_ascii=False,
                 )
-            except ValueError as exc:
+            except (ValueError, OSError, psycopg.Error) as exc:
                 return _tool_error(exc)
 
         @agent.tool_plain
         def update_training_plan(spec: str) -> str:
             """Add, edit or delete workouts in the user's training plan.
 
-            ``spec`` is a JSON object:
-            - "replace": optional bool — when true, the whole plan is wiped
-              first (use for "create a brand-new plan").
-            - "workouts": optional list of workout objects. An object with an
-              "id" updates that existing workout (the full desired state must
-              be given); one without an "id" creates a new workout. Fields:
-              planned_date (required, YYYY-MM-DD), activity_type (required:
-              run/cycle/swim/strength/rest/other), title, description,
-              duration_min, distance_km, intensity (easy/moderate/hard/
-              race_pace), completed (bool).
-            - "delete_ids": optional list of workout ids to delete.
-            Returns a JSON summary of what changed.
+            ``spec`` (one atomic transaction — an invalid part writes nothing):
+            - "workouts": list. An entry WITH an "id" PATCHES that workout (send
+              only the fields to change; goal_id/block_id and everything else are
+              kept). One WITHOUT an "id" creates a workout. Fields: planned_date,
+              activity_type (run/cycle/swim/strength/rest/other), title,
+              description, duration_min, distance_km, intensity
+              (easy/moderate/hard/race_pace), target_pace_min_km (decimal
+              min/km, 5.5 = 5:30), target_hr_zone, target_power_w, status
+              (planned/completed/partial/skipped), goal_id/block_id.
+            - "replace": wipe the whole plan first (destructive).
+            - "delete_ids": workout ids to delete.
+            - "delete_range": {"from": "YYYY-MM-DD", "to": "..."} (destructive).
+            - "shift": {"days": int, "from"?, "to"?, "ids"?, "goal_id"?} — move
+              matching workouts by N days (negative = earlier).
+            - "repeat_week": {"week_start": "YYYY-MM-DD", "weeks": int,
+              "include_completed"?: bool} — copy that week into the next N weeks.
+            - "undo": restore the snapshot taken before the last destructive edit.
+            Returns added/updated/deleted/shifted/repeated/total.
             """
+            if on_status is not None:
+                on_status("Updating training plan…")
             try:
                 parsed = json.loads(spec)
             except json.JSONDecodeError as exc:
                 return f"ERROR: spec is not valid JSON: {exc}"
             if not isinstance(parsed, dict):
                 return "ERROR: spec must be a JSON object"
-            if "replace" in parsed and not isinstance(parsed["replace"], bool):
-                return "ERROR: 'replace' must be a boolean"
+            for key in ("replace", "undo"):
+                if key in parsed and not isinstance(parsed[key], bool):
+                    return f"ERROR: '{key}' must be a boolean"
             for key in ("workouts", "delete_ids"):
                 if key in parsed and not isinstance(parsed[key], list):
                     return f"ERROR: '{key}' must be a list"
+            for key in ("shift", "repeat_week", "delete_range"):
+                if key in parsed and not isinstance(parsed[key], dict):
+                    return f"ERROR: '{key}' must be an object"
             try:
                 result = plan.apply(parsed)
-            except ValueError as exc:
+            except (ValueError, OSError, psycopg.Error) as exc:
                 return _tool_error(exc)
             return json.dumps(result, ensure_ascii=False)
+
+    if plan is not None and anchor is not None:
+
+        @agent.tool_plain
+        def get_training_week(
+            week_start: str | None = None,
+            goal_id: int | None = None,
+        ) -> str:
+            """Return one week of training in a single call.
+
+            Answers "how is my week going / what is left this week?" without
+            assembling the anchor, the plan and SQL yourself. ``week_start``
+            (YYYY-MM-DD, default today) is snapped back to Monday; ``goal_id``
+            limits the planned side to one long-term goal.
+
+            Returns {"week_start", "week_end", "goals": [...]} where each goal
+            carries the covering ``block``, the 1-based ``week_index``, the
+            resolved ``wave_target`` (with is_deload/intensity), the week's
+            ``planned`` workouts and the ``actual`` synced activities. Goals
+            with no dated block are still returned with block/week_index null.
+            """
+            if on_status is not None:
+                on_status("Checking this week's training…")
+            try:
+                if week_start:
+                    date.fromisoformat(week_start)
+                view = plan.week_view(week_start, goal_id)
+                day = view["week_start"]
+                goals: list[dict[str, Any]] = []
+                for goal in anchor.list_goals():
+                    if goal_id is not None and goal["id"] != int(goal_id):
+                        continue
+                    resolved = anchor.resolve_goal(goal["id"], day)
+                    if resolved is None:
+                        continue
+                    target = resolved["weekly_target"]
+                    goals.append({
+                        "goal_id": goal["id"],
+                        "title": goal["title"],
+                        "event_type": goal["event_type"],
+                        "target_date": goal["target_date"],
+                        "block": _slim(resolved["current_block"]),
+                        "week_index": resolved["week_index"],
+                        "wave_target": (
+                            _slim(target["wave"]) if target and target["wave"] else None
+                        ),
+                    })
+                return json.dumps(
+                    {
+                        "week_start": view["week_start"],
+                        "week_end": view["week_end"],
+                        "goals": goals,
+                        "planned": view["planned"],
+                        "actual": view["actual"],
+                    },
+                    ensure_ascii=False,
+                )
+            except (ValueError, OSError, psycopg.Error) as exc:
+                return _tool_error(exc)
+
+    if anchor is not None:
+
+        @agent.tool_plain
+        def get_training_anchor(
+            goal_id: int | None = None,
+            day: str | None = None,
+        ) -> str:
+            """Return the user's long-term training anchor(s) (goals + blocks + waves).
+
+            The anchor(s) are the plans the daily/weekly plan derives from; an
+            account may hold several goals at once (a marathon AND a half).
+            Each goal has id, title, sport, event_type, target_date,
+            target_distance_km, target_time, notes; its blocks are the phases
+            (id, name, focus, notes, sort_order, optional start_date/end_date)
+            and each block's ``waves`` are its repeating weekly microcycle
+            (week_index 1..N, distance_km, duration_min, intensity, is_deload,
+            notes). Per goal the response resolves the phase for ``day``
+            (YYYY-MM-DD, default today) as ``current_block``, its 1-based
+            ``week_index`` and the ``weekly_target`` (covering block + cycling
+            wave) — use those instead of re-deriving the arithmetic.
+            Returns {"goals": [...], "day": "<YYYY-MM-DD>"}.
+
+            Pass ``goal_id`` to fetch one goal (cheaper with several);
+            pass ``day`` to resolve a week other than today.
+            """
+            if on_status is not None:
+                on_status("Consulting training goals, blocks & waves…")
+            try:
+                day = day or date.today().isoformat()
+                date.fromisoformat(day)
+                goals = anchor.list_goals()
+                if goal_id is not None:
+                    goals = [g for g in goals if g["id"] == int(goal_id)]
+                    if not goals:
+                        return f"ERROR: goal {goal_id} not found"
+                out = [
+                    dumped for dumped in
+                    (_anchor_goal_dump(anchor, g["id"], day) for g in goals)
+                    if dumped is not None
+                ]
+                return json.dumps({"goals": out, "day": day}, ensure_ascii=False)
+            except (ValueError, OSError, psycopg.Error) as exc:
+                return _tool_error(exc)
+
+        @agent.tool_plain
+        def update_training_anchor(spec: str) -> str:
+            """Create, update or delete long-term training goals (with blocks + waves).
+
+            ``spec`` (one atomic transaction — an invalid part writes nothing):
+            - "goal_id": given -> UPDATE that goal (PATCH: only the fields you
+              pass change); omitted -> CREATE a new goal.
+            - "title", "sport", "event_type", "target_date" (YYYY-MM-DD),
+              "target_time", "target_distance_km", "notes": the target; all
+              optional.
+            - "blocks": phase UPSERT that never wipes the season. An entry
+              WITHOUT "id" creates a block; one WITH "id" patches it. Fields:
+              name, focus, optional start_date/end_date (YYYY-MM-DD), notes,
+              sort_order, and optional "waves": weekly microcycle targets, each
+              {"week_index": 1..n, "distance_km", "duration_min", "intensity",
+              "is_deload", "notes"}. week_index must be 1..N with no gaps (it is
+              assigned from list order when omitted). Waves REPEAT over the
+              block, so 4 entries become a repeating 4-week cycle
+              (50/55/60/45km with the last is_deload).
+            - "replace_blocks": DESTRUCTIVE — swaps the whole block set (ids
+              change; workouts are re-linked only to a same-named phase).
+              Prefer "blocks" upserts.
+            - "delete_blocks": block ids to remove from THIS goal.
+            - "delete_goal_ids": goal ids to delete.
+            - "undo": restore goals/blocks/waves from the snapshot taken before
+              the last destructive edit.
+            Returns the saved/updated goal (with blocks + waves), or the
+            remaining goals when the spec only deletes.
+            """
+            if on_status is not None:
+                on_status("Updating training goal, blocks & waves…")
+            try:
+                parsed = json.loads(spec)
+            except json.JSONDecodeError as exc:
+                return f"ERROR: spec is not valid JSON: {exc}"
+            if not isinstance(parsed, dict):
+                return "ERROR: spec must be a JSON object"
+            if "undo" in parsed and not isinstance(parsed["undo"], bool):
+                return "ERROR: 'undo' must be a boolean"
+            for key in ("blocks", "replace_blocks", "delete_blocks", "delete_goal_ids"):
+                if key in parsed and not isinstance(parsed[key], list):
+                    return f"ERROR: '{key}' must be a list"
+            try:
+                result = anchor.apply(parsed)
+            except (ValueError, OSError, psycopg.Error) as exc:
+                return _tool_error(exc)
+            goal = result.get("goal")
+            today = date.today().isoformat()
+            if goal is None:
+                # Pure deletion (or an empty spec): never invent an empty goal.
+                return json.dumps(
+                    {
+                        "deleted_goals": result.get("deleted_goals", 0),
+                        "goals": [
+                            dumped for dumped in
+                            (_anchor_goal_dump(anchor, g["id"], today)
+                             for g in anchor.list_goals())
+                            if dumped is not None
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                _anchor_goal_dump(anchor, goal["id"], today),
+                ensure_ascii=False,
+            )
 
     return agent
 
@@ -1696,6 +2378,9 @@ def _build_agent(
     *,
     memory: Any | None = None,
     plan: Any | None = None,
+    anchor: Any | None = None,
+    chart_cache: dict[str, Any] | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> Any:
     api_key = cfg["llm_api_key"] or None
     base_url = cfg["llm_base_url"] or None
@@ -1704,17 +2389,40 @@ def _build_agent(
             "no LLM configured: set OPENAI_API_KEY / LLM_API_KEY for cloud, "
             "or LLM_BASE_URL (e.g. http://host.docker.internal:11434/v1) with LLM_MODEL for a local Ollama model"
         )
-    weather = Weather.from_config(cfg)
+    weather = Weather.from_config(cfg, db=db)
     return build_agent(
         db,
         model_name=cfg["llm_model"],
         base_url=base_url,
         api_key=api_key,
         reasoning_effort=cfg.get("llm_reasoning_effort") or None,
+        provider=cfg.get("llm_provider") or None,
         memory=memory,
         weather=weather,
         plan=plan,
+        anchor=anchor,
+        chart_cache=chart_cache,
+        on_status=on_status,
     )
+
+
+def _load_excluded_types(db_url: str, user_id: int) -> str:
+    """The account's disabled data types (comma list) from the users table.
+
+    Reads as the writer role (``db_url``), which can SELECT ``users``; the
+    read-only agent role cannot. Returns '' when there is no DSN, no row, or a
+    query fails — the agent then simply sees every column.
+    """
+    if not db_url:
+        return ""
+    try:
+        with psycopg.connect(db_url) as conn:
+            row = conn.execute(
+                "SELECT excluded_data_types FROM users WHERE id = %s", (user_id,)
+            ).fetchone()
+            return (row[0] or "") if row else ""
+    except psycopg.Error:
+        return ""
 
 
 def _open_readonly(cfg: dict[str, Any]) -> ReadOnlyDB:
@@ -1725,7 +2433,9 @@ def _open_readonly(cfg: dict[str, Any]) -> ReadOnlyDB:
             "GARMIN_DB_URL (or GARMIN_READONLY_DB_URL) must be set — "
             "Postgres is the only supported backend"
         )
-    return ReadOnlyDB.from_url(url, user_id=cfg.get("local_user_id") or 1)
+    user_id = cfg.get("local_user_id") or 1
+    excluded = _load_excluded_types(cfg.get("db_url", ""), user_id)
+    return ReadOnlyDB.from_url(url, user_id=user_id, excluded_types=excluded)
 
 
 def _record_turn(
@@ -1734,27 +2444,40 @@ def _record_turn(
     result: Any,
     *,
     trace_writer: Any,
+    answer: str | None = None,
 ) -> None:
     """Append a trace entry for this turn via ``trace_writer`` (which persists
     the record to the per-user ``user_state`` ``trace`` key)."""
     from .trace import build_trace_record
 
+    if answer is None:
+        answer = str(getattr(result, "output", ""))
+    usage = getattr(result, "usage", None)
+    if callable(usage):
+        try:
+            usage = usage()
+        except Exception:
+            pass
     record = build_trace_record(
         question,
         result.new_messages(),
-        answer=str(result.output),
+        answer=answer,
         model=cfg.get("llm_model", ""),
-        usage=result.usage,
+        usage=usage,
     )
     trace_writer(record)
 
 
 def _ask(cfg: dict[str, str], question: str) -> str:
     db = _open_readonly(cfg)
-    from .server.state import PgMemory, TrainingPlan, TrainingPlanStore, UserState
+    from .server.state import (
+        PgMemory, TrainingAnchor, TrainingGoalStore, TrainingPlan,
+        TrainingPlanStore, UserState,
+    )
 
     state = UserState(cfg["db_url"])
     plan_store = TrainingPlanStore(cfg["db_url"])
+    goal_store = TrainingGoalStore(cfg["db_url"])
     user_id = cfg.get("local_user_id") or 1
     try:
         result = _build_agent(
@@ -1762,6 +2485,7 @@ def _ask(cfg: dict[str, str], question: str) -> str:
             db,
             memory=PgMemory(state, user_id),
             plan=TrainingPlan(plan_store, user_id),
+            anchor=TrainingAnchor(goal_store, user_id),
         ).run_sync(question)
         _record_turn(
             cfg, question, result, trace_writer=lambda r: state.append_trace(user_id, r)
@@ -1771,6 +2495,7 @@ def _ask(cfg: dict[str, str], question: str) -> str:
         db.close()
         state.close()
         plan_store.close()
+        goal_store.close()
 
 
 def _seed_history_from_summary(summary: str) -> list[Any]:
@@ -1782,6 +2507,148 @@ def _seed_history_from_summary(summary: str) -> list[Any]:
             parts=[UserPromptPart(content=f"{_SUMMARY_LABEL}\n\n{summary}")]
         )
     ]
+
+
+def _system_prompt_head(messages: Iterable[Any]) -> Any | None:
+    """Collect every ``SystemPromptPart`` from a history into one ``ModelRequest``.
+
+    A resumed request only receives base system prompts when its history is empty
+    (Pydantic AI injects ``_sys_parts`` only then), so compacting a session must
+    carry the role/schema/date/memory parts forward or the model loses its
+    instructions. Returns ``None`` when there are none.
+    """
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+    parts = [
+        SystemPromptPart(content=p.content, dynamic_ref=p.dynamic_ref)
+        for msg in messages
+        for p in getattr(msg, "parts", [])
+        if isinstance(p, SystemPromptPart)
+    ]
+    return ModelRequest(parts=parts) if parts else None
+
+
+def _seed_after_system_prompts(
+    messages: Iterable[Any], summary: str
+) -> list[Any]:
+    """Seed a fresh session with a summary, preserving the system-prompt head.
+
+    The compacted transcript is dropped; the system-prompt parts (which carry
+    the role, schema overview, date+freshness and memory prompts) are kept so a
+    resumed session still has its instructions, followed by the summary as a
+    user message.
+    """
+    head = _system_prompt_head(messages)
+    seed = _seed_history_from_summary(summary)
+    return ([head] if head is not None else []) + seed
+
+
+def _part_text(part: Any) -> str:
+    """Best-effort text of one message part, for a token estimate."""
+    content = getattr(part, "content", None)
+    if content is None:
+        content = getattr(part, "args_json", None)
+    if content is None:
+        content = getattr(part, "args", None)
+    if content is None:
+        return str(part)
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _messages_token_estimate(messages: Iterable[Any]) -> int:
+    """Rough token count for a conversation (≈ chars/4)."""
+    total = sum(len(_part_text(p)) for msg in messages for p in getattr(msg, "parts", []))
+    return max(1, round(total / 4))
+
+
+def _auto_compact(
+    agent: Any, messages: list[Any], *, max_tokens: int = _AUTO_COMPACT_MAX_TOKENS
+) -> list[Any]:
+    """Fold an over-budget conversation into a summary, or return it unchanged.
+
+    Triggers once per session once the stored history (including raw tool
+    results) exceeds ``max_tokens``. The one extra LLM call to produce the
+    summary is paid only occasionally; the cheaper resumed sessions then start
+    from the summary and the system-prompt head instead of the whole transcript.
+    A compaction failure never loses the session — the history is kept as-is.
+    """
+    if not messages or _messages_token_estimate(messages) <= max_tokens:
+        return messages
+    try:
+        summary = str(agent.run_sync(_COMPACT_INSTRUCTION, message_history=messages).output).strip()
+    except Exception:
+        return messages
+    if not summary:
+        return messages
+    return _seed_after_system_prompts(messages, summary)
+
+
+def _prune_session_messages(messages: list[Any]) -> list[Any]:
+    """Sanitize ephemeral tool return payloads in stored message history.
+
+    Replaces large raw SQL row dumps, schema listings, and bulky tool return
+    payloads with concise markers (e.g. '[Query executed: N rows returned]'),
+    while preserving the full conversational transcript (user prompts,
+    system prompts, assistant final text, and tool-call identities). This
+    keeps resumed sessions light and prevents context-window bloat over multi-turn
+    conversations.
+    """
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart
+
+    pruned: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, ModelRequest):
+            pruned.append(msg)
+            continue
+        new_parts = []
+        for part in msg.parts:
+            if not isinstance(part, ToolReturnPart):
+                new_parts.append(part)
+                continue
+            content = part.content
+            content_str = str(content) if not isinstance(content, str) else content
+            if len(content_str) > 350:
+                tool = part.tool_name
+                summary_content = None
+                try:
+                    parsed = json.loads(content_str)
+                    if isinstance(parsed, dict):
+                        if "rows" in parsed and "columns" in parsed:
+                            n_rows = len(parsed.get("rows") or [])
+                            cols = ", ".join(parsed.get("columns") or [])
+                            summary_content = f"[Query executed: {n_rows} rows returned with columns ({cols})]"
+                        elif "series" in parsed and "summary" in parsed:
+                            pts = len(parsed.get("series") or [])
+                            m = parsed.get("metric", "")
+                            summary_content = f"[{m} trend: {pts} points, summary: {json.dumps(parsed.get('summary'))}]"
+                        elif "workouts" in parsed:
+                            wkts = len(parsed.get("workouts") or [])
+                            summary_content = f"[Training plan: {wkts} workouts retrieved]"
+                    elif isinstance(parsed, list):
+                        if tool == "table_schema":
+                            summary_content = f"[Table schema: {len(parsed)} columns inspected]"
+                        elif tool == "get_recent_activities":
+                            summary_content = f"[Recent activities: {len(parsed)} workouts retrieved]"
+                except Exception:
+                    pass
+                if not summary_content:
+                    summary_content = content_str[:250] + "… [output pruned for memory]"
+                new_part = ToolReturnPart(
+                    tool_name=part.tool_name,
+                    content=summary_content,
+                    tool_call_id=part.tool_call_id,
+                    outcome=part.outcome,
+                )
+                new_parts.append(new_part)
+            else:
+                new_parts.append(part)
+        pruned.append(ModelRequest(parts=new_parts))
+    return pruned
 
 
 def _ask_session(cfg: dict[str, str]) -> None:
@@ -1799,11 +2666,15 @@ def _ask_session(cfg: dict[str, str]) -> None:
       summary, then starts a new session seeded with that summary, so context
       survives in compressed form.
     """
-    from .server.state import PgMemory, TrainingPlan, TrainingPlanStore, UserState
+    from .server.state import (
+        PgMemory, TrainingAnchor, TrainingGoalStore, TrainingPlan,
+        TrainingPlanStore, UserState,
+    )
 
     db = _open_readonly(cfg)
     state = UserState(cfg["db_url"])
     plan_store = TrainingPlanStore(cfg["db_url"])
+    goal_store = TrainingGoalStore(cfg["db_url"])
     user_id = cfg.get("local_user_id") or 1
     try:
         agent = _build_agent(
@@ -1811,10 +2682,11 @@ def _ask_session(cfg: dict[str, str]) -> None:
             db,
             memory=PgMemory(state, user_id),
             plan=TrainingPlan(plan_store, user_id),
+            anchor=TrainingAnchor(goal_store, user_id),
         )
         history = state.get_session_messages(user_id) or []
         if history:
-            _refresh_resumed_prompt(history)
+            _refresh_resumed_prompt(history, db)
             print(
                 f"Resumed {len(history)} prior message(s) from the database "
                 f"(user {user_id})"
@@ -1862,7 +2734,7 @@ def _ask_session(cfg: dict[str, str]) -> None:
                     print("Compaction produced no summary; keeping the current context.")
                     continue
                 n_before = len(history)
-                history = _seed_history_from_summary(summary)
+                history = _seed_after_system_prompts(history, summary)
                 _persist(history)
                 print(
                     f"Compacted {n_before} message(s) into 1; "
@@ -1887,6 +2759,7 @@ def _ask_session(cfg: dict[str, str]) -> None:
         db.close()
         state.close()
         plan_store.close()
+        goal_store.close()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -14,8 +14,13 @@ API:
 - ``GET  /acwr``            — acute-to-chronic workload ratio (JWT)
 - ``GET  /training-plan``   — the caller's planned workouts (JWT, optional range)
 - ``POST /training-plan``   — add a workout (JWT)
-- ``PUT  /training-plan/{id}`` — update a workout (JWT)
-- ``DELETE /training-plan/{id}`` — delete a workout (JWT)
+- ``PATCH /training-plan/{id}`` — partial update of a workout (JWT)
+- ``PUT  /training-plan/{id}`` — full replace of a workout (JWT)
+- ``DELETE /training-plan/{id}`` — delete a workout (JWT, undoable)
+- ``POST /training-plan/bulk`` — shift/repeat/delete-range/dry-run/undo (JWT)
+- ``POST /training-plan/undo`` — restore the pre-delete snapshot (JWT)
+- ``GET  /training-goal``    — goals + phases + waves + resolved week (JWT)
+- ``POST /training-goal/undo`` — restore the pre-delete anchor (JWT)
 - ``POST /ask``             — run the read-only agent (JWT, per-user rows)
 - ``GET  /ask/history``     — the stored conversation for the caller (JWT)
 - ``POST /ask/clear``       — drop the stored conversation, fresh session (JWT)
@@ -37,14 +42,17 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..ask import (
     ReadOnlyDB,
+    _auto_compact,
     _build_agent,
     _build_chart_figure,
+    _messages_token_estimate,
+    _prune_session_messages,
     _record_turn,
     _refresh_resumed_prompt,
 )
@@ -58,7 +66,10 @@ from ..config import load_config
 from ..db import ensure_schema
 from .auth import AuthError, AuthService, UserStore
 from .setup_db import ensure_roles
-from .state import PgMemory, TrainingPlan, TrainingPlanStore, UserState
+from .state import (
+    PgMemory, TrainingAnchor, TrainingGoalStore, TrainingPlan,
+    TrainingPlanStore, UserState,
+)
 from .sync_worker import SyncManager
 
 logger = logging.getLogger(__name__)
@@ -88,6 +99,7 @@ class LoginRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
     history: list[dict[str, Any]] = []
+    stream: bool = False
 
 
 class ChartRequest(BaseModel):
@@ -102,9 +114,12 @@ class ConfigRequest(BaseModel):
     excluded_data_types: list[str] | None = None
     auto_sync: bool | None = None
     sync_start_date: str | None = None
+    reasoning_effort: str | None = None
 
 
 class TrainingPlanWorkout(BaseModel):
+    """A planned workout (full create/replace body)."""
+
     planned_date: str
     activity_type: str
     title: str | None = None
@@ -112,7 +127,81 @@ class TrainingPlanWorkout(BaseModel):
     duration_min: int | None = None
     distance_km: float | None = None
     intensity: str | None = None
+    target_pace_min_km: float | None = None
+    target_hr_zone: str | None = None
+    target_power_w: int | None = None
+    status: str | None = None
     completed: bool = False
+    goal_id: int | None = None
+    block_id: int | None = None
+
+
+class TrainingPlanPatch(BaseModel):
+    """A partial workout edit — only the supplied fields change (PATCH)."""
+
+    planned_date: str | None = None
+    activity_type: str | None = None
+    title: str | None = None
+    description: str | None = None
+    duration_min: int | None = None
+    distance_km: float | None = None
+    intensity: str | None = None
+    target_pace_min_km: float | None = None
+    target_hr_zone: str | None = None
+    target_power_w: int | None = None
+    status: str | None = None
+    completed: bool | None = None
+    goal_id: int | None = None
+    block_id: int | None = None
+
+
+class TrainingPlanBulk(BaseModel):
+    """A bulk plan edit (shift / repeat / delete-range / undo)."""
+
+    replace: bool = False
+    delete_ids: list[int] | None = None
+    delete_range: dict[str, str] | None = None
+    shift: dict[str, Any] | None = None
+    repeat_week: dict[str, Any] | None = None
+    workouts: list[TrainingPlanPatch] | None = None
+    undo: bool = False
+
+
+class TrainingWave(BaseModel):
+    week_index: int | None = None
+    distance_km: float | None = None
+    duration_min: int | None = None
+    intensity: str | None = None
+    is_deload: bool | None = None
+    notes: str | None = None
+
+
+class TrainingBlock(BaseModel):
+    id: int | None = None
+    name: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    focus: str | None = None
+    notes: str | None = None
+    sort_order: int | None = None
+    meta: str | None = None
+    waves: list[TrainingWave] | None = None
+    clear_waves: bool | None = None
+
+
+class TrainingGoal(BaseModel):
+    title: str | None = None
+    sport: str | None = None
+    event_type: str | None = None
+    target_date: str | None = None
+    target_distance_km: float | None = None
+    target_time: str | None = None
+    notes: str | None = None
+    target_id: str | None = None
+    meta: str | None = None
+    blocks: list[TrainingBlock] | None = None
+    replace_blocks: list[TrainingBlock] | None = None
+    delete_blocks: list[int] | None = None
 
 
 # -- App state ---------------------------------------------------------------
@@ -126,13 +215,18 @@ def _per_user_cfg(cfg: dict[str, Any], user_id: int) -> dict[str, Any]:
     return dict(cfg)
 
 
-def _readonly(cfg: dict[str, Any], user_id: int) -> ReadOnlyDB:
+def _readonly(
+    cfg: dict[str, Any], user_id: int, excluded_types: str = ""
+) -> ReadOnlyDB:
     url = cfg.get("readonly_db_url") or cfg["db_url"]
     if not cfg.get("readonly_db_url"):
         logger.warning(
             "GARMIN_READONLY_DB_URL not set — agent connects as the writer role"
         )
-    return ReadOnlyDB.from_url(url, user_id=user_id)
+    # Hide columns the account can't have data for (disabled data types) so the
+    # agent's schema introspection stays lean and never costs tokens on metrics
+    # it will only ever see as NULL.
+    return ReadOnlyDB.from_url(url, user_id=user_id, excluded_types=excluded_types)
 
 
 def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dict[str, Any]:
@@ -146,7 +240,10 @@ def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dic
     user_cfg["llm_api_key"] = cfg.get("llm_api_key") or ""
     user_cfg["llm_base_url"] = cfg.get("llm_base_url") or ""
     user_cfg["llm_model"] = cfg.get("llm_model") or ""
-    user_cfg["llm_reasoning_effort"] = cfg.get("llm_reasoning_effort") or ""
+    user_cfg["llm_provider"] = cfg.get("llm_provider") or ""
+    user_cfg["llm_reasoning_effort"] = (
+        user.get("reasoning_effort") or cfg.get("llm_reasoning_effort") or ""
+    )
     user_cfg["weather_home_lat"] = user.get("home_lat") or ""
     user_cfg["weather_home_lon"] = user.get("home_lon") or ""
     user_cfg["excluded_data_types"] = user.get("excluded_data_types") or ""
@@ -166,11 +263,14 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         sync = SyncManager(cfg)
         state = UserState(cfg["db_url"])
         plan = TrainingPlanStore(cfg["db_url"])
+        goal = TrainingGoalStore(cfg["db_url"])
         app.state.auth = auth
         app.state.sync = sync
         app.state.state = state
         app.state.plan = plan
+        app.state.goal = goal
         app.state.cfg = cfg
+        app.state.chart_cache = {}
         sync.start()
         logger.info("garmin server started")
         try:
@@ -179,6 +279,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             sync.shutdown()
             state.close()
             plan.close()
+            goal.close()
             auth.close()
 
     app = FastAPI(title="Garmin Agent", lifespan=lifespan)
@@ -281,6 +382,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             kwargs["auto_sync"] = body.auto_sync
         if body.sync_start_date is not None:
             kwargs["sync_start_date"] = body.sync_start_date
+        if body.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = body.reasoning_effort
         auth.save_user_config(user["id"], **kwargs)
         return {"status": "ok"}
 
@@ -421,6 +524,19 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         plan: TrainingPlanStore = request.app.state.plan
         return {"workouts": plan.list(user["id"], from_date, to_date)}
 
+    @app.get("/training-plan/activity-types")
+    def training_plan_activity_types(
+        user: dict = Depends(get_user),
+    ) -> dict[str, Any]:
+        """Garmin typeKeys that satisfy each plan ``activity_type``.
+
+        The single source of truth (``state.GARMIN_TYPE_MAP``) shared with the
+        plan tab's weekly volume matching, so the UI never keeps its own copy.
+        """
+        from .state import GARMIN_TYPE_MAP
+
+        return {"types": {k: sorted(v) for k, v in GARMIN_TYPE_MAP.items()}}
+
     @app.post("/training-plan")
     def training_plan_create(
         body: TrainingPlanWorkout, request: Request, user: dict = Depends(get_user)
@@ -430,6 +546,62 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             return plan.create(user["id"], body.model_dump())
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/training-plan/bulk")
+    def training_plan_bulk(
+        body: TrainingPlanBulk, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """One atomic bulk edit: shift / repeat a week / delete a range / undo.
+
+        Destructive edits (replace/delete) snapshot the plan first, restorable
+        with ``{"undo": true}``.
+        """
+        plan: TrainingPlanStore = request.app.state.plan
+        spec = body.model_dump(exclude_unset=True)
+        if body.workouts is not None:
+            spec["workouts"] = [
+                w.model_dump(exclude_unset=True) for w in body.workouts
+            ]
+        try:
+            return plan.apply(user["id"], spec)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/training-plan/undo")
+    def training_plan_undo(
+        request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """Restore the plan from the snapshot taken before the last wipe."""
+        plan: TrainingPlanStore = request.app.state.plan
+        try:
+            restored = plan.undo(user["id"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"restored": restored}
+
+    @app.patch("/training-plan/{workout_id}")
+    def training_plan_patch(
+        workout_id: int,
+        body: TrainingPlanPatch,
+        request: Request,
+        user: dict = Depends(get_user),
+    ) -> dict[str, Any]:
+        """Partial workout update — only the fields sent change.
+
+        This is the edit path the plan tab uses, so moving a workout never
+        clears its title, targets or goal/block link.
+        """
+        plan: TrainingPlanStore = request.app.state.plan
+        try:
+            row = plan.update(
+                user["id"], workout_id, body.model_dump(exclude_unset=True),
+                partial=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if row is None:
+            raise HTTPException(404, "workout not found")
+        return row
 
     @app.put("/training-plan/{workout_id}")
     def training_plan_update(
@@ -452,8 +624,230 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         workout_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
         plan: TrainingPlanStore = request.app.state.plan
+        plan.snapshot(user["id"])
         if not plan.delete(user["id"], workout_id):
             raise HTTPException(404, "workout not found")
+        return {"status": "ok"}
+
+    @app.get("/activities")
+    def activities_get(
+        request: Request,
+        user: dict = Depends(get_user),
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict[str, Any]:
+        """The user's synced activities in an inclusive date range.
+
+        Lightweight read for the Training Plan tab's weekly progress (actual
+        mileage vs the wave target). Returns activity_id, start_date,
+        activity_type, distance_km and duration_hours.
+        """
+        from datetime import date as _date
+
+        from ..db import PostgresBackend
+
+        for label, value in (("from_date", from_date), ("to_date", to_date)):
+            if value:
+                try:
+                    _date.fromisoformat(value)
+                except ValueError as exc:
+                    raise HTTPException(
+                        400, f"{label} must be a YYYY-MM-DD date (or blank)"
+                    ) from exc
+        if not from_date or not to_date:
+            raise HTTPException(400, "pass both from_date and to_date")
+
+        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
+        conn = backend.connect()
+        try:
+            rows = conn.execute(
+                "SELECT activity_id, start_date, activity_type, distance_km, "
+                "duration_hours FROM activity_summaries "
+                "WHERE user_id = %s AND start_date >= %s AND start_date <= %s "
+                "ORDER BY start_date",
+                (user["id"], from_date, to_date),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"activities": [dict(r) for r in rows]}
+
+    # -- long-term anchor -----------------------------------------------------
+
+    def _goal_dump(
+        store: TrainingGoalStore, user_id: int, gid: int,
+        week_start: str | None = None,
+    ) -> dict[str, Any]:
+        """One goal with its phases (+ waves), resolved phase and weekly target.
+
+        Thin wrapper over ``TrainingGoalStore.resolve_goal`` (the single
+        composition shared with the agent tools), resolved for ``week_start``
+        (default today) so the plan tab never re-derives block/wave selection.
+        """
+        resolved = store.resolve_goal(user_id, gid, week_start)
+        if resolved is None:
+            raise HTTPException(404, "goal not found")
+        return resolved
+
+    def _block_dump(store: TrainingGoalStore, user_id: int, block_id: int) -> dict[str, Any]:
+        """Nest one block with its waves (404 when it does not exist)."""
+        row = store.get_block(user_id, block_id)
+        if row is None:
+            raise HTTPException(404, "block not found")
+        row = dict(row)
+        row["waves"] = store.list_waves(user_id, block_id)
+        return row
+
+    @app.get("/training-goal")
+    def training_goal_get(
+        request: Request, user: dict = Depends(get_user),
+        week_start: str | None = None,
+    ) -> dict[str, Any]:
+        """The user's long-term anchors (goal + blocks + waves + current block).
+
+        ``week_start`` (YYYY-MM-DD, default today) selects the week whose wave
+        target each goal reports as ``weekly_target``.
+        """
+        if week_start:
+            from datetime import date as _date
+
+            try:
+                _date.fromisoformat(week_start)
+            except ValueError as exc:
+                raise HTTPException(
+                    400, "week_start must be a YYYY-MM-DD date"
+                ) from exc
+        goal: TrainingGoalStore = request.app.state.goal
+        goals = [
+            _goal_dump(goal, user["id"], g["id"], week_start)
+            for g in goal.list_goals(user["id"])
+        ]
+        return {"goals": goals}
+
+    @app.post("/training-goal")
+    def training_goal_create(
+        body: TrainingGoal, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """Create a new long-term goal (appends it; never wipes other goals)."""
+        goal: TrainingGoalStore = request.app.state.goal
+        try:
+            saved = goal.create_goal(user["id"], body.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return _goal_dump(goal, user["id"], saved["id"])
+
+    @app.post("/training-goal/undo")
+    def training_goal_undo(
+        request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """Restore goals/blocks/waves from the last destructive-edit snapshot."""
+        goal: TrainingGoalStore = request.app.state.goal
+        try:
+            restored = goal.undo(user["id"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"restored": restored}
+
+    @app.get("/training-goal/{goal_id}")
+    def training_goal_get_one(
+        goal_id: int, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        goal: TrainingGoalStore = request.app.state.goal
+        if goal.get_goal(user["id"], goal_id) is None:
+            raise HTTPException(404, "goal not found")
+        return _goal_dump(goal, user["id"], goal_id)
+
+    @app.patch("/training-goal/{goal_id}")
+    def training_goal_update(
+        goal_id: int,
+        body: TrainingGoal,
+        request: Request,
+        user: dict = Depends(get_user),
+    ) -> dict[str, Any]:
+        """Partial update of one goal (only the fields sent change)."""
+        goal: TrainingGoalStore = request.app.state.goal
+        data = body.model_dump(exclude_unset=True)
+        if "replace_blocks" in data or "delete_blocks" in data:
+            # Destructive block edits are restorable via /training-goal/undo.
+            goal.snapshot(user["id"])
+        try:
+            saved = goal.update_goal(user["id"], goal_id, data)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if saved is None:
+            raise HTTPException(404, "goal not found")
+        return _goal_dump(goal, user["id"], goal_id)
+
+    @app.delete("/training-goal/{goal_id}")
+    def training_goal_delete(
+        goal_id: int, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        goal: TrainingGoalStore = request.app.state.goal
+        goal.snapshot(user["id"])
+        if not goal.delete_goal(user["id"], goal_id):
+            raise HTTPException(404, "goal not found")
+        return {"status": "ok"}
+
+    @app.get("/training-goal/block/{block_id}/waves")
+    def training_wave_list(
+        block_id: int, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        goal: TrainingGoalStore = request.app.state.goal
+        if goal.get_block(user["id"], block_id) is None:
+            raise HTTPException(404, "block not found")
+        return {"waves": goal.list_waves(user["id"], block_id)}
+
+    @app.put("/training-goal/block/{block_id}/waves")
+    def training_wave_replace(
+        block_id: int,
+        body: TrainingBlock,
+        request: Request,
+        user: dict = Depends(get_user),
+    ) -> dict[str, Any]:
+        """Replace a block's wave (microcycle) target list."""
+        goal: TrainingGoalStore = request.app.state.goal
+        waves = [w.model_dump(exclude_none=True) for w in (body.waves or [])]
+        try:
+            result = goal.replace_waves(user["id"], block_id, waves)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"waves": result}
+
+    @app.patch("/training-goal/block/{block_id}")
+    def training_block_update(
+        block_id: int,
+        body: TrainingBlock,
+        request: Request,
+        user: dict = Depends(get_user),
+    ) -> dict[str, Any]:
+        """Partial block update — adjust dates/notes/waves without rewriting the season."""
+        goal: TrainingGoalStore = request.app.state.goal
+        try:
+            row = goal.update_block(
+                user["id"], block_id, body.model_dump(exclude_unset=True)
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if row is None:
+            raise HTTPException(404, "block not found")
+        return _block_dump(goal, user["id"], block_id)
+
+    @app.put("/training-goal/block/{block_id}")
+    def training_block_replace(
+        block_id: int,
+        body: TrainingBlock,
+        request: Request,
+        user: dict = Depends(get_user),
+    ) -> dict[str, Any]:
+        """Full block update (all provided fields applied)."""
+        return training_block_update(block_id, body, request, user)
+
+    @app.delete("/training-goal/block/{block_id}")
+    def training_block_delete(
+        block_id: int, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        goal: TrainingGoalStore = request.app.state.goal
+        if not goal.delete_block(user["id"], block_id):
+            raise HTTPException(404, "block not found")
         return {"status": "ok"}
 
     # -- weather ---------------------------------------------------------------
@@ -512,9 +906,9 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     # -- ask ------------------------------------------------------------------
 
     @app.post("/ask")
-    def ask(
+    async def ask(
         body: AskRequest, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
+    ):
         auth: AuthService = request.app.state.auth
         if not auth.user_llm_configured(user):
             raise HTTPException(
@@ -523,43 +917,170 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 "LLM_BASE_URL with LLM_MODEL) in the server .env and restart",
             )
         user_cfg = _user_agent_cfg(request.app.state.cfg, user, auth)
-        db = _readonly(request.app.state.cfg, user["id"])
+        db = _readonly(
+            request.app.state.cfg,
+            user["id"],
+            excluded_types=user.get("excluded_data_types") or "",
+        )
         state: UserState = request.app.state.state
-        try:
-            memory = PgMemory(state, user["id"])
-            agent = _build_agent(
-                user_cfg,
-                db,
-                memory=memory,
-                plan=TrainingPlan(request.app.state.plan, user["id"]),
-            )
-            # The DB is the source of truth for the conversation: a caller that
-            # sends no history resumes the stored session (full replay), so a
-            # returning user continues exactly where they left off.
-            if body.history:
-                history = _history_to_messages(body.history)
-            else:
-                history = state.get_session_messages(user["id"])
-                if history:
-                    # Stored sessions may carry a stale "Today is <yesterday>"
-                    # system prompt from before the date became dynamic.
-                    _refresh_resumed_prompt(history)
-            result = agent.run_sync(body.question, message_history=history)
+        chart_cache = getattr(request.app.state, "chart_cache", {})
 
-            def _trace_writer(record: dict) -> None:
-                state.append_trace(user["id"], record)
+        is_streaming = body.stream or (request.headers.get("accept") == "text/event-stream")
 
-            _record_turn(user_cfg, body.question, result, trace_writer=_trace_writer)
-            answer = str(result.output)
-            text, specs = _extract_charts(answer)
-            text = _replace_plan_dumps(text)
-            state.set_session_messages(user["id"], result.all_messages())
-            return {"answer": text, "chart_specs": specs}
-        except Exception as exc:  # noqa: BLE001 - a bad question must not crash the server
-            logger.exception("ask failed for user %s", user["id"])
-            raise HTTPException(500, f"ask failed: {exc}") from exc
-        finally:
-            db.close()
+        if not is_streaming:
+            try:
+                memory = PgMemory(state, user["id"])
+                agent = _build_agent(
+                    user_cfg,
+                    db,
+                    memory=memory,
+                    plan=TrainingPlan(request.app.state.plan, user["id"]),
+                    anchor=TrainingAnchor(request.app.state.goal, user["id"]),
+                    chart_cache=chart_cache,
+                )
+                if body.history:
+                    history = _history_to_messages(body.history)
+                else:
+                    history = state.get_session_messages(user["id"])
+                    if history:
+                        _refresh_resumed_prompt(history, db)
+                result = await agent.run(body.question, message_history=history)
+
+                def _trace_writer(record: dict) -> None:
+                    state.append_trace(user["id"], record)
+
+                _record_turn(user_cfg, body.question, result, trace_writer=_trace_writer)
+                answer = str(result.output)
+                text, specs = _extract_charts(answer)
+                text = _replace_plan_dumps(text)
+                figures = [chart_cache.get(s.get("sql", "").strip()) for s in specs]
+                messages = _prune_session_messages(result.all_messages())
+                state.set_session_messages(user["id"], messages)
+                return {
+                    "answer": text,
+                    "chart_specs": specs,
+                    "chart_figures": figures,
+                    "tokens": _messages_token_estimate(messages),
+                }
+            except Exception as exc:  # noqa: BLE001 - a bad question must not crash the server
+                logger.exception("ask failed for user %s", user["id"])
+                raise HTTPException(500, f"ask failed: {exc}") from exc
+            finally:
+                db.close()
+
+        # Streaming path via Server-Sent Events (SSE)
+        import asyncio
+
+        async def event_generator():
+            queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def on_status(msg: str) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, ("status", {"text": msg}))
+
+            async def runner():
+                try:
+                    memory = PgMemory(state, user["id"])
+                    agent = _build_agent(
+                        user_cfg,
+                        db,
+                        memory=memory,
+                        plan=TrainingPlan(request.app.state.plan, user["id"]),
+                        anchor=TrainingAnchor(request.app.state.goal, user["id"]),
+                        chart_cache=chart_cache,
+                        on_status=on_status,
+                    )
+                    if body.history:
+                        history = _history_to_messages(body.history)
+                    else:
+                        history = state.get_session_messages(user["id"])
+                        if history:
+                            _refresh_resumed_prompt(history, db)
+
+                    # ``agent.run_stream`` treats the *first* text part as the
+                    # final output and stops the graph there, so a model that
+                    # narrates before a tool call ("Let me check…") would have
+                    # that preamble returned as the whole answer. ``agent.iter``
+                    # streams the same text but always runs the graph to
+                    # completion, so the real final output is captured.
+                    from pydantic_ai.messages import (
+                        PartDeltaEvent,
+                        PartStartEvent,
+                        TextPart,
+                        TextPartDelta,
+                    )
+
+                    async with agent.iter(body.question, message_history=history) as agent_run:
+                        async for node in agent_run:
+                            if not agent.is_model_request_node(node):
+                                continue
+                            async with node.stream(agent_run.ctx) as stream:
+                                async for event in stream:
+                                    if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                                        delta = event.part.content
+                                    elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                                        delta = event.delta.content_delta
+                                    else:
+                                        continue
+                                    if delta:
+                                        await queue.put(("delta", {"text": delta}))
+
+                        if agent_run.result is None:
+                            raise RuntimeError("agent run finished without a result")
+                        result = agent_run.result
+                        answer = str(result.output)
+
+                        def _trace_writer(record: dict) -> None:
+                            state.append_trace(user["id"], record)
+
+                        _record_turn(
+                            user_cfg,
+                            body.question,
+                            result,
+                            trace_writer=_trace_writer,
+                            answer=answer,
+                        )
+                        text, specs = _extract_charts(answer)
+                        text = _replace_plan_dumps(text)
+                        figures = [chart_cache.get(s.get("sql", "").strip()) for s in specs]
+                        messages = _prune_session_messages(result.all_messages())
+                        state.set_session_messages(user["id"], messages)
+
+                        await queue.put((
+                            "done",
+                            {
+                                "answer": text,
+                                "chart_specs": specs,
+                                "chart_figures": figures,
+                                "tokens": _messages_token_estimate(messages),
+                            },
+                        ))
+                except Exception as exc:
+                    logger.exception("streaming ask failed for user %s", user["id"])
+                    await queue.put(("error", {"error": str(exc)}))
+                finally:
+                    db.close()
+
+            runner_task = asyncio.create_task(runner())
+            try:
+                while True:
+                    event_type, payload = await queue.get()
+                    yield f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    if event_type in ("done", "error"):
+                        break
+            finally:
+                if not runner_task.done():
+                    runner_task.cancel()
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/ask/history")
     def ask_history(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
@@ -572,12 +1093,19 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         state: UserState = request.app.state.state
         messages = state.get_session_messages(user["id"]) or []
         history = _messages_to_history(messages)
+        cache = getattr(request.app.state, "chart_cache", {})
         for item in history:
             if item.get("role") in ("assistant", "bot"):
                 text, specs = _extract_charts(item["content"])
                 item["content"] = _replace_plan_dumps(text)
                 item["chart_specs"] = specs
-        return {"history": history}
+                item["chart_figures"] = [
+                    cache.get(s.get("sql", "").strip()) for s in specs
+                ] if cache else []
+        return {
+            "history": history,
+            "tokens": _messages_token_estimate(messages),
+        }
 
     @app.post("/ask/clear")
     def ask_clear(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
@@ -587,19 +1115,70 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         state.clear_session(user["id"])
         return {"status": "ok"}
 
+    @app.post("/ask/compact")
+    def ask_compact(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
+        """Fold the stored conversation into a compact summary (system-prompt
+        head kept), so the next turn resumes from a small seed instead of the
+        whole transcript. Called by the chat's Compact button — it is never run
+        automatically, so a slow tool-calling turn is never slowed further."""
+        auth: AuthService = request.app.state.auth
+        if not auth.user_llm_configured(user):
+            raise HTTPException(
+                503, "the LLM agent is not configured: set LLM_API_KEY (or a "
+                "local LLM_BASE_URL with LLM_MODEL) in the server .env and restart"
+            )
+        user_cfg = _user_agent_cfg(request.app.state.cfg, user, auth)
+        db = _readonly(
+            request.app.state.cfg,
+            user["id"],
+            excluded_types=user.get("excluded_data_types") or "",
+        )
+        state: UserState = request.app.state.state
+        try:
+            messages = state.get_session_messages(user["id"]) or []
+            if not messages:
+                return {"tokens": 0, "unchanged": True}
+            agent = _build_agent(
+                user_cfg,
+                db,
+                memory=PgMemory(state, user["id"]),
+                plan=TrainingPlan(request.app.state.plan, user["id"]),
+                anchor=TrainingAnchor(request.app.state.goal, user["id"]),
+            )
+            compacted = _auto_compact(agent, messages, max_tokens=0)
+            state.set_session_messages(user["id"], compacted)
+            return {
+                "tokens": _messages_token_estimate(compacted),
+                "unchanged": compacted is messages,
+            }
+        finally:
+            db.close()
+
     @app.post("/ask/chart")
     def ask_chart(
         body: ChartRequest, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
         cfg = request.app.state.cfg
         spec = body.spec
-        if not isinstance(spec.get("sql"), str):
+        sql = spec.get("sql")
+        if not isinstance(sql, str):
             raise HTTPException(400, "chart spec needs a string 'sql' key")
+        cache = getattr(request.app.state, "chart_cache", None)
+        if cache:
+            cached = cache.get(sql.strip()) or cache.get(json.dumps(spec, sort_keys=True))
+            if cached:
+                return cached
         db = _readonly(cfg, user["id"])
         try:
-            result = db.run_sql(spec["sql"])
+            result = db.run_sql(sql)
             figure = _build_chart_figure(spec, result)
-            return json.loads(figure.to_json())
+            fig_dict = json.loads(figure.to_json())
+            if cache is not None:
+                if len(cache) > 500:
+                    cache.clear()
+                cache[sql.strip()] = fig_dict
+                cache[json.dumps(spec, sort_keys=True)] = fig_dict
+            return fig_dict
         except Exception as exc:  # noqa: BLE001 - invalid spec -> client error
             raise HTTPException(400, f"invalid chart spec: {exc}") from exc
         finally:

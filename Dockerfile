@@ -26,10 +26,13 @@ COPY src ./src
 RUN uv sync --frozen --no-dev
 
 # Run as a non-root user; expose the venv entry points directly so the runtime
-# never needs the uv cache or network.
+# never needs the uv cache or network. The venv + src are read-only at runtime
+# (every user-facing byte lives in Postgres), so they can stay root-owned; only
+# the app user and a small scratch dir need a fast, non-recursive chown (a
+# recursive chown over .venv is the build bottleneck — thousands of files).
 ENV PATH="/app/.venv/bin:$PATH"
 RUN useradd --create-home --shell /bin/bash appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /app/.scratch && chown appuser:appuser /app/.scratch
 USER appuser
 
 EXPOSE 8000

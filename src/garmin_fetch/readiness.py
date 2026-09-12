@@ -14,8 +14,15 @@ Method (28-day rolling baselines with ``min_samples=7``):
 - ``Z_HRV = (HRV_today - mu_HRV) / sigma_HRV``, clamped at ``+2.0`` max so a
   parasympathetic spike can't inflate the score.
 - ``Z_RHR = (mu_RHR - RHR_today) / sigma_RHR`` (inverted: lower RHR = higher).
-- ``Z_Sleep = (Sleep_today - mu_Sleep) / sigma_Sleep``.
-- ``C = 0.50*Z_HRV + 0.30*Z_RHR + 0.20*Z_Sleep``.
+- Sleep is measured transparently rather than through Garmin's opaque
+  ``sleep_score``: ``Z_dur = z(sleep_time_hours)`` and ``Z_qual = z(quality)``,
+  blended as ``Z_Sleep = 0.65*Z_dur + 0.35*Z_qual`` when both are available
+  (whichever is present alone is used directly). Quality is the restorative
+  share ``(deep + rem) / sleep_time``, falling back to sleep efficiency
+  ``sleep_time / (sleep_time + awake)`` when the stage breakdown is missing.
+- The composite is the weighted mean over whichever components are available,
+  renormalized so a missing signal narrows the set instead of blanking the day:
+  ``C = (0.50*Z_HRV + 0.30*Z_RHR + 0.20*Z_Sleep) / sum(available weights)``.
 
 The composite is then scaled to 0-100 against a rolling window of the user's
 own recent composites instead of a fixed linear map: ``SCORE_ANCHORS``
@@ -28,10 +35,10 @@ no longer shifts when new nights are added). Calibration needs at least
 ``MIN_SCALE_SAMPLES`` composites in the window; scores stay monotone in C: a
 better night is always a higher score.
 
-All three of today's metrics and all three baselines must be available for a
-day to receive a score, and its calibration window must hold enough prior
-composites; otherwise that day's score is null (insufficient data). A zero
-baseline sigma yields a z-score of 0 (no signal, no penalty).
+All of a day's available components and baselines are used, and its
+calibration window must hold enough prior composites; otherwise that day's
+score is null (insufficient data). A zero baseline sigma yields a z-score of 0
+(no signal, no penalty).
 """
 
 from __future__ import annotations
@@ -53,6 +60,10 @@ HRV_Z_CLAMP = 2.0
 WEIGHT_HRV = 0.50
 WEIGHT_RHR = 0.30
 WEIGHT_SLEEP = 0.20
+
+#: How the sleep component splits into duration vs quality when both exist.
+SLEEP_DURATION_WEIGHT = 0.65
+SLEEP_QUALITY_WEIGHT = 0.35
 
 #: Target score distribution, as (cumulative percentile, score) anchor points.
 #: ``(p, s)`` means "the score that the p-th cumulative fraction of days
@@ -87,6 +98,39 @@ def _z_score(value: Any, mu: float | None, sigma: float | None) -> float | None:
     if sigma == 0:
         return 0.0
     return (value - mu) / sigma
+
+
+def _sleep_quality(day: dict[str, Any]) -> float | None:
+    """A transparent sleep-quality proxy in ``[0, 1]``.
+
+    The restorative share ``(deep + rem) / sleep_time`` when the stage
+    breakdown is present, else sleep efficiency ``sleep_time / (sleep_time +
+    awake)``. Returns None when time asleep (or the fallback inputs) are
+    missing, so the sleep component can still rely on duration alone.
+    """
+    slept = day.get("sleep_time_hours")
+    if not isinstance(slept, (int, float)) or slept <= 0:
+        return None
+    restorative = sum(
+        v for v in (day.get("deep_sleep_hours"), day.get("rem_sleep_hours"))
+        if isinstance(v, (int, float))
+    )
+    if restorative > 0:
+        return restorative / slept
+    awake = day.get("awake_sleep_hours")
+    if isinstance(awake, (int, float)) and slept + awake > 0:
+        return slept / (slept + awake)
+    return None
+
+
+def _weighted_mean(parts: list[tuple[float, float | None]]) -> float | None:
+    """Weighted mean of the available (weight, z) pairs, renormalized. None
+    when nothing is available."""
+    usable = [(w, z) for w, z in parts if z is not None]
+    total = sum(w for w, _ in usable)
+    if total == 0:
+        return None
+    return sum(w * z for w, z in usable) / total
 
 
 def _category(score: float) -> str:
@@ -147,10 +191,11 @@ def compute_readiness(days: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     ``days`` is the ordered list of rows from ``daily_metrics`` (each with
     ``calendar_date``, and the ``hrv_last_night_avg`` / ``resting_hr`` /
-    ``sleep_score`` columns when present). Returns one row per input day with
-    the raw metrics, the baseline mean/std used, the per-metric z-scores, the
-    sample counts, the weighted composite, and the 0-100 score + category
-    (all null on days with insufficient data). Rows keep the input order.
+    ``sleep_time_hours`` (+ sleep-stage) columns when present). Returns one row
+    per input day with the raw metrics, the baseline mean/std used, the
+    per-metric z-scores, the sample counts, the weighted composite, and the
+    0-100 score + category (all null on days with insufficient data). Rows keep
+    the input order.
 
     Scores are derived from the composite via ``SCORE_ANCHORS`` calibrated
     against the trailing ``SCALE_WINDOW_DAYS`` of composites before each day
@@ -169,43 +214,56 @@ def compute_readiness(days: list[dict[str, Any]]) -> list[dict[str, Any]]:
         while window and window[0]["_date"] < cutoff:
             window.popleft()
 
-        mu_hrv, sd_hrv, n_hrv = _baseline(r["hrv_last_night_avg"] for r in window)
-        mu_rhr, sd_rhr, n_rhr = _baseline(r["resting_hr"] for r in window)
-        mu_sleep, sd_sleep, n_sleep = _baseline(r["sleep_score"] for r in window)
+        mu_hrv, sd_hrv, n_hrv = _baseline(r.get("hrv_last_night_avg") for r in window)
+        mu_rhr, sd_rhr, n_rhr = _baseline(r.get("resting_hr") for r in window)
+        mu_sleep, sd_sleep, n_sleep = _baseline(r.get("sleep_time_hours") for r in window)
+        mu_qual, sd_qual, n_qual = _baseline(r.get("_sleep_quality") for r in window)
 
         hrv = day.get("hrv_last_night_avg")
         rhr = day.get("resting_hr")
-        sleep = day.get("sleep_score")
+        sleep = day.get("sleep_time_hours")
+        quality = _sleep_quality(day)
 
         z_hrv = _z_score(hrv, mu_hrv, sd_hrv)
         z_rhr = _z_score(rhr, mu_rhr, sd_rhr)
-        z_sleep = _z_score(sleep, mu_sleep, sd_sleep)
+        if z_rhr is not None:
+            z_rhr = -z_rhr
+        z_dur = _z_score(sleep, mu_sleep, sd_sleep)
+        z_qual = _z_score(quality, mu_qual, sd_qual)
+        z_sleep = _weighted_mean([
+            (SLEEP_DURATION_WEIGHT, z_dur),
+            (SLEEP_QUALITY_WEIGHT, z_qual),
+        ])
         z_hrv_clamped = min(z_hrv, HRV_Z_CLAMP) if z_hrv is not None else None
 
-        composite: float | None = None
-        if z_hrv_clamped is not None and z_rhr is not None and z_sleep is not None:
-            composite = (
-                WEIGHT_HRV * z_hrv_clamped
-                + WEIGHT_RHR * z_rhr
-                + WEIGHT_SLEEP * z_sleep
-            )
+        composite = _weighted_mean([
+            (WEIGHT_HRV, z_hrv_clamped),
+            (WEIGHT_RHR, z_rhr),
+            (WEIGHT_SLEEP, z_sleep),
+        ])
 
         prelim.append({
             "calendar_date": cal,
             "hrv": hrv,
             "rhr": rhr,
-            "sleep_score": sleep,
+            "sleep": sleep,
+            "sleep_quality": quality,
             "hrv_mean": mu_hrv,
             "hrv_std": sd_hrv,
             "rhr_mean": mu_rhr,
             "rhr_std": sd_rhr,
             "sleep_mean": mu_sleep,
             "sleep_std": sd_sleep,
+            "sleep_quality_mean": mu_qual,
+            "sleep_quality_std": sd_qual,
             "samples_hrv": n_hrv,
             "samples_rhr": n_rhr,
             "samples_sleep": n_sleep,
+            "samples_sleep_quality": n_qual,
             "z_hrv": z_hrv_clamped,
             "z_rhr": z_rhr,
+            "z_sleep_duration": z_dur,
+            "z_sleep_quality": z_qual,
             "z_sleep": z_sleep,
             "composite": composite,
             "score": None,
@@ -214,6 +272,7 @@ def compute_readiness(days: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         entry = dict(day)
         entry["_date"] = day_date
+        entry["_sleep_quality"] = quality
         window.append(entry)
 
     # Rolling calibration: each day is scored against the composites of the
@@ -241,14 +300,18 @@ def compute_readiness(days: list[dict[str, Any]]) -> list[dict[str, Any]]:
 READINESS_METRICS: dict[str, str] = {
     "readiness_hrv": "hrv",
     "readiness_rhr": "rhr",
-    "readiness_sleep": "sleep_score",
+    "readiness_sleep": "sleep",
+    "readiness_sleep_quality": "sleep_quality",
     "readiness_z_hrv": "z_hrv",
     "readiness_z_rhr": "z_rhr",
     "readiness_z_sleep": "z_sleep",
+    "readiness_z_sleep_duration": "z_sleep_duration",
+    "readiness_z_sleep_quality": "z_sleep_quality",
     "readiness_composite": "composite",
     "readiness_samples_hrv": "samples_hrv",
     "readiness_samples_rhr": "samples_rhr",
     "readiness_samples_sleep": "samples_sleep",
+    "readiness_samples_sleep_quality": "samples_sleep_quality",
 }
 
 
@@ -355,7 +418,10 @@ def fetch_daily_source(conn: Any) -> list[dict[str, Any]]:
         ).fetchall()
     }
     cols = [
-        c for c in ("hrv_last_night_avg", "resting_hr", "sleep_score")
+        c for c in (
+            "hrv_last_night_avg", "resting_hr", "sleep_time_hours",
+            "deep_sleep_hours", "rem_sleep_hours", "awake_sleep_hours",
+        )
         if c in existing
     ]
     if not cols:

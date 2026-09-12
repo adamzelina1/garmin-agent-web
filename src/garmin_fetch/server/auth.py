@@ -187,6 +187,7 @@ class UserStore:
         home_country: str | None = None,
         excluded_data_types: str | None = None,
         sync_start_date: str | None = None,
+        reasoning_effort: str | None = None,
         auto_sync: bool | None = None,
     ) -> None:
         with self._pool.connection() as conn:
@@ -199,6 +200,7 @@ class UserStore:
                 ("home_country", home_country),
                 ("excluded_data_types", excluded_data_types),
                 ("sync_start_date", sync_start_date),
+                ("reasoning_effort", reasoning_effort),
                 ("auto_sync", auto_sync),
             ):
                 if val is not None:
@@ -428,7 +430,7 @@ class AuthService:
     # -- per-user config ------------------------------------------------------
 
     def get_user_config(self, user_id: int) -> dict[str, Any]:
-        from ..datatypes import DATA_TYPES
+        from ..datatypes import CONFIG_VISIBLE_TYPES, DATA_TYPES
 
         user = self.store.get(user_id) or {}
         return {
@@ -444,7 +446,10 @@ class AuthService:
             ],
             "auto_sync": bool(user.get("auto_sync")),
             "sync_start_date": user.get("sync_start_date") or "",
-            "available_data_types": [t.as_dict() for t in DATA_TYPES.values()],
+            "reasoning_effort": user.get("reasoning_effort") or "",
+            "available_data_types": [
+                t.as_dict() for t in DATA_TYPES.values() if t.name in CONFIG_VISIBLE_TYPES
+            ],
         }
 
     def save_user_config(
@@ -458,18 +463,30 @@ class AuthService:
         excluded_data_types: list[str] | None = None,
         auto_sync: bool | None = None,
         sync_start_date: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
-        from ..datatypes import DAILY_TYPES
+        from ..datatypes import CONFIG_VISIBLE_TYPES
 
-        valid_types = set(DAILY_TYPES)
+        valid_types = set(CONFIG_VISIBLE_TYPES)
         if excluded_data_types is not None:
             unknown = sorted(t for t in excluded_data_types if t not in valid_types)
             if unknown:
                 raise AuthError(
                     400,
                     f"unknown data type(s) to exclude: {', '.join(unknown)}. "
-                    f"Valid daily types: {', '.join(DAILY_TYPES)}",
+                    f"Valid configurable types: {', '.join(sorted(CONFIG_VISIBLE_TYPES))}",
                 )
+        # A reasoning effort must be a known level (or blank = fall back to the
+        # server default from .env).
+        effective_effort: str | None = None
+        if reasoning_effort is not None:
+            cleaned = (reasoning_effort or "").strip().lower()
+            if cleaned and cleaned not in {"minimal", "low", "medium", "high"}:
+                raise AuthError(
+                    400, "reasoning effort must be minimal, low, medium, high (or blank)"
+                )
+            effective_effort = cleaned
+
         # An absent start date leaves the stored one untouched; a blank value
         # clears it; a non-empty value must be a real YYYY-MM-DD date.
         effective_start: str | None = None
@@ -521,6 +538,7 @@ class AuthService:
             ),
             auto_sync=auto_sync,
             sync_start_date=effective_start,
+            reasoning_effort=effective_effort,
         )
 
     def user_llm_configured(self, user: dict[str, Any]) -> bool:

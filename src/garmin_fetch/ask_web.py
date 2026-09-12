@@ -289,11 +289,13 @@ class ChatSession:
     """One chat app instance: lazy agent, DB-persisted conversation."""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
-        from .server.state import UserState
+        from .server.state import TrainingGoalStore, TrainingPlanStore, UserState
 
         self.cfg = cfg
         self._holder: dict[str, Any] = {}
         self._state = UserState(cfg["db_url"])
+        self._plan = TrainingPlanStore(cfg["db_url"])
+        self._goal = TrainingGoalStore(cfg["db_url"])
         self._user_id = cfg.get("local_user_id") or 1
         self.initial_history: list[dict[str, str]] = []
 
@@ -305,14 +307,24 @@ class ChatSession:
                 f"(user {self._user_id})"
             )
 
+    def close(self) -> None:
+        """Release the shared pools (called when the Gradio server stops)."""
+        self._goal.close()
+        self._plan.close()
+        self._state.close()
+
     def _agent(self) -> Any:
-        from .server.state import PgMemory
+        from .server.state import PgMemory, TrainingAnchor, TrainingPlan
 
         if "agent" not in self._holder:
             db = _open_readonly(self.cfg)
             self._holder["db"] = db
             self._holder["agent"] = _build_agent(
-                self.cfg, db, memory=PgMemory(self._state, self._user_id)
+                self.cfg,
+                db,
+                memory=PgMemory(self._state, self._user_id),
+                plan=TrainingPlan(self._plan, self._user_id),
+                anchor=TrainingAnchor(self._goal, self._user_id),
             )
         return self._holder["agent"]
 
@@ -406,13 +418,24 @@ def main() -> int:
     session = make_chat_session(cfg)
     demo = gr.ChatInterface(
         session.respond,
-        chatbot=gr.Chatbot(value=session.initial_history),
+        chatbot=gr.Chatbot(
+            value=session.initial_history,
+            # Render both inline $...$ and block $$...$$ LaTeX, not just the
+            # default block form, so the agent's math markup never shows raw.
+            latex_delimiters=[
+                {"left": "$", "right": "$", "display": False},
+                {"left": "$$", "right": "$$", "display": True},
+            ],
+        ),
         title="Garmin AI",
         description="Ask about your Garmin data. Queries are read-only SELECTs "
         "against Postgres. Ask for a chart and it will be drawn here.",
         fill_height=True,
     )
-    demo.launch(server_port=args.port, share=args.share, inbrowser=True)
+    try:
+        demo.launch(server_port=args.port, share=args.share, inbrowser=True)
+    finally:
+        session.close()
     return 0
 
 

@@ -5,13 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Garmin AI</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/texmath.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markdown-it-task-lists@2.1.1/dist/markdown-it-task-lists.min.js"></script>
 <style>
   :root { --bg:#0f1419; --panel:#171d24; --panel2:#1d242e; --text:#e7edf3;
-          --muted:#8b98a5; --accent:#3b82f6; --border:#2a323d; --ok:#22c55e; --err:#ef4444; }
+          --muted:#9aa8b6; --accent:#3b82f6; --border:#2a323d; --ok:#22c55e; --err:#ef4444; }
   * { box-sizing: border-box; }
+  html, body { height:100%; overflow:hidden; }
   body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-         background:var(--bg); color:var(--text); }
-  .wrap { max-width: 1240px; margin: 0 auto; padding: 16px; }
+         background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 16px; width:100%;
+          flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
   header { display:flex; align-items:center; justify-content:space-between;
            padding:12px 16px; background:var(--panel); border-bottom:1px solid var(--border); }
   header h1 { font-size:18px; margin:0; }
@@ -67,6 +74,11 @@
   .tabs button.active { color:#fff; border-color:var(--accent); }
   .banner { border-radius:8px; padding:10px 12px; font-size:13px; margin:8px 0; }
   .banner.warn { background:#3b2f10; border:1px solid #7a5c14; color:#f5d67b; }
+  .banner.dismissible { display:flex; align-items:center; gap:10px; }
+  .banner.dismissible > span { flex:1; }
+  .bd-close { background:none; border:none; color:inherit; opacity:.65; cursor:pointer;
+              font-size:14px; line-height:1; padding:2px 4px; }
+  .bd-close:hover { opacity:1; }
   .banner.err { background:#3b1216; border:1px solid #7a222a; color:#f5a3a3; }
   .banner.ok { background:#0f2f1a; border:1px solid #1f5c34; color:#a3e6bd; }
   .briefing { background:linear-gradient(180deg,#12283d,0,#0f1f30); border:1px solid #1f4a6d;
@@ -104,16 +116,31 @@
   .briefing .bf-vitals { display:flex; gap:14px; margin-top:12px; flex-wrap:wrap; }
   .briefing .bf-vital { font-size:12px; color:#9fc3dd; }
   .briefing .bf-vital b { display:block; font-size:16px; color:#e6f3fb; font-weight:700; }
-  .briefing .bf-wx { display:flex; align-items:center; gap:12px; }
-  .briefing .bf-wx .bf-wxtemp { font-size:22px; font-weight:700; color:#e6f3fb; }
-  .briefing .bf-wx .bf-wxrow { font-size:13px; color:#9fc3dd; line-height:1.5; }
+  .briefing .bf-wx { display:flex; align-items:center; gap:16px; }
+  .briefing .bf-wx .bf-wxtemp { font-size:26px; font-weight:700; color:#e6f3fb; }
+  .briefing .bf-wx .bf-wxrow { display:flex; flex-direction:column; gap:5px; font-size:13px; color:#9fc3dd; }
+  .briefing .bf-wx .bf-wxitem { display:flex; align-items:center; gap:6px; }
+  .briefing .bf-wx .bf-wxitem .bf-wxi { flex:none; width:16px; text-align:center; }
+  .briefing .bf-wx .bf-wxitem .bf-wxt { font-variant-numeric:tabular-nums; }
   @media (max-width:760px) {
     .briefing .bf-grid { grid-template-columns:1fr; }
   }
   #auth { max-width:460px; margin:48px auto; }
-  #app { display:none; }
+  #app { display:none; flex:1 1 auto; min-height:0; flex-direction:column; }
+  #app-tabs { flex:none; }
+  /* Chat tab: a fixed column locked to the viewport — only the message box
+     scrolls (both axes), the page never does. */
+  #tab-chat { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
+  /* Other tabs: fill the space and scroll their own content (viewport is
+     locked so the page itself can never scroll). */
+  #tab-today, #tab-plan, #tab-settings { flex:1 1 auto; min-height:0; overflow-y:auto; }
+  #tab-chat .chattop, #tab-chat .prompt-chips, #tab-chat .askrow { flex:none; }
+  #tab-chat .chatbox { flex:1 1 auto; min-height:0; max-height:none;
+                       overflow-y:auto; overflow-x:auto; }
+  .chattop { display:flex; align-items:center; gap:8px; margin-top:16px; color:var(--muted); font-size:12px; }
   .chatbox { background:var(--panel); border:1px solid var(--border); border-radius:10px;
-             min-height:340px; max-height:60vh; overflow-y:auto; padding:14px; margin-top:16px; }
+             min-height:340px; max-height:60vh; overflow-y:auto; overscroll-behavior:contain;
+             padding:14px; margin-top:6px; }
   .msg { margin:10px 0; }
   .msg .role { font-size:12px; color:var(--muted); margin-bottom:3px; }
   .msg .body { font-size:14px; line-height:1.5; }
@@ -126,11 +153,44 @@
   .msg .body th { background:var(--panel2); }
   .msg .body a { color:var(--accent); }
   .msg .body pre { background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:10px; overflow-x:auto; font-size:12px; }
+  .code-wrap { position:relative; margin:8px 0; }
+  .code-wrap pre { margin:0; }
+  .code-copy { position:absolute; top:6px; right:6px; background:var(--panel); border:1px solid var(--border);
+               border-radius:4px; color:var(--muted); font-size:11px; padding:3px 7px; cursor:pointer;
+               opacity:0.75; transition:opacity .15s ease, background .15s ease, color .15s ease; }
+  .code-wrap:hover .code-copy { opacity:1; }
+  .code-copy:hover { color:var(--text); background:var(--panel2); }
+  .code-copy.copied { color:var(--ok); border-color:var(--ok); }
+  .msg .body blockquote { border-left:3px solid var(--accent); margin:8px 0; padding:4px 12px; color:var(--muted);
+                          background:rgba(59,130,246,.06); border-radius:0 6px 6px 0; }
+  .msg .body blockquote p { margin:3px 0; }
+  .msg .body del { color:var(--muted); text-decoration:line-through; }
+  .msg .body li.task-item { list-style:none; margin-left:-18px; display:flex; align-items:baseline; gap:6px; }
+  .msg .body li.task-item input[type="checkbox"] { margin:0; vertical-align:middle; cursor:default; }
+  .thinking-bubble { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:13px; padding:2px 0; }
+  .thinking-dots { display:inline-flex; gap:4px; align-items:center; }
+  .thinking-dots span { width:5px; height:5px; border-radius:50%; background:var(--accent); display:inline-block;
+                        animation:pulseDot 1.4s infinite ease-in-out both; }
+  .thinking-dots span:nth-child(1) { animation-delay: -0.32s; }
+  .thinking-dots span:nth-child(2) { animation-delay: -0.16s; }
+  @keyframes pulseDot { 0%, 80%, 100% { transform: scale(0.4); opacity: 0.35; } 40% { transform: scale(1); opacity: 1; } }
+  .prompt-chips { display:flex; align-items:center; gap:6px; margin-top:8px; flex-wrap:wrap; }
+  .prompt-chip-label { font-size:11px; color:var(--muted); text-transform:uppercase; font-weight:700; letter-spacing:.05em; }
+  .prompt-chip { background:var(--panel2); border:1px solid var(--border); border-radius:14px;
+                 padding:4px 10px; font-size:12px; color:var(--muted); cursor:pointer;
+                 transition:all .15s ease; }
+  .prompt-chip:hover { border-color:var(--accent); color:var(--text); background:#202a36; }
+  .pwd-wrap { position:relative; display:flex; align-items:center; width:100%; }
+  .pwd-wrap input { padding-right:36px; margin:4px 0; width:100%; }
+  .pwd-toggle { position:absolute; right:6px; background:none; border:none; color:var(--muted);
+                padding:4px 6px; font-size:14px; cursor:pointer; border-radius:4px; line-height:1; }
+  .pwd-toggle:hover { color:var(--text); background:rgba(255,255,255,.06); }
   .planbox { margin:10px 0 4px; }
   .planbox .planbox-head { font-size:12px; color:var(--muted); margin-bottom:4px; }
   .msg.user .body { color:#cfe4ff; }
-  .askrow { display:flex; gap:8px; margin-top:10px; }
-  .askrow input { flex:1; }
+  .askrow { display:flex; gap:8px; margin-top:10px; align-items:flex-end; }
+  .askrow textarea { flex:1; resize:none; min-height:38px; max-height:180px; margin:0; line-height:1.4; padding:8px 10px; font-family:inherit; }
+  .askrow button { height:38px; flex:none; }
   .chartbox { margin-top:8px; }
   .toolbar { display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap; }
   .stat { font-size:13px; color:var(--muted); }
@@ -155,16 +215,85 @@
   .readiness-comp .r-sub { font-size:12px; color:var(--muted); }
   .plan-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
   .plan-head .plan-week-label { flex:1; text-align:center; font-weight:600; font-size:14px; }
+  .plan-anchor { background:var(--panel2); border:1px solid var(--border); border-radius:10px;
+                 padding:9px 12px; margin-bottom:14px; cursor:pointer;
+                 transition:border-color .15s ease, background .15s ease; }
+  #plan-anchor { display:flex; flex-direction:column; gap:10px; }
+  #plan-anchor.hidden { display:none; }
+  #plan-anchor .plan-anchor { margin-bottom:0; }
+  .goal-tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .goal-tabs.hidden { display:none; }
+  .goal-chip { border:1px solid var(--border); background:var(--panel2); color:var(--text);
+               border-radius:999px; padding:5px 12px; font-size:12px; cursor:pointer;
+               font-weight:600; }
+  .goal-chip:hover { border-color:var(--accent); }
+  .goal-chip.active { background:var(--accent); color:#06210f; border-color:var(--accent); }
+  .wp-row { background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+            padding:9px 11px; font-size:12.5px; color:var(--text); }
+  #plan-anchor .wp-row { margin-top:10px; }
+  .wp-row .wp-bar-row { display:flex; align-items:center; gap:10px; }
+  .wp-row .wp-num { font-weight:600; white-space:nowrap; color:var(--muted); }
+  .wp-row .wp-num b { color:var(--text); font-weight:800; font-size:13.5px; }
+  .wp-row .wp-track { position:relative; flex:1; min-width:100px; height:12px; border-radius:6px;
+                      background:var(--panel); border:1px solid var(--border); overflow:hidden; }
+  .wp-row .wp-fill { position:absolute; left:0; top:0; bottom:0; border-radius:5px; }
+  .wp-row .wp-fill.actual { background:var(--accent); }
+  .wp-row .wp-pct { color:var(--muted); font-weight:700; white-space:nowrap; min-width:34px; text-align:right; }
+  .wp-row .wp-legend { display:flex; flex-wrap:wrap; align-items:center; gap:5px 16px;
+                       color:var(--muted); font-size:12px; margin-top:7px; }
+  .wp-row .wp-legend .lg { display:inline-flex; align-items:center; gap:6px; }
+  .wp-row .wp-legend .sw { width:10px; height:10px; border-radius:3px; flex:none; }
+  .wp-row .wp-legend .sw.actual { background:var(--accent); }
+  .wp-row .wp-ref { color:var(--muted); font-size:11.5px; margin-top:5px; }
+  .wp-row .wp-ref b { color:var(--text); font-weight:600; }
+  .wp-row .wp-note { color:var(--muted); font-size:12px; margin-top:6px; line-height:1.4; }
+  .plan-anchor.pinned { border-color:var(--accent); background:#232b37; }
+  .goal-head { display:flex; align-items:center; gap:10px; }
+  .goal-head .goal-title { font-weight:700; font-size:15px; color:var(--text); white-space:nowrap;
+                           text-overflow:ellipsis; overflow:hidden; }
+  .goal-head .goal-title:empty { display:none; }
+  .goal-head .goal-hint { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px;
+                          font-size:11.5px; color:var(--muted); white-space:nowrap;
+                          border:1px solid var(--border); background:var(--panel2); border-radius:999px;
+                          padding:3px 9px; transition:color .15s ease, border-color .15s ease; }
+  .plan-anchor:hover .goal-hint { color:var(--text); border-color:var(--accent); }
+  .goal-head .goal-hint .gh-chev { display:inline-block; font-size:9px; transition:transform .18s ease; }
+  .plan-anchor.pinned .goal-hint .gh-chev { transform:rotate(90deg); }
+  .goal-sub { color:var(--muted); font-size:12.5px; margin-top:5px; }
+  .goal-sub b { color:var(--text); font-weight:600; }
+  .goal-details { max-height:0; overflow:hidden; opacity:0;
+                  transition:max-height .22s ease, opacity .18s ease, margin .18s ease; }
+  .plan-anchor.pinned .goal-details { max-height:1000px; opacity:1; margin-top:10px; }
+  .goal-meta { color:var(--muted); font-size:12px; }
+  .goal-meta span { margin-right:14px; }
+  .goal-meta b { color:var(--text); font-weight:600; }
+  .goal-note { color:var(--muted); font-size:12px; margin-top:6px; white-space:pre-wrap; }
+  .phase-strip { display:flex; margin-top:10px; height:14px; border-radius:7px; overflow:hidden;
+                 background:transparent; margin-bottom:8px; }
+  .phase-seg { flex:none; opacity:.5; border-radius:3px; cursor:default;
+               transition:opacity .15s ease, box-shadow .15s ease; }
+  .phase-seg:hover { opacity:.85; }
+  .phase-seg.active { opacity:1; box-shadow:inset 0 0 0 2px #fff; }
+  .phase-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin:0 0 4px; }
+  .phase-legend .pl-item { display:inline-flex; align-items:center; gap:6px; font-size:11.5px;
+                           color:var(--muted); cursor:default; }
+  .phase-legend .pl-item .pl-dot { width:9px; height:9px; border-radius:3px; flex:none; }
+  .phase-legend .pl-item.active { color:var(--text); font-weight:700; }
+  .phase-empty { color:var(--muted); font-size:11.5px; margin-top:8px; }
+  .plan-day.block { box-shadow:inset 0 2px 0 rgba(59,130,246,.55); }
   .plan-week { display:grid; grid-template-columns:repeat(7,1fr); gap:10px; }
   .plan-day { background:var(--panel2); border:1px solid var(--border); border-radius:10px;
               padding:10px; min-height:150px; display:flex; flex-direction:column; }
   .plan-day.today { border-color:var(--accent); box-shadow:0 0 0 1px rgba(59,130,246,.30); }
   .plan-day-header { display:flex; justify-content:space-between; align-items:baseline;
-                     font-size:11px; color:var(--muted); margin-bottom:2px; }
+                     font-size:11.5px; color:var(--muted); margin-bottom:2px; }
   .plan-day-header .dow { font-weight:600; color:var(--text); }
-  .plan-day .wx { display:flex; align-items:baseline; gap:8px; font-size:11px; margin:0 0 8px; }
+  .plan-day .wx { display:flex; align-items:center; gap:6px; font-size:11.5px; margin:0 0 8px; }
+  .plan-day .wx .wxi { font-size:12px; line-height:1; }
   .plan-day .wx .wt { color:var(--text); font-weight:600; }
-  .plan-day .wx .wr { color:var(--muted); font-size:10px; }
+  .plan-day .wx .wp { display:inline-flex; align-items:center; gap:2px; font-size:10.5px;
+                      color:#8fbcf5; background:rgba(59,130,246,.15);
+                      border:1px solid rgba(59,130,246,.32); border-radius:999px; padding:1px 6px; }
   .plan-card { position:relative; background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent);
                border-radius:6px; padding:7px 8px; margin-bottom:6px; cursor:pointer; font-size:12px;
                line-height:1.35; }
@@ -181,28 +310,79 @@
   #plan-tip p { margin:4px 0; }
   #plan-tip p:first-child { margin-top:0; }
   #plan-tip p:last-child { margin-bottom:0; }
-  .plan-card .pc-type { display:inline-block; font-size:9px; text-transform:uppercase; letter-spacing:.07em;
+  .plan-card .pc-type { display:inline-block; font-size:10px; text-transform:uppercase; letter-spacing:.07em;
                         font-weight:700; color:var(--accent); }
   .plan-card .pc-title { font-weight:600; color:var(--text); margin:3px 0; }
-  .plan-card .pc-meta { color:var(--muted); font-size:11px; }
+  .plan-card .pc-meta { color:var(--muted); font-size:11.5px; }
   .plan-card .pc-meta span { margin-right:8px; }
-  .plan-card .pc-done { display:inline-flex; align-items:center; gap:4px; font-size:9px; font-weight:700;
+  .plan-card .pc-done { display:inline-flex; align-items:center; gap:4px; font-size:10px; font-weight:700;
                         letter-spacing:.05em; text-transform:uppercase; color:#06210f;
                         background:var(--ok); border:1px solid var(--ok); border-radius:4px;
                         padding:2px 6px; margin-left:6px; box-shadow:0 1px 3px rgba(34,197,94,.35); }
-  .plan-card .pc-done::before { content:"✓"; font-size:9px; line-height:1; }
-  .plan-card.rest { opacity:.75; }
-  .plan-card.done { background:#0f2f1a; border-color:#1f5c34; }
+  .plan-card .pc-done::before { content:"✓"; font-size:10px; line-height:1; }
+  .plan-card.rest { opacity:.8; }
+  .plan-card.done { background:var(--panel); border-color:#2f5c3a; }
   .plan-card.done .pc-type { color:var(--ok); }
   .plan-card.done .pc-title { color:#9fb8aa; text-decoration:line-through; text-decoration-color:rgba(34,197,94,.6); }
-  .plan-card.done .pc-meta { color:var(--muted); opacity:.75; }
-  .plan-card.done:hover { background:#123a20; }
+  .plan-card.done .pc-meta { color:var(--muted); opacity:.85; }
+  .plan-card.done:hover { background:var(--panel2); }
   .plan-card.dragging { opacity:.5; }
   .plan-day.drag-over { border-color:var(--accent); box-shadow:0 0 0 1px rgba(59,130,246,.45); }
   .plan-add { width:100%; background:transparent; border:1px dashed var(--border); color:var(--muted);
               border-radius:6px; padding:5px; font-size:12px; cursor:pointer; margin-top:auto; }
   .plan-add:hover { color:var(--accent); border-color:var(--accent); }
   .plan-empty { color:var(--muted); font-size:12px; text-align:center; padding:16px 4px; }
+  .plan-empty.rest { color:var(--ok); }
+  .plan-head .spacer { flex:1; }
+  .view-toggle.active { background:var(--accent); color:#06210f; border-color:var(--accent); }
+  .plan-card .pc-targets { display:flex; flex-wrap:wrap; gap:4px; margin-top:5px; }
+  .plan-card .pc-chip { display:inline-flex; align-items:center; gap:3px; font-size:11px; font-weight:600;
+                        border-radius:999px; padding:1px 7px; border:1px solid var(--border);
+                        background:var(--panel2); color:var(--muted); white-space:nowrap; }
+  .plan-card .pc-chip-i { font-size:10px; line-height:1; }
+  .plan-card .pc-chip.pace { color:#8fbcf5; background:rgba(59,130,246,.14); border-color:rgba(59,130,246,.32); }
+  .plan-card .pc-chip.hr { color:#f7a6b8; background:rgba(236,72,153,.16); border-color:rgba(236,72,153,.38); }
+  .plan-card .pc-chip.power { color:#f5c66b; background:rgba(234,179,8,.15); border-color:rgba(234,179,8,.32); }
+  .plan-card.skipped { opacity:.6; }
+  .plan-card.skipped .pc-title { text-decoration:line-through; }
+  .plan-card .pc-skip { display:inline-flex; align-items:center; font-size:10px; font-weight:700;
+    text-transform:uppercase; letter-spacing:.06em; color:var(--err); margin-left:6px; }
+  .plan-list { display:flex; flex-direction:column; gap:14px; }
+  .pl-week { border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .pl-week-head { display:flex; align-items:baseline; gap:10px; padding:8px 12px; background:var(--panel2);
+    border-bottom:1px solid var(--border); font-weight:700; }
+  .pl-week-head .pl-range { color:var(--muted); font-weight:600; font-size:12px; }
+  .pl-week-head .pl-stat { margin-left:auto; color:var(--muted); font-weight:600; font-size:12px; }
+  .pl-row { display:flex; align-items:center; gap:10px; padding:7px 12px; border-bottom:1px solid var(--border);
+    font-size:13px; }
+  .pl-row:last-child { border-bottom:none; }
+  .pl-row .pl-date { width:74px; flex:none; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .pl-row .pl-badge { flex:none; font-size:10px; text-transform:uppercase; letter-spacing:.07em; font-weight:700;
+    padding:1px 6px; border-radius:4px; color:#06210f; }
+  .pl-row .pl-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pl-row .pl-meta { color:var(--muted); font-size:11px; white-space:nowrap; }
+  .pl-row.done .pl-title { color:var(--muted); text-decoration:line-through; }
+  .pl-row.skipped { opacity:.6; }
+  .pl-row.skipped .pl-title { text-decoration:line-through; }
+  .goal-modal { max-width:760px; width:92vw; max-height:86vh; overflow:auto; }
+  .goal-modal h3 { position:sticky; top:0; background:var(--panel); z-index:1; }
+  .goal-form { display:flex; flex-direction:column; gap:8px; }
+  .goal-form .row > div { flex:1; }
+  .block-card { border:1px solid var(--border); border-radius:8px; padding:10px; background:var(--panel2); }
+  .block-card .bc-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .block-card .bc-head b { flex:1; }
+  .wave-row { display:flex; align-items:center; gap:6px; margin-top:6px; }
+  .wave-row input[type=number], .wave-row input[type=text] { padding:4px 6px; font-size:12px; }
+  .wave-row .w-idx { width:44px; flex:none; }
+  .wave-row .w-km { width:70px; flex:none; }
+  .wave-row .w-min { width:70px; flex:none; }
+  .wave-row .w-int { flex:1; min-width:70px; }
+  .wave-row .w-deload { display:flex; align-items:center; gap:4px; font-size:11px; color:var(--muted); flex:none; }
+  .wave-row .w-deload input { width:auto; margin:0; }
+  .goal-actions { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .goal-list { display:flex; flex-direction:column; gap:6px; margin-bottom:10px; }
+  .goal-list button { text-align:left; }
+  .goal-list button.active { background:var(--accent); color:#06210f; border-color:var(--accent); }
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center;
               justify-content:center; z-index:50; }
   .modal { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px;
@@ -232,7 +412,10 @@
         <label>Email</label>
         <input id="login-email" type="email" autocomplete="email">
         <label>Password</label>
-        <input id="login-password" type="password" autocomplete="current-password">
+        <div class="pwd-wrap">
+          <input id="login-password" type="password" autocomplete="current-password">
+          <button type="button" class="pwd-toggle" data-for="login-password" title="Show password" aria-label="Show password">👁</button>
+        </div>
         <div class="banner err hidden" id="login-error"></div>
         <div class="banner ok hidden" id="login-ok"></div>
         <div style="margin-top:14px"><button id="btn-login">Sign in</button></div>
@@ -241,11 +424,17 @@
         <label>Your email (login)</label>
         <input id="reg-email" type="email" autocomplete="off">
         <label>Password (min 8 chars)</label>
-        <input id="reg-password" type="password" autocomplete="new-password">
+        <div class="pwd-wrap">
+          <input id="reg-password" type="password" autocomplete="new-password">
+          <button type="button" class="pwd-toggle" data-for="reg-password" title="Show password" aria-label="Show password">👁</button>
+        </div>
         <label>Garmin Connect email</label>
         <input id="reg-garmin-email" type="email" autocomplete="off">
         <label>Garmin Connect password</label>
-        <input id="reg-garmin-password" type="password" autocomplete="off">
+        <div class="pwd-wrap">
+          <input id="reg-garmin-password" type="password" autocomplete="off">
+          <button type="button" class="pwd-toggle" data-for="reg-garmin-password" title="Show password" aria-label="Show password">👁</button>
+        </div>
         <div id="reg-mfa" class="hidden">
           <label>Garmin verification code</label>
           <input id="reg-mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code">
@@ -271,11 +460,21 @@
       <div class="banner warn hidden" id="llm-missing">Chat is unavailable: set
         <code>LLM_API_KEY</code> (or a local <code>LLM_BASE_URL</code>) in <code>.env</code>
         and restart the server.</div>
+      <div class="chattop"><span>Context</span> <span id="ctx-tokens">…</span></div>
       <div class="chatbox" id="chat"></div>
+      <div id="prompt-chips" class="prompt-chips">
+        <span class="prompt-chip-label">Try:</span>
+        <button type="button" class="prompt-chip" data-prompt="How was my sleep and HRV this week?">Sleep &amp; HRV this week</button>
+        <button type="button" class="prompt-chip" data-prompt="What is my current training readiness and why?">Readiness breakdown</button>
+        <button type="button" class="prompt-chip" data-prompt="Analyze my acute-to-chronic workload ratio (ACWR)">ACWR risk</button>
+        <button type="button" class="prompt-chip" data-prompt="What was my hardest workout in the past 30 days?">Hardest workout (30d)</button>
+        <button type="button" class="prompt-chip" data-prompt="Did I have form drift or cadence changes on my recent runs?">Form &amp; cadence drift</button>
+      </div>
       <div class="askrow">
-        <input id="question" placeholder="Ask about your Garmin data… (e.g. avg sleep last week)" autocomplete="off">
+        <textarea id="question" rows="1" placeholder="Ask about your Garmin data… (Enter to send, Shift+Enter for new line)" autocomplete="off"></textarea>
         <button id="btn-ask">Ask</button>
         <button id="btn-new-chat" title="Forget this conversation and start a fresh session (long-term memory is kept)">New chat</button>
+        <button id="btn-compact" title="Compress this conversation into a summary to cut the context size (manual)">Compact</button>
       </div>
     </div>
 
@@ -346,11 +545,21 @@
           <span class="plan-week-label" id="plan-week-label"></span>
           <button id="btn-plan-today" class="secondary" title="Jump to this week">Today</button>
           <button id="plan-next" class="secondary" title="Next week">›</button>
+          <span class="spacer"></span>
+          <button id="plan-view-week" class="secondary view-toggle active" title="Week calendar">Week</button>
+          <button id="plan-view-list" class="secondary view-toggle" title="List the next 8 weeks">List</button>
+          <button id="btn-edit-goals" class="secondary" title="Edit goals, phases and weekly waves">Goals</button>
         </div>
-        <div class="banner warn" style="margin-top:0">You can edit your plan here, or ask the AI in
-          Chat to build or change it (e.g. "create a 12-week half-marathon plan").</div>
+        <div class="goal-tabs hidden" id="plan-goal-tabs"></div>
+        <div class="hidden" id="plan-anchor"></div>
+        <div class="banner warn dismissible" style="margin-top:0" id="plan-onboard">
+          <span>You can edit your plan here, or ask the AI in
+            Chat to build or change it (e.g. "create a 12-week half-marathon plan").</span>
+          <button class="bd-close" title="Dismiss" aria-label="Dismiss">✕</button>
+        </div>
         <div class="banner err hidden" id="plan-error"></div>
         <div class="plan-week" id="plan-week"></div>
+        <div class="plan-list hidden" id="plan-list"></div>
         <div id="plan-briefing" class="briefing hidden"></div>
       </div>
     </div>
@@ -383,7 +592,8 @@
           <label style="display:block;margin-top:12px">Sync start date <span class="muted">(optional —
             backfills your Garmin history from this date on the next sync; blank keeps the
             current window)</span></label>
-          <input id="cfg-sync-start" type="date" autocomplete="off">
+          <input id="cfg-sync-start" type="text" inputmode="numeric" autocomplete="off"
+                 placeholder="YYYY-MM-DD" maxlength="10">
           <div class="muted" id="sync-start-state" style="margin:4px 0 0;font-size:12px"></div>
           <div class="banner warn" style="margin-top:10px">Garmin rate-limits unofficial
             clients and can suspend accounts that hammer it. Syncs are spaced and auto-back-off on
@@ -394,22 +604,29 @@
       <div id="sub-config" class="hidden">
         <div class="card">
           <h3 style="margin:0 0 10px">Your preferences</h3>
-          <div class="banner err hidden" id="cfg-error"></div>
-          <div class="banner ok hidden" id="cfg-llm-state" style="margin:0 0 8px"></div>
-          <label>Home city <span class="muted">(for the training-plan weather forecast)</span></label>
+           <div class="banner err hidden" id="cfg-error"></div>
+           <label>Home city <span class="muted">(for the training-plan weather forecast)</span></label>
           <input id="cfg-home-city" type="text" autocomplete="off" placeholder="e.g. Bratislava">
           <label>Home country</label>
           <input id="cfg-home-country" type="text" autocomplete="off" placeholder="e.g. Slovakia">
-          <label>Don't fetch these Garmin features (check what you don't have)</label>
-          <div id="cfg-excluded"></div>
-          <div style="margin-top:16px"><button id="btn-save-config">Save config</button></div>
+           <label>Don't fetch these Garmin features (check what you don't have)</label>
+           <div id="cfg-excluded"></div>
+           <label for="cfg-reasoning">Agent reasoning effort</label>
+           <select id="cfg-reasoning">
+             <option value="">Default (server .env)</option>
+             <option value="low">Low</option>
+             <option value="medium">Medium</option>
+             <option value="high">High</option>
+           </select>
+           <div class="muted" style="font-size:12px">How hard the AI agent thinks before answering (Gemini/OpenAI reasoning effort).</div>
+           <div style="margin-top:16px"><button id="btn-save-config">Save config</button></div>
         </div>
       </div>
     </div>
   </div>
 
   <!-- Workout edit modal -->
-  <div id="plan-modal" class="modal-bg hidden">
+  <div id="plan-modal" class="modal-bg hidden" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">
     <div class="modal">
       <h3 id="plan-modal-title">Workout</h3>
       <div class="banner err hidden" id="plan-modal-error"></div>
@@ -452,15 +669,62 @@
           <input type="number" id="pm-distance" min="0" step="any" placeholder="5.0">
         </div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text)">
-        <input type="checkbox" id="pm-completed" style="width:auto;margin:0">
-        Completed
-      </label>
+      <div class="row">
+        <div>
+          <label>Target pace <span class="muted">(min/km)</span></label>
+          <input type="number" id="pm-pace" min="1" max="60" step="any" placeholder="5.5 = 5:30">
+        </div>
+        <div>
+          <label>Target HR zone</label>
+          <input type="text" id="pm-hrzone" placeholder="Z2 or 140-150" autocomplete="off">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Target power <span class="muted">(W)</span></label>
+          <input type="number" id="pm-power" min="0" placeholder="—">
+        </div>
+        <div>
+          <label>Status</label>
+          <select id="pm-status">
+            <option value="planned">Planned</option>
+            <option value="completed">Completed</option>
+            <option value="partial">Partial</option>
+            <option value="skipped">Skipped</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Goal</label>
+          <select id="pm-goal"><option value="">—</option></select>
+        </div>
+        <div>
+          <label>Phase</label>
+          <select id="pm-block"><option value="">—</option></select>
+        </div>
+      </div>
       <div class="modal-actions">
         <button id="pm-delete" class="secondary" style="border-color:var(--err);color:var(--err)">Delete</button>
         <span></span>
         <button id="pm-cancel" class="secondary">Cancel</button>
         <button id="pm-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Goal / phase / wave editor -->
+  <div id="goal-modal" class="modal-bg hidden" role="dialog" aria-modal="true" aria-labelledby="goal-modal-title">
+    <div class="modal goal-modal">
+      <h3 id="goal-modal-title">Goals, phases &amp; waves</h3>
+      <div class="banner err hidden" id="goal-modal-error"></div>
+      <div id="goal-modal-body"></div>
+      <div class="modal-actions">
+        <button id="goal-undo" class="secondary" title="Restore the goals/phases from before the last destructive save">Undo last save</button>
+        <span></span>
+        <button id="goal-cancel" class="secondary">Close</button>
+        <button id="goal-new" class="secondary">New goal</button>
+        <button id="goal-save">Save goal</button>
       </div>
     </div>
   </div>
@@ -483,13 +747,22 @@ function api(path, body, method) {
   if (body !== undefined) opts.body = JSON.stringify(body);
   return fetch(API + path, opts).then(async (r) => {
     const data = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      if (token) {
+        token = "";
+        localStorage.removeItem("garmin_token");
+        showAuth();
+        setErr($("login-error"), "Session expired. Please sign in again.");
+      }
+      throw new Error(data.detail || "Session expired. Please sign in again.");
+    }
     if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
     return data;
   });
 }
 
 function showAuth() { $("auth").style.display = ""; $("app").style.display = "none"; }
-function showApp() { $("auth").style.display = "none"; $("app").style.display = "block"; }
+function showApp() { $("auth").style.display = "none"; $("app").style.display = "flex"; }
 
 function switchTab(which) {
   $("tab-login").classList.toggle("active", which === "login");
@@ -542,9 +815,15 @@ function clearBusy(btn) {
 async function loginFlow() {
   const btn = $("btn-login");
   setErr($("login-error"), ""); setErr($("login-ok"), "");
+  const email = $("login-email").value.trim();
+  const password = $("login-password").value;
+  if (!email || !password) {
+    setErr($("login-error"), "Please enter both email and password.");
+    return;
+  }
   setBusy(btn, "Signing in…");
   try {
-    const data = await api("/auth/login", { email: $("login-email").value, password: $("login-password").value });
+    const data = await api("/auth/login", { email, password });
     token = data.token; localStorage.setItem("garmin_token", token);
     await enterApp();
   } catch (e) {
@@ -559,10 +838,16 @@ async function registerFlow() {
   const btn = $("btn-register");
   setErr($("reg-error"), ""); setErr($("reg-ok"), "");
   if (mfaChallenge) {
+    const code = $("reg-mfa-code").value.trim();
+    if (!code) {
+      setErr($("reg-error"), "Please enter the verification code.");
+      $("reg-mfa-code").focus();
+      return;
+    }
     setBusy(btn, "Verifying code…");
     try {
       const data = await api("/auth/register/mfa", {
-        challenge: mfaChallenge, code: $("reg-mfa-code").value,
+        challenge: mfaChallenge, code,
       });
       token = data.token; localStorage.setItem("garmin_token", token);
       $("reg-ok").textContent = "Account created and linked to Garmin. Signing you in…";
@@ -577,11 +862,23 @@ async function registerFlow() {
     }
     return;
   }
+  const email = $("reg-email").value.trim();
+  const password = $("reg-password").value;
+  const garmin_email = $("reg-garmin-email").value.trim();
+  const garmin_password = $("reg-garmin-password").value;
+  if (!email || !password || !garmin_email || !garmin_password) {
+    setErr($("reg-error"), "Please fill in all fields.");
+    return;
+  }
+  if (password.length < 8) {
+    setErr($("reg-error"), "Password must be at least 8 characters.");
+    $("reg-password").focus();
+    return;
+  }
   setBusy(btn, "Linking Garmin account…");
   try {
     const data = await api("/auth/register", {
-      email: $("reg-email").value, password: $("reg-password").value,
-      garmin_email: $("reg-garmin-email").value, garmin_password: $("reg-garmin-password").value,
+      email, password, garmin_email, garmin_password,
     });
     if (data.status === "mfa_required") {
       mfaChallenge = data.challenge;
@@ -604,114 +901,105 @@ async function registerFlow() {
   }
 }
 
+function wirePasswordToggles() {
+  document.querySelectorAll(".pwd-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = $(btn.dataset.for);
+      if (!input) return;
+      const isPwd = input.type === "password";
+      input.type = isPwd ? "text" : "password";
+      btn.textContent = isPwd ? "🙈" : "👁";
+      btn.title = isPwd ? "Hide password" : "Show password";
+      btn.setAttribute("aria-label", isPwd ? "Hide password" : "Show password");
+    });
+  });
+}
+
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
           .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-// Renders a small, safe subset of GFM (tables, bold, italic, code, headings,
-// lists, links). Input is HTML-escaped first so model/user text can never
-// inject markup; only our own tags ever reach innerHTML.
-function renderInline(s) {
-  const codes = [];
-  s = s.replace(/`([^`]+)`/g, (m, c) => {
-    codes.push(c);
-    return "\u0000" + (codes.length - 1) + "\u0000";
+// Shared markdown-it instance, built lazily once the CDN scripts are loaded.
+// Using a real parser (instead of regexes) fixes emphasis that the old
+// renderer dropped (e.g. "*text* word"), handles GFM tables/strikethrough
+// natively, and lets KaTeX render the agent's LaTeX math.
+let md = null;
+function buildMd() {
+  if (md) return md;
+  md = window.markdownit({
+    html: false,        // model/user text can never inject raw HTML
+    linkify: false,
+    typographer: false,
+    breaks: true,       // single newlines become <br>, matching the old renderer
   });
-  // Single pass over ***bold italic*** / **bold** / *italic* (order matters).
-  // Unlike before, bold/italic may span newlines and is never re-scanned, so a
-  // model's multi-line emphasis no longer leaks literal ** asterisks.
-  s = s.replace(
-    /\*\*\*([\s\S]+?)\*\*\*|\*\*([\s\S]+?)\*\*|(^|[^*\w])\*(?!\s)([^\n*]+?)\*(?!\*|\s)/g,
-    (m, b3, b2, pre, em) =>
-      b3 != null ? "<strong><em>" + b3 + "</em></strong>"
-      : b2 != null ? "<strong>" + b2 + "</strong>"
-      : pre + "<em>" + em + "</em>"
-  );
-  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  return s.replace(/\u0000(\d+)\u0000/g, (m, i) => "<code>" + codes[Number(i)] + "</code>");
+  // External links open in a new tab with noopener; safe schemes stay plain.
+  const linkOpen = md.renderer.rules.link_open ||
+    ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+  md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+    if (/^https?:\/\//i.test(tokens[idx].attrGet("href") || "")) {
+      tokens[idx].attrSet("target", "_blank");
+      tokens[idx].attrSet("rel", "noopener noreferrer");
+    }
+    return linkOpen(tokens, idx, options, env, self);
+  };
+  // Fenced code blocks keep the Copy button the old renderer provided. The
+  // content is still HTML-escaped (markdown-it escapes it itself).
+  md.renderer.rules.fence = (tokens, idx) => {
+    const t = tokens[idx];
+    const info = t.info ? t.info.trim().split(/\s+/g)[0] : "";
+    const cls = info ? ' class="language-' + info + '"' : "";
+    return '<div class="code-wrap">'
+      + '<button class="code-copy" type="button" title="Copy code" onclick="copyCode(this)">Copy</button>'
+      + '<pre><code' + cls + '>' + md.utils.escapeHtml(t.content) + '</code></pre></div>';
+  };
+  if (window.markdownitTaskLists) md.use(window.markdownitTaskLists, { enabled: false });
+  if (window.texmath && window.katex) {
+    md.use(window.texmath, {
+      engine: window.katex,
+      delimiters: "dollars",
+      katexOptions: { throwOnError: false },
+    });
+  }
+  return md;
 }
 
-function renderTable(rows) {
-  const delim = /^\s*\|?[\s:|-]+\|?\s*$/;
-  const split = (r) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
-  if (rows.length < 2 || !delim.test(rows[1])) {
-    return rows.map((r) => "<p>" + renderInline(r.trim()) + "</p>").join("");
-  }
-  const cells = (r) => split(r).map((c) => renderInline(c));
-  let html = "<table><thead><tr>" + cells(rows[0]).map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>";
-  for (let j = 2; j < rows.length; j++) {
-    html += "<tr>" + cells(rows[j]).map((c) => "<td>" + c + "</td>").join("") + "</tr>";
-  }
-  return html + "</tbody></table>";
+// <chart> specs and <plan_table/> markers are handled separately (charts are
+// re-rendered from the /ask payload, plan tables from /training-plan), so their
+// tags must never surface as literal text — especially during live streaming.
+function stripMarkers(s) {
+  return s
+    .replace(/<chart\b[^>]*>[\s\S]*?<\/chart\s*>/gi, "")
+    .replace(/<chart\b[^>]*>[\s\S]*$/gi, "")
+    .replace(/<plan_table\b[^>]*(?:\/>|>)/gi, "");
 }
 
+// Renders GFM (tables, bold/italic, code, headings, lists, links, task lists)
+// plus KaTeX math ($...$ / $$...$$). Input is parsed by markdown-it, which
+// HTML-escapes it and refuses raw HTML, so model text can never inject markup.
 function renderMarkdown(text) {
   if (!text) return "";
-  const lines = escapeHtml(text).replace(/\r\n/g, "\n").split("\n");
-  const isBlock = (l) => {
-    const t = l.trim();
-    return t === "" || t.startsWith("|") || t.startsWith("```")
-      || /^\s*([-*]|\d+\.)\s+/.test(l) || /^\s*#{1,4}\s+/.test(l);
-  };
-  let html = "";
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const t = line.trim();
-    if (t.startsWith("```")) {
-      i++;
-      const buf = [];
-      while (i < lines.length && !lines[i].trim().startsWith("```")) { buf.push(lines[i]); i++; }
-      i++;
-      html += "<pre><code>" + buf.join("\n") + "</code></pre>";
-      continue;
-    }
-    if (t.startsWith("|")) {
-      const rows = [];
-      while (i < lines.length && lines[i].trim().startsWith("|")) { rows.push(lines[i]); i++; }
-      html += renderTable(rows);
-      continue;
-    }
-    const h = t.match(/^(#{1,4})\s+(.*)$/);
-    if (h) { const lv = Math.min(h[1].length + 1, 6); html += "<h" + lv + ">" + renderInline(h[2]) + "</h" + lv + ">"; i++; continue; }
-    const ul = t.match(/^([-*])\s+(.*)$/);
-    if (ul) {
-      let items = "";
-      while (i < lines.length) {
-        const m2 = lines[i].trim().match(/^([-*])\s+(.*)$/);
-        if (!m2) break;
-        items += "<li>" + renderInline(m2[2]) + "</li>";
-        i++;
-      }
-      html += "<ul>" + items + "</ul>";
-      continue;
-    }
-    const ol = t.match(/^\d+\.\s+(.*)$/);
-    if (ol) {
-      let items = "";
-      while (i < lines.length) {
-        const m2 = lines[i].trim().match(/^\d+\.\s+(.*)$/);
-        if (!m2) break;
-        items += "<li>" + renderInline(m2[1]) + "</li>";
-        i++;
-      }
-      html += "<ol>" + items + "</ol>";
-      continue;
-    }
-    if (t === "") { i++; continue; }
-    const buf = [line];
-    i++;
-    while (i < lines.length && !isBlock(lines[i])) { buf.push(lines[i]); i++; }
-    // Inline-format the whole paragraph at once (so **bold** can span lines),
-    // then turn the paragraph's own newlines into <br>.
-    html += "<p>" + renderInline(buf.join("\n")).replace(/\n/g, "<br>") + "</p>";
-  }
-  return html;
+  text = stripMarkers(text.replace(/\r\n/g, "\n"));
+  // If a CDN script failed to load, fall back to a safe escaped paragraph
+  // rather than crashing the whole chat render.
+  if (!window.markdownit) return "<p>" + escapeHtml(text).replace(/\n/g, "<br>") + "</p>";
+  return buildMd().render(text);
 }
 
-function addMsg(role, text, charts) {
+function copyCode(btn) {
+  const wrap = btn.closest(".code-wrap");
+  const code = wrap ? wrap.querySelector("code") : null;
+  if (!code) return;
+  navigator.clipboard.writeText(code.textContent).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = "Copied!";
+    btn.classList.add("copied");
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied"); }, 1800);
+  }).catch(() => {});
+}
+window.copyCode = copyCode;
+
+function addMsg(role, text, charts, figures) {
   const box = $("chat");
   const m = document.createElement("div");
   m.className = "msg " + role;
@@ -741,13 +1029,16 @@ function addMsg(role, text, charts) {
     }
   }
   m.appendChild(body); m.appendChild(b);
-  for (const spec of (charts || [])) {
+  (charts || []).forEach((spec, idx) => {
     const holder = document.createElement("div");
     holder.className = "chartbox";
     holder.dataset.sql = spec.sql || "";
     holder.dataset.spec = JSON.stringify(spec);
+    if (figures && figures[idx]) {
+      holder.dataset.figure = JSON.stringify(figures[idx]);
+    }
     m.appendChild(holder);
-  }
+  });
   box.appendChild(m);
   box.scrollTop = box.scrollHeight;
   if (charts) renderCharts();
@@ -822,11 +1113,44 @@ async function renderCharts() {
   for (const h of holders) {
     h.setAttribute("data-done", "1");
     try {
-      const spec = JSON.parse(h.dataset.spec);
-      const fig = await api("/ask/chart", { spec });
-      Plotly.newPlot(h, fig.data, fig.layout, { responsive: true });
+      if (h.dataset.figure) {
+        const fig = JSON.parse(h.dataset.figure);
+        Plotly.newPlot(h, fig.data, fig.layout, { responsive: true });
+      } else {
+        const spec = JSON.parse(h.dataset.spec);
+        const fig = await api("/ask/chart", { spec });
+        Plotly.newPlot(h, fig.data, fig.layout, { responsive: true });
+      }
     } catch (e) { h.textContent = "(chart unavailable: " + e.message + ")"; }
   }
+}
+
+function fmtTokens(n) {
+  if (!n || n <= 0) return "…";
+  if (n >= 100000) return Math.round(n / 1000) + "k";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+  return String(n);
+}
+function updateTokens(n) {
+  $("ctx-tokens").textContent = n ? "~" + fmtTokens(n) + " tokens" : "…";
+}
+
+function autoResizeQuestion() {
+  const el = $("question");
+  if (!el) return;
+  el.style.height = "auto";
+  const newH = Math.min(el.scrollHeight, 180);
+  el.style.height = Math.max(38, newH) + "px";
+}
+
+function wirePromptChips() {
+  document.querySelectorAll(".prompt-chip").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $("question").value = btn.dataset.prompt;
+      autoResizeQuestion();
+      ask();
+    });
+  });
 }
 
 async function ask() {
@@ -834,18 +1158,113 @@ async function ask() {
   if (!q) return;
   addMsg("user", q);
   $("question").value = "";
+  autoResizeQuestion();
   $("btn-ask").disabled = true;
-  const placeholder = document.createElement("div");
-  placeholder.className = "msg";
-  placeholder.innerHTML = '<div class="role">Garmin AI</div><div class="body muted">thinking…</div>';
-  $("chat").appendChild(placeholder);
+
+  const msgEl = document.createElement("div");
+  msgEl.className = "msg assistant";
+  const roleEl = document.createElement("div");
+  roleEl.className = "role";
+  roleEl.textContent = "Garmin AI";
+  msgEl.appendChild(roleEl);
+
+  const bubbleEl = document.createElement("div");
+  bubbleEl.className = "body thinking-bubble";
+  bubbleEl.innerHTML =
+    '<span class="thinking-dots"><span></span><span></span><span></span></span>' +
+    '<span class="status-text">Thinking &amp; analyzing your Garmin data…</span>';
+  msgEl.appendChild(bubbleEl);
+  $("chat").appendChild(msgEl);
   $("chat").scrollTop = $("chat").scrollHeight;
+
   try {
-    const data = await api("/ask", { question: q });
-    placeholder.remove();
-    addMsg("assistant", data.answer, data.chart_specs || []);
+    const res = await fetch(API + "/ask", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+      },
+      body: JSON.stringify({ question: q, stream: true }),
+    });
+
+    if (res.status === 401) {
+      token = "";
+      localStorage.removeItem("garmin_token");
+      showAuth();
+      throw new Error("Session expired. Please sign in again.");
+    }
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.detail || ("HTTP " + res.status));
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("text/event-stream")) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedText = "";
+      let isStreamingText = false;
+      let finalData = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() || "";
+
+        for (const block of blocks) {
+          if (!block.trim()) continue;
+          let eventType = "message";
+          let dataStr = "";
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) {
+              eventType = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              dataStr += line.slice(5).trim();
+            }
+          }
+          if (!dataStr) continue;
+          const payload = JSON.parse(dataStr);
+
+          if (eventType === "status") {
+            if (!isStreamingText) {
+              const statusEl = bubbleEl.querySelector(".status-text");
+              if (statusEl) statusEl.textContent = payload.text;
+            }
+          } else if (eventType === "delta") {
+            if (!isStreamingText) {
+              isStreamingText = true;
+              bubbleEl.className = "body";
+              bubbleEl.innerHTML = "";
+            }
+            accumulatedText += payload.text;
+            bubbleEl.innerHTML = renderMarkdown(accumulatedText);
+            $("chat").scrollTop = $("chat").scrollHeight;
+          } else if (eventType === "done") {
+            finalData = payload;
+          } else if (eventType === "error") {
+            throw new Error(payload.error || "Agent error");
+          }
+        }
+      }
+
+      if (finalData) {
+        msgEl.remove();
+        addMsg("assistant", finalData.answer, finalData.chart_specs || [], finalData.chart_figures || []);
+        updateTokens(finalData.tokens);
+      } else if (accumulatedText) {
+        updateTokens(Math.round(accumulatedText.length / 4));
+      }
+    } else {
+      const data = await res.json();
+      msgEl.remove();
+      addMsg("assistant", data.answer, data.chart_specs || [], data.chart_figures || []);
+      updateTokens(data.tokens);
+    }
   } catch (e) {
-    placeholder.remove();
+    msgEl.remove();
     addMsg("assistant", "Error: " + e.message);
   } finally {
     $("btn-ask").disabled = false;
@@ -921,6 +1340,14 @@ const PLAN_COLORS = { run:"#3b82f6", cycle:"#22c55e", swim:"#06b6d4",
 const DAY_LABELS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 let planWeekStart = mondayOf(new Date());
 let planEditId = null;
+let planGoals = [];
+let planWorkouts = [];
+let planActivities = [];
+let planActiveBlocks = [];
+let planSelectedGoalId = null;
+let planView = localStorage.getItem("plan_view") === "list" ? "list" : "week";
+let goalEditId = null;   // null = creating a new goal
+let goalDraft = null;    // working copy of the goal being edited
 
 function mondayOf(d) {
   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -935,18 +1362,540 @@ function fmt(d) {
 }
 
 async function loadPlan() {
+  initOnboardBanner();
+  await loadActivityTypes();
   const end = new Date(planWeekStart);
   end.setDate(end.getDate() + 6);
   const fromStr = fmt(planWeekStart);
   const toStr = fmt(end);
   try {
-    const data = await api("/training-plan?from_date=" + fromStr + "&to_date=" + toStr,
-      undefined, "GET");
-    renderPlan(data.workouts || []);
+    const [planRes, actRes] = await Promise.all([
+      api("/training-plan?from_date=" + fromStr + "&to_date=" + toStr, undefined, "GET"),
+      api("/activities?from_date=" + fromStr + "&to_date=" + toStr, undefined, "GET").catch(() => null),
+    ]);
+    planWorkouts = planRes.workouts || [];
+    planActivities = (actRes && actRes.activities) || [];
+    renderPlan(planWorkouts);
     setErr($("plan-error"), "");
-  } catch (e) { setErr($("plan-error"), e.message); }
+  } catch (e) { planWorkouts = []; planActivities = []; setErr($("plan-error"), e.message); }
+  await loadAnchor(fromStr);
   await loadWeather(fromStr, toStr);
+  applyPlanView();
+  if (planView === "list") await loadPlanList();
 }
+
+function applyPlanView() {
+  const list = planView === "list";
+  $("plan-view-week").classList.toggle("active", !list);
+  $("plan-view-list").classList.toggle("active", list);
+  $("plan-week").classList.toggle("hidden", list);
+  $("plan-list").classList.toggle("hidden", !list);
+  localStorage.setItem("plan_view", planView);
+}
+
+async function setPlanView(view) {
+  planView = view;
+  applyPlanView();
+  if (view === "list") await loadPlanList();
+}
+
+// 8-week list view: the season shape at a glance, grouped by week.
+async function loadPlanList() {
+  const box = $("plan-list");
+  if (!box) return;
+  const start = new Date(planWeekStart);
+  const end = new Date(planWeekStart);
+  end.setDate(end.getDate() + 55);
+  box.innerHTML = '<div class="muted" style="padding:8px 2px">Loading…</div>';
+  let workouts = [];
+  try {
+    const data = await api(
+      "/training-plan?from_date=" + fmt(start) + "&to_date=" + fmt(end), undefined, "GET");
+    workouts = data.workouts || [];
+  } catch (e) {
+    box.innerHTML = "";
+    setErr($("plan-error"), e.message);
+    return;
+  }
+  renderPlanList(workouts);
+}
+
+function renderPlanList(workouts) {
+  const box = $("plan-list");
+  box.innerHTML = "";
+  const today = fmt(new Date());
+  const byWeek = new Map();
+  for (const w of workouts) {
+    const ws = fmt(mondayOf(parseISO(w.planned_date)));
+    if (!byWeek.has(ws)) byWeek.set(ws, []);
+    byWeek.get(ws).push(w);
+  }
+  // Always show the 8 weeks from the current view start, even when empty.
+  const weeks = [];
+  for (let i = 0; i < 8; i++) {
+    const ws = new Date(planWeekStart);
+    ws.setDate(ws.getDate() + i * 7);
+    weeks.push(fmt(ws));
+  }
+  const weekSet = new Set(weeks);
+  for (const ws of [...byWeek.keys()].sort()) {
+    if (!weekSet.has(ws)) weeks.push(ws);
+  }
+  weeks.sort();
+  for (const ws of weeks) {
+    const rows = (byWeek.get(ws) || []).slice().sort((a, b) =>
+      (a.planned_date + String(a.id)).localeCompare(b.planned_date + String(b.id)));
+    const card = document.createElement("div");
+    card.className = "pl-week";
+    const head = document.createElement("div");
+    head.className = "pl-week-head";
+    const label = document.createElement("span");
+    label.textContent = "Week of " + ws;
+    head.appendChild(label);
+    const range = document.createElement("span");
+    range.className = "pl-range";
+    range.textContent = ws === fmt(mondayOf(new Date())) ? "this week" : "";
+    head.appendChild(range);
+    const stat = document.createElement("span");
+    stat.className = "pl-stat";
+    const done = rows.filter((w) => w.completed).length;
+    stat.textContent = rows.length
+      ? done + "/" + rows.length + " done"
+      : "no workouts";
+    head.appendChild(stat);
+    card.appendChild(head);
+    for (const w of rows) {
+      const row = document.createElement("div");
+      row.className = "pl-row"
+        + (w.completed ? " done" : "")
+        + (w.status === "skipped" ? " skipped" : "");
+      const date = document.createElement("span");
+      date.className = "pl-date";
+      date.textContent = w.planned_date.slice(5) + " " + DAY_LABELS[(parseISO(w.planned_date).getDay() + 6) % 7];
+      row.appendChild(date);
+      const badge = document.createElement("span");
+      badge.className = "pl-badge";
+      badge.style.background = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
+      badge.textContent = w.activity_type;
+      row.appendChild(badge);
+      const title = document.createElement("span");
+      title.className = "pl-title";
+      title.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
+      row.appendChild(title);
+      const meta = document.createElement("span");
+      meta.className = "pl-meta";
+      meta.textContent = workoutMeta(w).join(" · ");
+      row.appendChild(meta);
+      row.addEventListener("click", () => openPlanModal(w, w.planned_date));
+      card.appendChild(row);
+    }
+    box.appendChild(card);
+  }
+}
+
+async function loadAnchor(weekStart) {
+  const box = $("plan-anchor");
+  if (!box) return;
+  let goals = [];
+  try {
+    const q = weekStart ? "?week_start=" + encodeURIComponent(weekStart) : "";
+    const data = await api("/training-goal" + q, undefined, "GET");
+    goals = data.goals || [];
+  } catch (e) { goals = []; }
+  renderAnchor(goals);
+}
+
+function renderAnchor(goals) {
+  const box = $("plan-anchor");
+  if (!box) return;
+  planGoals = goals;
+  renderGoalSelector();
+  const g = selectedGoal();
+  if (!g) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    planActiveBlocks = [];
+    applyBlockHighlight();
+    return;
+  }
+  box.classList.remove("hidden");
+  box.innerHTML = "";
+  planActiveBlocks = [];
+  const today = fmt(new Date());
+  for (const b of (g.blocks || [])) {
+    if (b.start_date && b.end_date && b.start_date <= today && today <= b.end_date) {
+      planActiveBlocks.push(b);
+    }
+  }
+  renderOneAnchor(box, g);
+  applyBlockHighlight();
+}
+
+function selectedGoal() {
+  if (planSelectedGoalId != null) {
+    const g = planGoals.find((x) => x.goal.id === planSelectedGoalId);
+    if (g) return g;
+  }
+  const today = fmt(new Date());
+  const active = planGoals.find((g) => (g.blocks || []).some((b) =>
+    b.start_date && b.end_date && b.start_date <= today && today <= b.end_date));
+  if (active) { planSelectedGoalId = active.goal.id; return active; }
+  if (planGoals.length) { planSelectedGoalId = planGoals[0].goal.id; return planGoals[0]; }
+  return null;
+}
+
+function renderGoalSelector() {
+  const box = $("plan-goal-tabs");
+  if (!box) return;
+  if (planGoals.length <= 1) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  selectedGoal();
+  box.classList.remove("hidden");
+  box.innerHTML = "";
+  // Stable order (creation order from the backend). Clicking only highlights the
+  // active chip — it never reorders the row.
+  const ordered = [...planGoals].sort((a, b) => (a.goal.id || 0) - (b.goal.id || 0));
+  for (const g of ordered) {
+    const chip = document.createElement("button");
+    chip.className = "goal-chip" + (g.goal.id === planSelectedGoalId ? " active" : "");
+    chip.textContent = g.goal.title || ("Goal " + g.goal.id);
+    chip.addEventListener("click", () => {
+      planSelectedGoalId = g.goal.id;
+      renderAnchor(planGoals);
+    });
+    box.appendChild(chip);
+  }
+}
+
+function renderOneAnchor(container, anchor) {
+  const box = document.createElement("div");
+  box.className = "plan-anchor";
+  const G = anchor.goal || {};
+  const head = document.createElement("div");
+  head.className = "goal-head";
+  const title = document.createElement("span");
+  title.className = "goal-title";
+  title.textContent = G.title || "Training anchor";
+  head.appendChild(title);
+  const hint = document.createElement("span");
+  hint.className = "goal-hint";
+  const chev = document.createElement("span");
+  chev.className = "gh-chev";
+  chev.textContent = "▸";
+  hint.appendChild(chev);
+  hint.appendChild(document.createTextNode("Details"));
+  head.appendChild(hint);
+  box.appendChild(head);
+
+  box.onclick = (e) => {
+    if (e.target.closest(".phase-seg") || e.target.closest(".phase-legend")) return;
+    box.classList.toggle("pinned");
+  };
+
+  // Always-visible summary of the block/week we are currently viewing.
+  const tgt = anchor.weekly_target;
+  if (tgt && tgt.wave) {
+    const block = tgt.block;
+    const weekNum = blockWeekIndex(block, fmt(planWeekStart));
+    const totalWeeks = blockWeekCount(block);
+    const sub = document.createElement("div");
+    sub.className = "goal-sub";
+    const b = document.createElement("b");
+    b.textContent = "Week " + weekNum + (totalWeeks ? " of " + totalWeeks : "");
+    sub.appendChild(b);
+    if (block && (block.focus || block.name)) {
+      sub.appendChild(document.createTextNode(" · " + (block.focus || block.name)));
+    }
+    box.appendChild(sub);
+  }
+
+  const details = document.createElement("div");
+  details.className = "goal-details";
+  const meta = document.createElement("span");
+  meta.className = "goal-meta";
+  const parts = [];
+  if (G.event_type) parts.push(renderSpan("Event", G.event_type));
+  if (G.target_date) {
+    const days = (parseISO(G.target_date) - startOfDay(new Date())) / 86400000;
+    const dd = Math.max(0, Math.round(days));
+    parts.push(renderSpan("Target", G.target_date + (dd >= 0 ? " (" + dd + "d)" : "")));
+  }
+  if (G.target_distance_km != null) parts.push(renderSpan("Distance", Number(G.target_distance_km) + " km"));
+  if (G.target_time) parts.push(renderSpan("Time", G.target_time));
+  for (const p of parts) meta.appendChild(p);
+  if (meta.firstChild) details.appendChild(meta);
+  if (G.notes) {
+    const note = document.createElement("div");
+    note.className = "goal-note";
+    note.textContent = G.notes;
+    details.appendChild(note);
+  }
+  renderPhaseStrip(box, anchor.blocks || [], anchor.current_block);
+  renderWeeklyProgressInto(box, anchor);
+  box.appendChild(details);
+  container.appendChild(box);
+}
+
+function applyBlockHighlight() {
+  const B = planActiveBlocks;
+  for (const c of document.querySelectorAll("#plan-week .plan-day[data-date]")) {
+    const hit = B && B.some((b) => b.start_date && b.end_date && c.dataset.date >= b.start_date
+      && c.dataset.date <= b.end_date);
+    if (hit) c.classList.add("block"); else c.classList.remove("block");
+  }
+}
+
+// Renders this week's target-vs-actual bar into the goal anchor (the goal title
+// already lives in the anchor head, so this row carries no title of its own).
+function renderWeeklyProgressInto(box, goal) {
+  if (!box || !goal) return;
+  const tgt = goal.weekly_target;
+  if (!tgt || !tgt.wave) return;
+  const block = tgt.block;
+  const wave = tgt.wave;
+  const haveKm = wave.distance_km != null;
+  const haveMin = wave.duration_min != null;
+  const waveTarget = haveKm ? wave.distance_km : (haveMin ? wave.duration_min : null);
+  const unit = haveKm ? "km" : "min";
+  const weekStart = fmt(planWeekStart);
+  const end = new Date(planWeekStart);
+  end.setDate(end.getDate() + 6);
+  const weekEnd = fmt(end);
+
+  // actual = mileage / volume logged this week (from synced activities).
+  // We track a single unit for the whole week (km when the wave gives a km
+  // target, minutes otherwise) so a recovery bike's minutes never get summed
+  // into the km total.
+  let actual = 0;
+  for (const a of planActivities) {
+    if (a.start_date < weekStart || a.start_date > weekEnd) continue;
+    if (!activityMatches(goal.goal, a.activity_type)) continue;
+    if (haveKm && a.distance_km != null) actual += Number(a.distance_km);
+    else if (!haveKm && haveMin && a.duration_hours != null) actual += Number(a.duration_hours) * 60;
+  }
+
+  // The bar is measured against what is actually scheduled on the calendar (the
+  // daily sum), falling back to the block's wave target only when nothing with
+  // distance/duration is scheduled. The wave target is shown separately below,
+  // so the two never read as competing denominators.
+  let scheduled = 0;
+  for (const w of planWorkouts) {
+    if (w.planned_date < weekStart || w.planned_date > weekEnd) continue;
+    if (haveKm && w.distance_km != null) scheduled += Number(w.distance_km);
+    else if (!haveKm && haveMin && w.duration_min != null) scheduled += Number(w.duration_min);
+  }
+  const denom = scheduled > 0 ? scheduled : waveTarget;
+  const rounded = (n) => Math.round(n * 10) / 10;
+  const pct = denom ? Math.min(100, Math.round((actual / denom) * 100)) : 0;
+
+  const row = document.createElement("div");
+  row.className = "wp-row";
+
+  const barRow = document.createElement("div");
+  barRow.className = "wp-bar-row";
+  const label = document.createElement("span");
+  label.className = "wp-num";
+  const actualB = document.createElement("b");
+  actualB.textContent = rounded(actual);
+  label.appendChild(actualB);
+  label.appendChild(document.createTextNode(" / " + (denom != null ? rounded(denom) : "–") + " " + unit));
+  barRow.appendChild(label);
+
+  const track = document.createElement("span");
+  track.className = "wp-track";
+  const actualFill = document.createElement("span");
+  actualFill.className = "wp-fill actual";
+  actualFill.style.width = pct + "%";
+  track.appendChild(actualFill);
+  barRow.appendChild(track);
+
+  const pctEl = document.createElement("span");
+  pctEl.className = "wp-pct";
+  pctEl.textContent = pct + "%";
+  barRow.appendChild(pctEl);
+  row.appendChild(barRow);
+
+  const legend = document.createElement("div");
+  legend.className = "wp-legend";
+  const lg = document.createElement("span");
+  lg.className = "lg";
+  const sw = document.createElement("span");
+  sw.className = "sw actual";
+  lg.appendChild(sw);
+  lg.appendChild(document.createTextNode(rounded(actual) + " " + unit + " logged this week"));
+  legend.appendChild(lg);
+  if (scheduled > 0) {
+    const sg = document.createElement("span");
+    sg.className = "lg";
+    sg.textContent = rounded(scheduled) + " " + unit + " scheduled on the calendar";
+    legend.appendChild(sg);
+  }
+  row.appendChild(legend);
+
+  // The block's wave target is a reference only (it can differ slightly from the
+  // sum of the scheduled workouts).
+  if (waveTarget != null && scheduled > 0 && Math.abs(waveTarget - scheduled) >= 0.05) {
+    const ref = document.createElement("div");
+    ref.className = "wp-ref";
+    const b = document.createElement("b");
+    b.textContent = "Block target: ";
+    ref.appendChild(b);
+    ref.appendChild(document.createTextNode(rounded(waveTarget) + " " + unit + " for this week"));
+    row.appendChild(ref);
+  }
+
+  if (wave.notes) {
+    const note = document.createElement("div");
+    note.className = "wp-note";
+    note.textContent = wave.notes;
+    row.appendChild(note);
+  }
+
+  box.appendChild(row);
+}
+
+// Which Garmin activity types count as a goal's "mileage". The map comes from
+// the server (state.GARMIN_TYPE_MAP via /training-plan/activity-types) so the
+// two never drift; if it is unavailable the matcher stays permissive.
+let SPORT_TYPES = null;
+
+async function loadActivityTypes() {
+  if (SPORT_TYPES) return;
+  try {
+    const data = await api("/training-plan/activity-types", undefined, "GET");
+    const map = {};
+    for (const [family, types] of Object.entries(data.types || {})) {
+      map[family] = new Set(types);
+    }
+    SPORT_TYPES = map;
+  } catch (e) { /* leave null -> permissive */ }
+}
+
+function sportFamily(sport) {
+  const s = (sport || "").toLowerCase();
+  if (s.includes("run")) return "run";
+  if (s.includes("cycl") || s.includes("bike")) return "cycle";
+  if (s.includes("swim")) return "swim";
+  if (s.includes("strength")) return "strength";
+  return null;
+}
+
+function activityMatches(goal, atype) {
+  const family = sportFamily(goal.sport);
+  if (!family) return true;
+  const set = SPORT_TYPES && SPORT_TYPES[family];
+  if (!set) return true;
+  return set.has(atype);
+}
+
+function blockWeekIndex(block, dayStr) {
+  if (!block || !block.start_date) return 1;
+  const offset = (parseISO(dayStr) - parseISO(block.start_date)) / 86400000;
+  return Math.max(1, Math.floor(offset / 7) + 1);
+}
+
+function blockWeekCount(block) {
+  if (!block || !block.start_date || !block.end_date) return 0;
+  const days = (parseISO(block.end_date) - parseISO(block.start_date)) / 86400000 + 1;
+  return Math.max(1, Math.ceil(days / 7));
+}
+
+function renderSpan(label, value) {
+  const s = document.createElement("span");
+  const b = document.createElement("b");
+  b.textContent = label + ": ";
+  s.appendChild(b);
+  s.appendChild(document.createTextNode(value));
+  return s;
+}
+
+function renderPhaseStrip(box, blocks, currentBlock) {
+  const dated = blocks.filter((b) => b.start_date && b.end_date);
+  const undated = blocks.filter((b) => !b.start_date || !b.end_date);
+  if (dated.length) {
+    const first = dated.map((b) => parseISO(b.start_date)).sort((a, b) => a - b)[0];
+    const last = dated.map((b) => parseISO(b.end_date)).sort((a, b) => b - a)[0];
+    const span = Math.max(1, (last - first) / 86400000);
+    const strip = document.createElement("div");
+    strip.className = "phase-strip";
+    for (const b of dated) {
+      const seg = document.createElement("div");
+      seg.className = "phase-seg"
+        + (currentBlock && currentBlock.id === b.id ? " active" : "");
+      const s = (parseISO(b.start_date) - first) / 86400000;
+      const e = (parseISO(b.end_date) - first) / 86400000;
+      const pct = Math.max(4, Math.min(100, ((e - s + 1) / span) * 100));
+      seg.style.width = "calc(" + pct + "% - 2px)";
+      seg.style.background = phaseColor(b.name || b.focus || b.sort_order);
+      seg.title = b.name || b.focus || "Phase";
+      seg.addEventListener("mouseenter", () => {
+        showCardTip(seg, blockTipHtml(b));
+      });
+      seg.addEventListener("mouseleave", hideCardTip);
+      strip.appendChild(seg);
+    }
+    box.appendChild(strip);
+
+    // Readable legend below the strip (labels no longer clip inside segments).
+    const legend = document.createElement("div");
+    legend.className = "phase-legend";
+    for (const b of dated) {
+      const item = document.createElement("span");
+      item.className = "pl-item"
+        + (currentBlock && currentBlock.id === b.id ? " active" : "");
+      const dot = document.createElement("span");
+      dot.className = "pl-dot";
+      dot.style.background = phaseColor(b.name || b.focus || b.sort_order);
+      item.appendChild(dot);
+      item.appendChild(document.createTextNode(b.name || b.focus || "Phase"));
+      legend.appendChild(item);
+    }
+    box.appendChild(legend);
+  }
+  if (undated.length) {
+    const note = document.createElement("div");
+    note.className = "phase-empty";
+    note.textContent = undated.map((b) => b.name || b.focus || "Phase").join(" · ")
+      + " (undated)";
+    box.appendChild(note);
+  }
+}
+
+function blockTipHtml(b) {
+  let html = "<strong>" + (b.name || "Phase") + "</strong>";
+  const bits = [];
+  if (b.focus) bits.push("Focus: " + b.focus);
+  if (b.start_date && b.end_date) bits.push(b.start_date + " → " + b.end_date);
+  else if (b.start_date) bits.push("from " + b.start_date);
+  else if (b.end_date) bits.push("to " + b.end_date);
+  else bits.push("undated");
+  if (bits.length) html += "<br><em>" + bits.join(" · ") + "</em>";
+  if (b.waves && b.waves.length) {
+    const w = b.waves.map((x) => {
+      const d = x.distance_km != null ? x.distance_km + "km"
+        : (x.duration_min != null ? x.duration_min + "min" : "");
+      const bits = [d, x.intensity, x.is_deload ? "deload" : ""].filter(Boolean).join(" ");
+      return "W" + (x.week_index ?? "") + (bits ? " " + bits : "");
+    });
+    html += "<br><em>Weeks: " + w.join(" · ") + "</em>";
+  }
+  if (b.notes && b.notes.trim()) html += "<p>" + renderMarkdown(b.notes) + "</p>";
+  return html;
+}
+
+const PHASE_COLORS = ["#1f7a5c", "#2f6fa8", "#8a5aa5", "#c77f2e", "#a8443a", "#3d8f8a", "#6b6b8f"];
+function phaseColor(seed) {
+  if (seed == null) return PHASE_COLORS[0];
+  let h = 0; const s = String(seed);
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return PHASE_COLORS[h % PHASE_COLORS.length];
+}
+
+function parseISO(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function startOfDay(dt) { return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()); }
 
 function fmtWx(wx) {
   const tMax = wx.temp_max_c != null ? Math.round(wx.temp_max_c) : null;
@@ -993,23 +1942,24 @@ async function loadWeather(fromStr, toStr) {
     if (!wx) continue;
     const el = document.createElement("div");
     el.className = "wx";
-    const wt = document.createElement("span");
-    wt.className = "wt";
-    wt.textContent = fmtWx(wx);
-    el.appendChild(wt);
     const cond = wxCondition(wx.condition_code);
     if (cond.sym) {
       const wc = document.createElement("span");
-      wc.className = "wr";
+      wc.className = "wxi";
       wc.title = cond.label;
       wc.textContent = cond.sym;
       el.appendChild(wc);
     }
+    const wt = document.createElement("span");
+    wt.className = "wt";
+    wt.textContent = fmtWx(wx);
+    el.appendChild(wt);
     if (wx.precip_mm > 0) {
-      const wr = document.createElement("span");
-      wr.className = "wr";
-      wr.textContent = Math.round(wx.precip_mm) + "mm";
-      el.appendChild(wr);
+      const wp = document.createElement("span");
+      wp.className = "wp";
+      wp.title = "Precipitation";
+      wp.textContent = "💧" + Math.round(wx.precip_mm) + "mm";
+      el.appendChild(wp);
     }
     const head = c.querySelector(".plan-day-header");
     c.insertBefore(el, head.nextSibling);
@@ -1017,6 +1967,23 @@ async function loadWeather(fromStr, toStr) {
 }
 
 let planWeatherByDate = {};
+
+let onboardWired = false;
+function initOnboardBanner() {
+  const banner = $("plan-onboard");
+  if (!banner) return;
+  if (localStorage.getItem("dismissed_banner") === "true") {
+    banner.classList.add("hidden");
+    return;
+  }
+  if (onboardWired) return;
+  onboardWired = true;
+  const close = banner.querySelector(".bd-close");
+  if (close) close.addEventListener("click", () => {
+    localStorage.setItem("dismissed_banner", "true");
+    banner.classList.add("hidden");
+  });
+}
 
 function briefingCat(score) {
   if (score >= 80) return "Prime";
@@ -1185,7 +2152,7 @@ async function loadBriefing() {
       el.querySelector("b").textContent = val == null ? "—" : String(val);
       vitals.appendChild(el);
     };
-    v("Sleep score", rdy.sleep_score != null ? Math.round(rdy.sleep_score) : null);
+    v("Sleep", rdy.sleep != null ? Number(rdy.sleep).toFixed(1) + " h" : null);
     v("HRV (ms)", rdy.hrv != null ? Math.round(rdy.hrv) : null);
     v("Resting HR", rdy.rhr != null ? Math.round(rdy.rhr) : null);
     rSec.appendChild(vitals);
@@ -1209,15 +2176,24 @@ async function loadBriefing() {
     const cond = wxCondition(wx.condition_code);
     const temp = document.createElement("div");
     temp.className = "bf-wxtemp";
-    temp.textContent = (cond.sym ? cond.sym + " " : "") + fmtWx(wx);
+    temp.textContent = fmtWx(wx);
     const det = document.createElement("div");
     det.className = "bf-wxrow";
-    const lines = [];
-    if (cond.label) lines.push(cond.label);
-    if (wx.precip_mm > 0) lines.push("Precip: " + Math.round(wx.precip_mm) + " mm");
-    else lines.push("Precip: dry");
-    if (wx.wind_max_kmh != null) lines.push("Wind: " + Math.round(wx.wind_max_kmh) + " km/h");
-    det.textContent = lines.join("\n");
+    const addRow = (icon, text) => {
+      const row = document.createElement("div");
+      row.className = "bf-wxitem";
+      const i = document.createElement("span");
+      i.className = "bf-wxi";
+      i.textContent = icon;
+      const t = document.createElement("span");
+      t.className = "bf-wxt";
+      t.textContent = text;
+      row.appendChild(i); row.appendChild(t);
+      det.appendChild(row);
+    };
+    if (cond.sym && cond.label) addRow(cond.sym, cond.label);
+    addRow("💧", (wx.precip_mm > 0 ? "Precip: " + Math.round(wx.precip_mm) + " mm" : "Precip: dry"));
+    if (wx.wind_max_kmh != null) addRow("💨", "Wind: " + Math.round(wx.wind_max_kmh) + " km/h");
     wrapX.appendChild(temp); wrapX.appendChild(det);
     xSec.appendChild(wrapX);
   }
@@ -1243,6 +2219,10 @@ function renderPlan(workouts) {
     const day = document.createElement("div");
     day.className = "plan-day" + (iso === today ? " today" : "");
     day.dataset.date = iso;
+    if (planActiveBlocks.some((b) => b.start_date && b.end_date
+        && iso >= b.start_date && iso <= b.end_date)) {
+      day.classList.add("block");
+    }
     const head = document.createElement("div");
     head.className = "plan-day-header";
     const dow = document.createElement("span");
@@ -1257,7 +2237,16 @@ function renderPlan(workouts) {
     if (!(byDate[iso] || []).length) {
       const empty = document.createElement("div");
       empty.className = "plan-empty";
-      empty.textContent = "—";
+      // A past day with no planned workout and no synced activity was a rest
+      // day in practice — say so instead of an opaque dash.
+      const hadActivity = planActivities.some((a) => a.start_date === iso);
+      if (iso < today && !hadActivity) {
+        empty.classList.add("rest");
+        empty.textContent = "Rest ✓";
+        empty.title = "No workout planned and nothing synced that day";
+      } else {
+        empty.textContent = "—";
+      }
       list.appendChild(empty);
     }
     const add = document.createElement("button");
@@ -1274,12 +2263,54 @@ function renderPlan(workouts) {
   $("plan-week-label").textContent = fmt(planWeekStart) + " — " + fmt(end);
 }
 
+// Decimal min/km -> "M:SS /km" (5.5 -> "5:30 /km").
+function fmtPace(dec) {
+  if (dec == null || !isFinite(dec) || dec <= 0) return null;
+  let m = Math.floor(dec);
+  let s = Math.round((dec - m) * 60);
+  if (s >= 60) { m += 1; s = 0; }
+  return m + ":" + String(s).padStart(2, "0") + " /km";
+}
+
+// The short "10 km · 60 min · easy" meta string used by cards and the list view.
+function workoutMeta(w) {
+  const parts = [];
+  if (w.distance_km != null) parts.push(Number(w.distance_km) + " km");
+  if (w.duration_min != null) parts.push(Number(w.duration_min) + " min");
+  if (w.intensity) parts.push(w.intensity);
+  return parts;
+}
+
+// The prescribed targets as individual chips (pace / HR zone / power) so each
+// reads distinctly instead of blending into one blue line.
+function workoutTargets(w) {
+  const out = [];
+  const pace = fmtPace(w.target_pace_min_km);
+  if (pace) out.push({ cls: "pace", icon: "", label: pace, title: "Target pace" });
+  const hr = fmtHrZone(w.target_hr_zone);
+  if (hr) out.push({ cls: "hr", icon: "❤️", label: hr, title: "Target heart-rate zone" });
+  if (w.target_power_w != null) {
+    out.push({ cls: "power", icon: "⚡", label: Number(w.target_power_w) + " W", title: "Target power" });
+  }
+  return out;
+}
+
+// "2" / "z2" -> "Z2"; anything else ("Zone 2", "145-160 bpm") passes through.
+function fmtHrZone(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return "Z" + s;
+  return s;
+}
+
 function workoutCard(w) {
   const color = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
   const card = document.createElement("div");
   card.className = "plan-card"
     + (w.activity_type === "rest" ? " rest" : "")
-    + (w.completed ? " done" : "");
+    + (w.completed ? " done" : "")
+    + (w.status === "skipped" ? " skipped" : "");
   card.style.borderLeftColor = w.completed ? "#22c55e" : color;
   if (w.description && w.description.trim()) {
     card.addEventListener("mouseenter", () => showCardTip(card, renderMarkdown(w.description)));
@@ -1294,24 +2325,44 @@ function workoutCard(w) {
   if (w.completed) {
     const done = document.createElement("span");
     done.className = "pc-done";
-    done.textContent = "Done";
+    done.textContent = w.status === "partial" ? "Partial" : "Done";
     head.appendChild(done);
+  } else if (w.status === "skipped") {
+    const skip = document.createElement("span");
+    skip.className = "pc-skip";
+    skip.textContent = "Skipped";
+    head.appendChild(skip);
   }
   const title = document.createElement("div");
   title.className = "pc-title";
   title.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
-  const meta = [];
-  if (w.distance_km != null) meta.push(Number(w.distance_km) + " km");
-  if (w.duration_min != null) meta.push(Number(w.duration_min) + " min");
-  if (w.intensity) meta.push(w.intensity);
   const m = document.createElement("div");
   m.className = "pc-meta";
-  for (const part of meta) {
+  for (const part of workoutMeta(w)) {
     const s = document.createElement("span");
     s.textContent = part;
     m.appendChild(s);
   }
   card.appendChild(head); card.appendChild(title); card.appendChild(m);
+  const targets = workoutTargets(w);
+  if (targets.length) {
+    const tgt = document.createElement("div");
+    tgt.className = "pc-targets";
+    for (const t of targets) {
+      const chip = document.createElement("span");
+      chip.className = "pc-chip " + t.cls;
+      chip.title = t.title;
+      if (t.icon) {
+        const ic = document.createElement("span");
+        ic.className = "pc-chip-i";
+        ic.textContent = t.icon;
+        chip.appendChild(ic);
+      }
+      chip.appendChild(document.createTextNode(t.label));
+      tgt.appendChild(chip);
+    }
+    card.appendChild(tgt);
+  }
   card.addEventListener("click", () => openPlanModal(w, w.planned_date));
   card.draggable = true;
   card.style.cursor = "grab";
@@ -1405,6 +2456,36 @@ function installDayDrop(day) {
   });
 }
 
+// Populate the goal/phase selects from the loaded anchor so a workout can be
+// linked (or re-linked) without the chat — and so saving an edit can never
+// silently detach it from its phase.
+function fillPlanGoalSelects(goalId, blockId) {
+  const gs = $("pm-goal");
+  gs.innerHTML = '<option value="">—</option>';
+  for (const g of planGoals) {
+    const o = document.createElement("option");
+    o.value = String(g.goal.id);
+    o.textContent = g.goal.title || ("Goal " + g.goal.id);
+    gs.appendChild(o);
+  }
+  gs.value = goalId != null ? String(goalId) : "";
+  fillPlanBlockSelect(blockId);
+}
+
+function fillPlanBlockSelect(blockId) {
+  const bs = $("pm-block");
+  bs.innerHTML = '<option value="">—</option>';
+  const gid = Number($("pm-goal").value);
+  const goal = planGoals.find((g) => g.goal.id === gid);
+  for (const b of (goal ? goal.blocks : []) || []) {
+    const o = document.createElement("option");
+    o.value = String(b.id);
+    o.textContent = b.name || ("Phase " + b.id);
+    bs.appendChild(o);
+  }
+  bs.value = blockId != null ? String(blockId) : "";
+}
+
 function openPlanModal(workout, date) {
   planEditId = workout ? workout.id : null;
   $("pm-date").value = workout ? workout.planned_date : date;
@@ -1414,30 +2495,48 @@ function openPlanModal(workout, date) {
   $("pm-description").value = workout ? (workout.description || "") : "";
   $("pm-duration").value = workout && workout.duration_min != null ? workout.duration_min : "";
   $("pm-distance").value = workout && workout.distance_km != null ? workout.distance_km : "";
-  $("pm-completed").checked = workout ? !!workout.completed : false;
+  $("pm-pace").value = workout && workout.target_pace_min_km != null ? workout.target_pace_min_km : "";
+  $("pm-hrzone").value = workout ? (workout.target_hr_zone || "") : "";
+  $("pm-power").value = workout && workout.target_power_w != null ? workout.target_power_w : "";
+  $("pm-status").value = workout
+    ? (workout.status || (workout.completed ? "completed" : "planned"))
+    : "planned";
+  const sel = selectedGoal();
+  fillPlanGoalSelects(
+    workout ? workout.goal_id : (sel ? sel.goal.id : null),
+    workout ? workout.block_id : null);
   $("pm-delete").classList.toggle("hidden", !workout);
   $("plan-modal-title").textContent = workout ? "Edit workout" : "Add workout";
   setErr($("plan-modal-error"), "");
   $("plan-modal").classList.remove("hidden");
+  setTimeout(() => { $("pm-title").focus(); }, 20);
 }
 
 function closePlanModal() { $("plan-modal").classList.add("hidden"); }
 
 async function savePlan() {
   setErr($("plan-modal-error"), "");
+  const num = (id) => { const v = $(id).value; return v === "" ? null : Number(v); };
   const body = {
     planned_date: $("pm-date").value,
     activity_type: $("pm-type").value,
     title: $("pm-title").value,
     description: $("pm-description").value,
-    duration_min: $("pm-duration").value === "" ? null : Number($("pm-duration").value),
-    distance_km: $("pm-distance").value === "" ? null : Number($("pm-distance").value),
+    duration_min: num("pm-duration"),
+    distance_km: num("pm-distance"),
     intensity: $("pm-intensity").value,
-    completed: $("pm-completed").checked,
+    target_pace_min_km: num("pm-pace"),
+    target_hr_zone: $("pm-hrzone").value,
+    target_power_w: num("pm-power"),
+    status: $("pm-status").value,
+    goal_id: num("pm-goal"),
+    block_id: num("pm-block"),
   };
   if (!body.planned_date) { setErr($("plan-modal-error"), "pick a date"); return; }
   try {
-    if (planEditId) await api("/training-plan/" + planEditId, body, "PUT");
+    // PATCH on edit: only the fields above change, so the link and any field
+    // the form does not carry are preserved server-side.
+    if (planEditId) await api("/training-plan/" + planEditId, body, "PATCH");
     else await api("/training-plan", body, "POST");
     closePlanModal();
     loadPlan();
@@ -1452,6 +2551,289 @@ async function deletePlan() {
     closePlanModal();
     loadPlan();
   } catch (e) { setErr($("plan-modal-error"), e.message); }
+}
+
+// ---- Goals / phases / waves editor -----------------------------------------
+// The long-term anchor is the season shape the plan derives from; this modal is
+// the UI equivalent of the agent's anchor tool. Saving replaces the block set
+// (workouts are re-linked by phase name, the rest detached) and is undoable.
+
+function openGoalsModal() {
+  setErr($("goal-modal-error"), "");
+  $("goal-modal").classList.remove("hidden");
+  const sel = selectedGoal();
+  startGoalEdit(sel ? sel.goal.id : null);
+}
+
+function closeGoalModal() { $("goal-modal").classList.add("hidden"); }
+
+function startGoalEdit(goalId) {
+  goalEditId = goalId;
+  const g = planGoals.find((x) => x.goal.id === goalId);
+  goalDraft = g
+    ? JSON.parse(JSON.stringify({ goal: g.goal, blocks: g.blocks || [] }))
+    : { goal: {}, blocks: [] };
+  renderGoalEditor();
+}
+
+function goalField(label, id, value, attrs) {
+  const wrap = document.createElement("div");
+  const l = document.createElement("label");
+  l.textContent = label;
+  wrap.appendChild(l);
+  const inp = document.createElement("input");
+  inp.id = id;
+  inp.value = value == null ? "" : value;
+  Object.assign(inp, attrs || {});
+  wrap.appendChild(inp);
+  return wrap;
+}
+
+function goalRow(a, b) {
+  const r = document.createElement("div");
+  r.className = "row";
+  r.appendChild(a); r.appendChild(b);
+  return r;
+}
+
+function renderGoalEditor() {
+  const body = $("goal-modal-body");
+  body.innerHTML = "";
+  const list = document.createElement("div");
+  list.className = "goal-list";
+  for (const g of planGoals) {
+    const b = document.createElement("button");
+    b.className = "secondary" + (g.goal.id === goalEditId ? " active" : "");
+    b.textContent = (g.goal.title || ("Goal " + g.goal.id)) +
+      (g.goal.event_type ? " · " + g.goal.event_type : "");
+    b.addEventListener("click", () => startGoalEdit(g.goal.id));
+    list.appendChild(b);
+  }
+  if (planGoals.length) body.appendChild(list);
+
+  const form = document.createElement("div");
+  form.className = "goal-form";
+  const G = goalDraft.goal || {};
+  form.appendChild(goalRow(
+    goalField("Title", "gm-title", G.title, { placeholder: "Autumn marathon" }),
+    goalField("Sport", "gm-sport", G.sport, { placeholder: "running" })));
+  form.appendChild(goalRow(
+    goalField("Event", "gm-event", G.event_type, { placeholder: "marathon" }),
+    goalField("Target date", "gm-date", G.target_date, { placeholder: "YYYY-MM-DD" })));
+  form.appendChild(goalRow(
+    goalField("Distance (km)", "gm-dist", G.target_distance_km,
+      { type: "number", step: "any", min: "0" }),
+    goalField("Target time", "gm-time", G.target_time, { placeholder: "3:45:00" })));
+  const nw = document.createElement("div");
+  const nl = document.createElement("label");
+  nl.textContent = "Notes";
+  nw.appendChild(nl);
+  const notes = document.createElement("textarea");
+  notes.id = "gm-notes";
+  notes.rows = 2;
+  notes.value = G.notes || "";
+  nw.appendChild(notes);
+  form.appendChild(nw);
+
+  const bh = document.createElement("div");
+  bh.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:8px";
+  const bt = document.createElement("b");
+  bt.textContent = "Phases & weekly waves";
+  bh.appendChild(bt);
+  const addBlock = document.createElement("button");
+  addBlock.className = "secondary";
+  addBlock.textContent = "+ phase";
+  addBlock.addEventListener("click", () => {
+    goalDraft.blocks.push({ name: "", waves: [] });
+    renderGoalEditor();
+  });
+  bh.appendChild(addBlock);
+  if (goalEditId != null) {
+    const delGoal = document.createElement("button");
+    delGoal.className = "secondary";
+    delGoal.style.cssText = "margin-left:auto;border-color:var(--err);color:var(--err)";
+    delGoal.textContent = "Delete goal";
+    delGoal.addEventListener("click", async () => {
+      if (!window.confirm("Delete this goal and its phases? Planned workouts are detached.")) return;
+      try {
+        await api("/training-goal/" + goalEditId, undefined, "DELETE");
+        goalEditId = null;
+        goalDraft = { goal: {}, blocks: [] };
+        await loadAnchor(fmt(planWeekStart));
+        renderGoalEditor();
+        loadPlan();
+      } catch (e) { setErr($("goal-modal-error"), e.message); }
+    });
+    bh.appendChild(delGoal);
+  }
+  form.appendChild(bh);
+  goalDraft.blocks.forEach((b, bi) => form.appendChild(blockEditor(b, bi)));
+  body.appendChild(form);
+}
+
+function blockField(label, key, block, attrs) {
+  const wrap = document.createElement("div");
+  const l = document.createElement("label");
+  l.textContent = label;
+  wrap.appendChild(l);
+  const inp = document.createElement("input");
+  inp.value = block[key] == null ? "" : block[key];
+  Object.assign(inp, attrs || {});
+  inp.addEventListener("input", () => { block[key] = inp.value; });
+  wrap.appendChild(inp);
+  return wrap;
+}
+
+function blockEditor(block, bi) {
+  const card = document.createElement("div");
+  card.className = "block-card";
+  const head = document.createElement("div");
+  head.className = "bc-head";
+  const title = document.createElement("b");
+  title.textContent = "Phase " + (bi + 1) + (block.name ? " · " + block.name : "");
+  head.appendChild(title);
+  const del = document.createElement("button");
+  del.className = "secondary";
+  del.style.cssText = "border-color:var(--err);color:var(--err)";
+  del.textContent = "Remove";
+  del.addEventListener("click", () => {
+    goalDraft.blocks.splice(bi, 1);
+    renderGoalEditor();
+  });
+  head.appendChild(del);
+  card.appendChild(head);
+
+  card.appendChild(goalRow(
+    blockField("Name", "name", block, { placeholder: "Base" }),
+    blockField("Focus", "focus", block, { placeholder: "aerobic" })));
+  card.appendChild(goalRow(
+    blockField("Start", "start_date", block, { placeholder: "YYYY-MM-DD" }),
+    blockField("End", "end_date", block, { placeholder: "YYYY-MM-DD" })));
+  const nw = document.createElement("div");
+  const nl = document.createElement("label");
+  nl.textContent = "Notes (shown on hover in the phase strip)";
+  nw.appendChild(nl);
+  const ta = document.createElement("textarea");
+  ta.rows = 2;
+  ta.value = block.notes || "";
+  ta.addEventListener("input", () => { block.notes = ta.value; });
+  nw.appendChild(ta);
+  card.appendChild(nw);
+
+  const wh = document.createElement("div");
+  wh.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:8px";
+  const wl = document.createElement("b");
+  wl.textContent = "Weekly wave (repeats over the phase)";
+  wh.appendChild(wl);
+  const addWave = document.createElement("button");
+  addWave.className = "secondary";
+  addWave.textContent = "+ week";
+  addWave.addEventListener("click", () => {
+    if (!block.waves) block.waves = [];
+    block.waves.push({});
+    renderGoalEditor();
+  });
+  wh.appendChild(addWave);
+  card.appendChild(wh);
+  (block.waves || []).forEach((w, wi) => card.appendChild(waveRow(block, w, wi)));
+  return card;
+}
+
+function waveRow(block, wave, wi) {
+  const row = document.createElement("div");
+  row.className = "wave-row";
+  const label = document.createElement("span");
+  label.className = "w-idx";
+  label.textContent = "W" + (wi + 1);
+  label.title = "week " + (wi + 1) + " of the microcycle";
+  row.appendChild(label);
+
+  const num = (cls, key, attrs) => {
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.className = cls;
+    inp.value = wave[key] == null ? "" : wave[key];
+    Object.assign(inp, attrs || {});
+    inp.addEventListener("input", () => {
+      wave[key] = inp.value === "" ? null : Number(inp.value);
+    });
+    return inp;
+  };
+  const km = num("w-km", "distance_km", { step: "any", min: "0" });
+  km.placeholder = "km";
+  row.appendChild(km);
+  const mn = num("w-min", "duration_min", { min: "0" });
+  mn.placeholder = "min";
+  row.appendChild(mn);
+
+  const intent = document.createElement("input");
+  intent.type = "text";
+  intent.className = "w-int";
+  intent.value = wave.intensity || "";
+  intent.placeholder = "intensity intent";
+  intent.addEventListener("input", () => { wave.intensity = intent.value; });
+  row.appendChild(intent);
+
+  const dl = document.createElement("label");
+  dl.className = "w-deload";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = !!wave.is_deload;
+  cb.addEventListener("change", () => { wave.is_deload = cb.checked; });
+  dl.appendChild(cb);
+  dl.appendChild(document.createTextNode("deload"));
+  row.appendChild(dl);
+
+  const del = document.createElement("button");
+  del.className = "secondary";
+  del.textContent = "✕";
+  del.title = "remove week";
+  del.addEventListener("click", () => {
+    block.waves.splice(wi, 1);
+    renderGoalEditor();
+  });
+  row.appendChild(del);
+  return row;
+}
+
+async function saveGoal() {
+  setErr($("goal-modal-error"), "");
+  const val = (id) => { const v = $(id).value.trim(); return v === "" ? null : v; };
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+  const payload = {
+    title: val("gm-title"),
+    sport: val("gm-sport"),
+    event_type: val("gm-event"),
+    target_date: val("gm-date"),
+    target_distance_km: num("gm-dist"),
+    target_time: val("gm-time"),
+    notes: val("gm-notes"),
+    replace_blocks: goalDraft.blocks.map((b) => ({
+      name: b.name || null,
+      focus: b.focus || null,
+      start_date: b.start_date || null,
+      end_date: b.end_date || null,
+      notes: b.notes || null,
+      waves: (b.waves || []).map((w, i) => ({
+        week_index: i + 1,
+        distance_km: w.distance_km == null ? null : Number(w.distance_km),
+        duration_min: w.duration_min == null ? null : Number(w.duration_min),
+        intensity: w.intensity || null,
+        is_deload: !!w.is_deload,
+      })),
+    })),
+  };
+  try {
+    if (goalEditId != null) {
+      await api("/training-goal/" + goalEditId, payload, "PATCH");
+    } else {
+      const created = await api("/training-goal", payload, "POST");
+      goalEditId = created.goal ? created.goal.id : null;
+    }
+    await loadAnchor(fmt(planWeekStart));
+    startGoalEdit(goalEditId);
+    loadPlan();
+  } catch (e) { setErr($("goal-modal-error"), e.message); }
 }
 
 const READINESS_COLORS = { Prime:"#22c55e", Moderate:"#3b82f6", Low:"#f59e0b", Depleted:"#ef4444" };
@@ -1500,8 +2882,9 @@ async function loadReadiness() {
         today.z_hrv != null ? "z = " + Number(today.z_hrv).toFixed(2) : "n/a"],
       ["Resting HR", today.rhr != null ? Math.round(today.rhr) + " bpm" : "—",
         today.z_rhr != null ? "z = " + Number(today.z_rhr).toFixed(2) : "n/a"],
-      ["Sleep score", today.sleep_score != null ? Math.round(today.sleep_score) : "—",
-        today.z_sleep != null ? "z = " + Number(today.z_sleep).toFixed(2) : "n/a"],
+      ["Sleep", today.sleep != null ? Number(today.sleep).toFixed(1) + " h" : "—",
+        (today.z_sleep != null ? "z = " + Number(today.z_sleep).toFixed(2) : "n/a") +
+        (today.sleep_quality != null ? " · restorative " + Math.round(today.sleep_quality * 100) + "%" : "")],
       ["Baseline samples", "HRV " + (today.samples_hrv != null ? today.samples_hrv : "—") +
         " · RHR " + (today.samples_rhr != null ? today.samples_rhr : "—") +
         " · Sleep " + (today.samples_sleep != null ? today.samples_sleep : "—"), "last 28 days"],
@@ -1573,11 +2956,19 @@ function wireTodayAccordions() {
     const key = card.dataset.load;
     const head = card.querySelector(".td-head");
     const details = card.querySelector(".td-details");
+    const saved = localStorage.getItem("td_card_" + key);
+    const shouldOpen = saved !== null ? saved === "1" : (key === "readiness");
+    if (shouldOpen) {
+      details.classList.remove("hidden");
+      card.classList.add("open");
+      head.setAttribute("aria-expanded", "true");
+    }
     head.addEventListener("click", () => {
       const opening = details.classList.contains("hidden");
       details.classList.toggle("hidden", !opening);
       card.classList.toggle("open", opening);
       head.setAttribute("aria-expanded", opening ? "true" : "false");
+      localStorage.setItem("td_card_" + key, opening ? "1" : "0");
       if (opening) {
         const td = TODAY_CARDS[key];
         if (td && td.pending) { td.render(td.chart, td.days); td.pending = false; }
@@ -1881,32 +3272,25 @@ function loadToday() {
 }
 
 const DATA_TYPES = [
-  "heart_rate", "steps", "sleep", "body_battery", "hrv", "stress",
-  "respiration", "spo2", "rhr", "daily_summary", "intensity_minutes",
-  "max_metrics", "training_readiness", "morning_training_readiness",
-  "fitnessage", "training_status", "lactate_threshold",
-  "sweat_loss", "weight", "body_composition", "blood_pressure",
-  "endurance_score", "hill_score", "running_tolerance", "cycling_ftp",
+  "spo2", "training_readiness", "morning_training_readiness",
+  "body_composition", "blood_pressure", "endurance_score",
+  "hill_score", "running_tolerance", "cycling_ftp",
 ];
 async function loadConfig() {
   try {
     const c = await api("/auth/config", undefined, "GET");
     $("cfg-home-city").value = c.home_city || "";
     $("cfg-home-country").value = c.home_country || "";
-    const ok = $("cfg-llm-state");
-    ok.classList.toggle("hidden", !c.llm_configured);
-    ok.classList.toggle("ok", c.llm_configured);
-    ok.textContent = c.llm_configured
-      ? "The AI is configured on the server — chat is ready."
-      : "";
+    $("cfg-reasoning").value = c.reasoning_effort || "";
     const excluded = new Set(c.excluded_data_types || []);
     const box = $("cfg-excluded");
     box.innerHTML = "";
     const grid = document.createElement("div");
     grid.className = "cfg-grid";
-    // The exhaustive daily-metric list comes from the server (DATA_TYPES),
-    // so the checkbox grid always covers every collectible type. Each entry
-    // is {name, label, description}; plain-name arrays are a fallback.
+    // The grid only shows the "premium"/hardware-dependent metrics a user
+    // might not have (SpO2, body composition, readiness, ...). The server
+    // returns that curated list; each entry is {name, label, description},
+    // and a plain-name array (DATA_TYPES) is a fallback.
     const types = (c.available_data_types || DATA_TYPES).map((t) =>
       typeof t === "string" ? { name: t, label: t, description: "" } : t
     );
@@ -1943,6 +3327,7 @@ async function saveConfig() {
       home_city: $("cfg-home-city").value,
       home_country: $("cfg-home-country").value,
       excluded_data_types: excluded,
+      reasoning_effort: $("cfg-reasoning").value,
     }, "PUT");
   } catch (e) { setErr($("cfg-error"), e.message); }
 }
@@ -1950,7 +3335,8 @@ async function saveConfig() {
 async function loadHistory() {
   try {
     const data = await api("/ask/history", undefined, "GET");
-    for (const m of (data.history || [])) addMsg(m.role, m.content, m.chart_specs || []);
+    for (const m of (data.history || [])) addMsg(m.role, m.content, m.chart_specs || [], m.chart_figures || []);
+    updateTokens(data.tokens);
   } catch (e) { /* conversation history is best-effort on login */ }
 }
 
@@ -1979,12 +3365,21 @@ async function saveAutoSync() {
   } finally { $("cfg-autosync").disabled = false; }
 }
 
+function _isDateStr(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s + "T00:00:00").getTime());
+}
+
 async function saveStartDate() {
   $("cfg-sync-start").disabled = true;
+  const v = $("cfg-sync-start").value.trim();
   try {
-    await api("/auth/config", { sync_start_date: $("cfg-sync-start").value }, "PUT");
-    $("sync-start-state").textContent = $("cfg-sync-start").value
-      ? "Saved — the next sync will backfill from " + $("cfg-sync-start").value + "."
+    if (v && !_isDateStr(v)) {
+      $("sync-start-state").textContent = "Enter a date as YYYY-MM-DD (e.g. 2025-01-01) or leave it blank.";
+      return;
+    }
+    await api("/auth/config", { sync_start_date: v }, "PUT");
+    $("sync-start-state").textContent = v
+      ? "Saved — the next sync will backfill from " + v + "."
       : "Saved — backfill window unchanged; a sync will pick it up.";
   } catch (e) {
     $("sync-start-state").textContent = "couldn't save: " + e.message;
@@ -2016,7 +3411,33 @@ $("btn-ask").addEventListener("click", ask);
 $("btn-new-chat").addEventListener("click", async () => {
   try { await api("/ask/clear", {}); } catch (e) {}
   $("chat").innerHTML = "";
+  updateTokens(0);
   $("question").focus();
+});
+$("btn-compact").addEventListener("click", async () => {
+  const btn = $("btn-compact");
+  btn.disabled = true;
+  try {
+    const data = await api("/ask/compact", {});
+    if (data.tokens === 0) {
+      addMsg("assistant", "Nothing to compact — the conversation is already empty.");
+    } else if (data.unchanged) {
+      addMsg("assistant", "The conversation could not be compacted (no summary produced); keeping it as-is.");
+    } else {
+      // The stored transcript is now a compact summary; show a notice instead of
+      // the raw summary text so the chat reads cleanly.
+      $("chat").innerHTML = "";
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.textContent = "Conversation compacted into a summary to cut the context size. Continue the conversation as normal.";
+      $("chat").appendChild(note);
+    }
+    updateTokens(data.tokens);
+  } catch (e) {
+    addMsg("assistant", "Error compacting: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 });
 $("btn-sync").addEventListener("click", triggerSync);
 $("btn-sync-full").addEventListener("click", triggerSyncFull);
@@ -2039,11 +3460,47 @@ $("btn-save-config").addEventListener("click", saveConfig);
 $("plan-prev").addEventListener("click", () => { planWeekStart.setDate(planWeekStart.getDate() - 7); loadPlan(); });
 $("plan-next").addEventListener("click", () => { planWeekStart.setDate(planWeekStart.getDate() + 7); loadPlan(); });
 $("btn-plan-today").addEventListener("click", () => { planWeekStart = mondayOf(new Date()); loadPlan(); });
+$("plan-view-week").addEventListener("click", () => setPlanView("week"));
+$("plan-view-list").addEventListener("click", () => setPlanView("list"));
+$("btn-edit-goals").addEventListener("click", openGoalsModal);
+$("pm-goal").addEventListener("change", () => fillPlanBlockSelect(null));
 $("pm-save").addEventListener("click", savePlan);
 $("pm-cancel").addEventListener("click", closePlanModal);
 $("pm-delete").addEventListener("click", deletePlan);
 $("plan-modal").addEventListener("click", (e) => { if (e.target === $("plan-modal")) closePlanModal(); });
-$("question").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+$("goal-save").addEventListener("click", saveGoal);
+$("goal-cancel").addEventListener("click", closeGoalModal);
+$("goal-new").addEventListener("click", () => startGoalEdit(null));
+$("goal-undo").addEventListener("click", async () => {
+  setErr($("goal-modal-error"), "");
+  try {
+    await api("/training-goal/undo", {}, "POST");
+    goalEditId = null;
+    goalDraft = { goal: {}, blocks: [] };
+    await loadAnchor(fmt(planWeekStart));
+    renderGoalEditor();
+    loadPlan();
+  } catch (e) { setErr($("goal-modal-error"), e.message); }
+});
+$("goal-modal").addEventListener("click", (e) => { if (e.target === $("goal-modal")) closeGoalModal(); });
+$("question").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    ask();
+  }
+});
+$("question").addEventListener("input", autoResizeQuestion);
+wirePromptChips();
+wirePasswordToggles();
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (!$("plan-modal").classList.contains("hidden")) {
+      closePlanModal();
+    } else if (!$("goal-modal").classList.contains("hidden")) {
+      closeGoalModal();
+    }
+  }
+});
 $("login-email").addEventListener("keydown", (e) => { if (e.key === "Enter") loginFlow(); });
 $("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") loginFlow(); });
 $("reg-password").addEventListener("keydown", (e) => { if (e.key === "Enter") registerFlow(); });

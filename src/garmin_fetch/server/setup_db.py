@@ -91,6 +91,7 @@ def _ensure_user_config_columns(conn: Any) -> None:
         ("home_country", "TEXT"),
         ("excluded_data_types", "TEXT"),
         ("sync_start_date", "TEXT"),
+        ("reasoning_effort", "TEXT"),
         ("auto_sync", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ):
         # Skip silently until the table exists (fresh volumes create it later).

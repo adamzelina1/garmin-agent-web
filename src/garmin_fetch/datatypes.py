@@ -264,6 +264,25 @@ DEFAULT_TYPES: tuple[DataType, ...] = tuple(DATA_TYPES.values())
 #: and are not part of the daily-metrics list.
 DAILY_TYPES: tuple[str, ...] = tuple(DATA_TYPES.keys())
 
+#: Data types surfaced as toggles in the settings config grid. These are the
+#: "premium"/hardware-dependent metrics a user might not have (SpO2-capable
+#: watch, body-composition scale, power meter, ...). The universal daily
+#: metrics (heart rate, steps, sleep, stress, body battery, ...) are omitted —
+#: nearly every Garmin collects them, so there's nothing useful to toggle off.
+#: The full DAILY_TYPES list above is still used for fetching, parsing and
+#: exclusion validation, so a hidden type's stored exclusion keeps working.
+CONFIG_VISIBLE_TYPES: frozenset[str] = frozenset({
+    "spo2",
+    "training_readiness",
+    "morning_training_readiness",
+    "body_composition",
+    "blood_pressure",
+    "endurance_score",
+    "hill_score",
+    "running_tolerance",
+    "cycling_ftp",
+})
+
 
 def resolve_types(names: list[str] | None) -> list[DataType]:
     """Map data-type names to their registered DataType objects.
