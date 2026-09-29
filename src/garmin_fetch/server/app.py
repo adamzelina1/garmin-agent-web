@@ -121,7 +121,8 @@ class WorkoutStep(BaseModel):
 
     ``kind`` is the step role (warmup/steady/work/recovery/cooldown/rest) and a
     positive duration is required — use the friendly ``duration`` string
-    (``"15m"``, ``"90s"``, ``"1:30"``) or a plain number of minutes.
+    (``"15m"``, ``"90s"``, ``"1:30"``) or a plain number of minutes, or
+    ``duration_sec`` (whole seconds, the form steps are read back in).
     ``repeat`` > 1 expands the step, and the optional targets mirror the flat
     workout targets.
     """
@@ -129,6 +130,7 @@ class WorkoutStep(BaseModel):
     kind: str = "steady"
     label: str | None = None
     duration: str | float | None = None
+    duration_sec: float | None = None
     repeat: int | None = None
     intensity: str | None = None
     target_pace_min_km: float | None = None

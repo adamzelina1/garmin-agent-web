@@ -109,6 +109,13 @@ def _normalize_steps(value: Any) -> str | None:
         duration = None
         if raw.get("duration") not in (None, ""):
             duration = _parse_duration(raw["duration"], f"step {i} duration")
+        elif raw.get("duration_sec") not in (None, ""):
+            # The stored/read-back form (whole seconds), so a step round-trips
+            # through the API unchanged.
+            try:
+                duration = int(round(float(raw["duration_sec"])))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"step {i} duration_sec must be a number") from exc
         if duration is None:
             raise ValueError(
                 f"step {i} needs a duration (e.g. '15m' or '90s')"

@@ -3000,7 +3000,8 @@ function goalSelect(label, id, value, options) {
 function goalRow(a, b) {
   const r = document.createElement("div");
   r.className = "row";
-  r.appendChild(a); r.appendChild(b);
+  r.appendChild(a);
+  if (b) r.appendChild(b);
   return r;
 }
 
