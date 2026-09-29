@@ -181,9 +181,9 @@ def _db_records() -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def _render(record: dict[str, Any], full: bool) -> list[str]:
-    limit = None if full else 300
-    lines = [f"[{record.get('ts', '')}] Q> {record.get('question', '')}"]
+def _render_body(record: dict[str, Any], limit: int | None) -> list[str]:
+    """Render one record's usage + steps + answer (no question header)."""
+    lines: list[str] = []
     usage = record.get("usage")
     if usage:
         ratio = usage.get("cache_hit_ratio", 0.0) or 0.0
@@ -225,6 +225,21 @@ def _render(record: dict[str, Any], full: bool) -> list[str]:
     return lines
 
 
+def _render(record: dict[str, Any], full: bool) -> list[str]:
+    limit = None if full else 300
+    lines = [f"[{record.get('ts', '')}] Q> {record.get('question', '')}"]
+    lines.extend(_render_body(record, limit))
+    return lines
+
+
+def _uses_tool(record: dict[str, Any], name: str) -> bool:
+    """True when ``name`` appears as a tool call in the record."""
+    return any(
+        step.get("kind", "").startswith("tool") and step.get("tool") == name
+        for step in record.get("steps", [])
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="garmin-trace",
@@ -259,14 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         records = _db_records()
     if args.tool:
-        records = [
-            r
-            for r in records
-            if any(
-                s.get("kind", "").startswith("tool") and s.get("tool") == args.tool
-                for s in r.get("steps", [])
-            )
-        ]
+        records = [r for r in records if _uses_tool(r, args.tool)]
     if args.tail:
         records = records[-args.tail :]
     for record in records:

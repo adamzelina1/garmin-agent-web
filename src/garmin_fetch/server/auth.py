@@ -213,13 +213,6 @@ class UserStore:
                 f"UPDATE users SET {', '.join(sets)} WHERE id = %s", params
             )
 
-    def list_active(self) -> list[dict[str, Any]]:
-        with self._pool.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM users WHERE active = TRUE ORDER BY id"
-            ).fetchall()
-            return [dict(r) for r in rows]
-
     def list_auto_sync(self) -> list[dict[str, Any]]:
         """Users who opted into scheduled auto-sync (per-account setting)."""
         with self._pool.connection() as conn:

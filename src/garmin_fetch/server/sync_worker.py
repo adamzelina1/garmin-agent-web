@@ -29,7 +29,7 @@ from ..fetcher import DataFetcher, refresh_weather_forecast, sync_data
 
 from .auth import UserStore, now_iso
 from .crypto import Encryptor
-from .state import TrainingPlanStore
+from .state import TrainingStore
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class SyncManager:
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
         self.store = UserStore(cfg["db_url"])
-        self.plan = TrainingPlanStore(cfg["db_url"])
+        self.training = TrainingStore(cfg["db_url"])
         self.encryptor = Encryptor(cfg["enc_key"])
         self._pool = ThreadPoolExecutor(
             max_workers=cfg["sync_max_workers"], thread_name_prefix="garmin-sync"
@@ -90,7 +90,7 @@ class SyncManager:
             pass
         self._pool.shutdown(wait=False, cancel_futures=True)
         self.store.close()
-        self.plan.close()
+        self.training.close()
 
     def is_running(self, user_id: int) -> bool:
         with self._lock:
@@ -231,7 +231,7 @@ class SyncManager:
         sync (the matcher is idempotent and only ever completes, never un-does).
         """
         try:
-            result = self.plan.autocomplete(user_id)
+            result = self.training.workouts.autocomplete(user_id)
         except Exception as exc:  # noqa: BLE001 - must never break a sync
             logger.warning(
                 "training-plan autocomplete failed for user %s: %s", user_id, exc

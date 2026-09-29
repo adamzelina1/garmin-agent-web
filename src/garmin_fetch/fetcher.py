@@ -625,7 +625,7 @@ def sync_data(
                     power_parsed.get("power_zones", 0),
                     device_parsed.get("devices", 0),
                 )
-            # Derived daily metrics (training readiness, ACWR, ...) are
+            # Derived daily metrics (ACWR, running ACWR, gait drift, ...) are
             # recomputed from the now-parsed tables once per sync and stored
             # for the AI agent.
             from .derived import build_derived
@@ -633,9 +633,9 @@ def sync_data(
             derived = build_derived(db)
             counts.update(derived)
             logger.info(
-                "rebuilt derived metrics: readiness %s, acwr %s, %s rows",
-                derived.get("readiness", 0),
+                "rebuilt derived metrics: acwr %s, run_acwr %s, %s rows",
                 derived.get("acwr", 0),
+                derived.get("running_acwr", 0),
                 derived.get("derived", 0),
             )
         if types is None and start is None:
@@ -767,14 +767,6 @@ _HEART_RATE = DATA_TYPES["heart_rate"]
 
 class HeartRateFetcher(DataFetcher):
     """Back-compat alias: fetch only heart rate."""
-
-    def fetch_daily_hr(self, calendar_date: str) -> dict:
-        return self.fetch(_HEART_RATE, calendar_date)
-
-
-def sync_heart_rates() -> dict[str, int]:
-    """Back-compat: sync only heart_rate data."""
-    return sync_data(types=[_HEART_RATE])
 
 
 def fetch_heart_rates(

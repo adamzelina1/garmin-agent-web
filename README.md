@@ -1,7 +1,7 @@
 # Garmin Health-Data Agent
 
 > **Ask questions about your Garmin data in plain English — sleep, resting HR,
-> HRV, training load, form drift, readiness and ACWR — and get answers with
+> HRV, training load, form drift and ACWR — and get answers with
 > charts, weather context and a plan you and the AI can both edit.**
 
 A self-hosted, multi-user Garmin Connect fetcher that syncs your watch into
@@ -15,7 +15,7 @@ Garmin Connect ──▶ sync worker ──▶ Postgres (raw JSON, source of tru
                                        ▲  (user_id + RLS on every row)        │
     JS frontend ─▶ FastAPI (JWT) ──▶ garmin-ask agent (read-only role) ◀──────┘
                                            │
-                                     derived_metrics (readiness, ACWR, running)
+                                     derived_metrics (ACWR, running)
 ```
 
 ## What it looks like
@@ -28,11 +28,10 @@ The agent does the analysis and hands back a chart with the reasoning:
 
 ### Clarity at a glance
 
-Training Readiness, ACWR and Running ACWR are computed for you — shown as
-compact scorecards that expand on click into the full breakdown, colour-coded
-zones and history:
+ACWR and Running ACWR are computed for you — shown as compact scorecards that
+expand on click into the full breakdown, colour-coded zones and history:
 
-![Today tab — collapsible Readiness, ACWR and Running ACWR scorecards](images/today_tab_v2.png)
+![Today tab — collapsible ACWR and Running ACWR scorecards](images/today_tab_v2.png)
 
 ### A plan you and the AI both own
 
@@ -111,17 +110,17 @@ construction inside the database layer (see [Security](#security)).
   connection.
 - Tool-calling: schema inspection, `run_sql`, fast no-SQL helpers
   (`get_day_summary`, `get_metric_trend`, `get_recent_activities`), chart specs,
-  weather, long-term memory, training-plan read/write, a one-call
-  `get_training_week` (planned + actual + resolved wave target), and a long-term
-  anchor (multiple goals + periodized blocks + per-block `training_wave` weekly
-  microcycles) the daily plan derives from. Anchor edits are atomic and
-  per-block (an upsert by `id` leaves other phases — and the workouts linked to
-  them — untouched).
+  weather, long-term memory, and a single **`training`** tool over the whole
+  season (goals → periodized blocks → explicit non-repeating calendar weeks →
+  dated workouts). `action="get"` returns the season with the resolved current
+  week and planned/actual-vs-target coverage; `action="apply"` takes one atomic
+  `{"anchor": ..., "workouts": ...}` spec (or `{"undo": true}`), so the agent
+  never assembles a plan/anchor split.
 - Workouts carry a lifecycle `status` (planned/completed/partial/skipped) and
   prescribed targets (`target_pace_min_km`, `target_hr_zone`, `target_power_w`).
-  Plan/anchor writes support id-keyed partial updates, bulk `shift` /
-  `repeat_week` / `delete_range`, and `undo` of the last destructive edit
-  (snapshots live in `user_state`).
+  Writes are id-keyed partial updates plus `delete_ids`, and a single
+  season-wide `undo` of the last destructive edit (one `season_undo` snapshot in
+  `user_state` covers the workouts and the anchor together).
 
 **Operation hardening**
 - Exponential per-account backoff against Garmin's informal API and ban risk;
@@ -150,13 +149,13 @@ sync status, per-account settings).
 | `user_profile` | Raw profile snapshots (HR zones, power zones, race predictions, gear, devices) |
 | `gear` | Current gear snapshot (bikes, shoes, ...) with cumulative stats — replaced each sync, no history |
 | `devices` | Current Garmin devices (model + which is primary) — replaced each sync, no history |
-| `derived_metrics` | Computed daily metrics — one row per `(calendar_date, metric)`; `readiness` (+ `readiness_*` components), `acwr` (+ acute/chronic/daily load), `run_acwr` and `run_cadence_drift`. Replaced wholesale each sync |
+| `derived_metrics` | Computed daily metrics — one row per `(calendar_date, metric)`; `acwr` (+ acute/chronic/daily load), `run_acwr` and `run_cadence_drift`. Replaced wholesale each sync |
 | `weather_forecast` | Stored daily Open-Meteo forecast (min/max °C, precip mm, max wind, WMO condition code), refreshed once per sync — the Training Plan calendar renders it from here, RLS-scoped per account |
-| `training_plan` | Per-user planned workouts (editable in the UI and by the agent) with a `status` (planned/completed/partial/skipped) and prescribed `target_pace_min_km`/`target_hr_zone`/`target_power_w`, optionally linked to a long-term goal via `goal_id`/`block_id`; links are validated on write and detached when a goal/block is removed, so no row points at a missing phase |
-| `training_goal` | Long-term goals (one per event, e.g. a marathon and a half-marathon) — an account may hold many; editable via `goal_id` PATCH |
-| `training_block` | Periodized phases of a goal — free-form `name`/`focus`/`notes`, optional dates, partial PATCH updates; blocks are upserted by `id` so editing one phase never rewrites the season |
-| `training_wave` | Per-block weekly microcycle / wave targets (e.g. Week 1: 50km … Week 4: 45km deload), `week_index` contiguous 1..N, optional `intensity` intent and `is_deload` flag; the pattern repeats over longer blocks and drives the plan tab's weekly progress bars |
-| `user_state` | Per-user agent state: long-term memory, conversation history, tool-call trace, and the plan/anchor undo snapshots |
+| `training_workout` | Per-user planned workouts (editable in the UI and by the agent) with a `status` (planned/completed/partial/skipped) and prescribed `target_pace_min_km`/`target_hr_zone`/`target_power_w`; automatically linked to the active phase and goal by `planned_date` and `activity_type` (optional `goal_id` manual override) |
+| `training_goal` | Long-term goals (one per event, e.g. a marathon and a half-marathon) over `[start_date, target_date]` — an account may hold many, each with an enum `sport` (run/cycle/swim/strength/rest/other); editable via `goal_id` PATCH |
+| `training_block` | Periodized blocks of a goal — free-form `name`/`focus`, `start_date`/`end_date` (ordered chronologically), optional baseline `target_weekly_km`, partial PATCH updates; blocks are upserted by `id` so editing one block never rewrites the season |
+| `training_week` | Per-block week targets, keyed by `week_start` (Monday `YYYY-MM-DD`) — non-repeating, optional `distance_km` (falls back to block's `target_weekly_km`), `duration_min`, and an `is_deload` flag; drives the plan tab's weekly progress bars and the resolver's planned/actual-vs-target coverage |
+| `user_state` | Per-user agent state: long-term memory, conversation history, tool-call trace, and the season undo snapshot |
 
 ## Setup
 
@@ -217,7 +216,6 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/login \
 
 curl -s -X POST http://127.0.0.1:8000/sync -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://127.0.0.1:8000/sync/full -H "Authorization: Bearer $TOKEN"  # + full re-parse from raw
-curl -s http://127.0.0.1:8000/readiness -H "Authorization: Bearer $TOKEN"   # readiness series + today + scale
 curl -s http://127.0.0.1:8000/acwr -H "Authorization: Bearer $TOKEN"        # ACWR series + today
 curl -s http://127.0.0.1:8000/run-acwr -H "Authorization: Bearer $TOKEN"    # running-isolated ACWR series
 curl -s "http://127.0.0.1:8000/activities?from_date=2026-08-01&to_date=2026-08-31" -H "Authorization: Bearer $TOKEN"
@@ -299,13 +297,6 @@ Both the cardio and the running-specific scores are derived in
 (after parsing), so the agent can answer questions about them from the same
 table the UI renders.
 
-- **Training readiness** (`readiness.py`) — 28-day trailing baselines
-  (`min_samples=7`) for nightly HRV, resting HR and sleep score; z-scores
-  (HRV clamped at `+2.0`, resting HR inverted); composite
-  `0.50·Z_HRV + 0.30·Z_RHR + 0.20·Z_Sleep`; then auto-scaled to 0-100 via
-  `SCORE_ANCHORS` calibrated against the trailing 90 days of composites (per
-  day, never including the day itself, so no future leakage). Adjust
-  `SCORE_ANCHORS` / `SCALE_WINDOW_DAYS` in `readiness.py` to reshape.
 - **ACWR** (`workload.py`) — daily training load summed from
   `activity_summaries.training_load`; `acute = EMA₇`, `chronic = EMA₂₈`,
   `ACWR = acute/chronic`. Rest days count as zero load, so tapers show up as a
@@ -346,8 +337,7 @@ src/garmin_fetch/
   fetcher.py    # Garmin Connect sync (per-user, token-string store)
   parser.py     # raw JSON -> typed table projections
   datatypes.py  # data-type registry
-  derived.py    # rebuilds all derived metrics (readiness + ACWR + running) into derived_metrics
-  readiness.py  # custom training-readiness score (z-composite + rolling auto-scale)
+  derived.py    # rebuilds all derived metrics (ACWR + running) into derived_metrics
   workload.py   # ACWR (7d/28d EMA of daily training load)
   run_workload.py # running foot-strike ACWR + pace-normalised cadence (form) drift
   ask.py        # read-only AI agent (ReadOnlyDB, statement gate, RLS-scoped, chart)

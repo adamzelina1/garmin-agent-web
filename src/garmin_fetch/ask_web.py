@@ -26,6 +26,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from .ask import (
     _build_agent,
     _build_chart_figure,
+    _final_answer,
     _open_readonly,
     _record_turn,
 )
@@ -208,18 +209,31 @@ def _extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
     return "".join(pieces), charts
 
 
-def _looks_like_plan_dump(data: Any) -> bool:
-    """True when ``data`` is training-plan workout JSON.
+def _workout_dump_list(data: Any) -> Any:
+    """The workout list inside a plan-ish dump (or None).
 
-    The ``get_training_plan`` tool returns ``{"workouts": [...], "truncated":
-    ...}``, so both the wrapper object and a bare array of workouts are
-    recognised.
+    Handles a bare array and the unified ``training`` tool's windowed
+    ``{"weeks": [{"planned": [...]}, ...]}`` agenda (flattened across weeks).
     """
+    if isinstance(data, list):
+        return data
     if isinstance(data, dict):
-        data = data.get("workouts")
-    if not isinstance(data, list) or not data:
+        weeks = data.get("weeks")
+        if isinstance(weeks, list):
+            return [
+                w for wk in weeks
+                if isinstance(wk, dict) and isinstance(wk.get("planned"), list)
+                for w in wk["planned"]
+            ]
+    return None
+
+
+def _looks_like_workout_dump(data: Any) -> bool:
+    """True when ``data`` is training-plan workout JSON."""
+    workouts = _workout_dump_list(data)
+    if not isinstance(workouts, list) or not workouts:
         return False
-    for item in data:
+    for item in workouts:
         if not isinstance(item, dict):
             return False
         if not (
@@ -230,10 +244,9 @@ def _looks_like_plan_dump(data: Any) -> bool:
     return True
 
 
-def _plan_dump_marker(data: Any) -> str:
+def _workout_dump_marker(data: Any) -> str:
     """Render the ``<plan_table />`` marker for a plan dump, with date bounds."""
-    if isinstance(data, dict):
-        data = data.get("workouts") or []
+    data = _workout_dump_list(data) or []
     dates = [str(i["planned_date"]) for i in data if i.get("planned_date")]
     attrs = ""
     if dates:
@@ -241,12 +254,12 @@ def _plan_dump_marker(data: Any) -> str:
     return f"<plan_table{attrs} />"
 
 
-def _replace_plan_dumps(text: str) -> str:
+def _replace_workout_dumps(text: str) -> str:
     """Replace verbatim training-plan JSON dumps with a ``<plan_table />`` marker.
 
     The model is told to show the plan via ``<plan_table />`` (the UI renders
     the stored plan straight from the DB), but it sometimes ignores that and
-    pastes the raw JSON the ``get_training_plan`` tool returned — burning
+    pastes the raw JSON the ``training`` tool returned — burning
     tokens and displaying ugly JSON. This post-processes the answer: any JSON
     array whose items look like plan workouts (fenced or bare) is swapped for
     the marker, so the chat always shows the rendered table.
@@ -256,9 +269,9 @@ def _replace_plan_dumps(text: str) -> str:
             data = json.loads(match.group(1))
         except (json.JSONDecodeError, AttributeError):
             return match.group(0)
-        if not _looks_like_plan_dump(data):
+        if not _looks_like_workout_dump(data):
             return match.group(0)
-        return _plan_dump_marker(data)
+        return _workout_dump_marker(data)
 
     text = re.sub(r"```(?:json)?\s*\n([\s\S]*?)```", _swap, text)
 
@@ -277,8 +290,8 @@ def _replace_plan_dumps(text: str) -> str:
             out.append(text[idx])
             pos = idx + 1
             continue
-        if _looks_like_plan_dump(data):
-            out.append(_plan_dump_marker(data))
+        if _looks_like_workout_dump(data):
+            out.append(_workout_dump_marker(data))
         else:
             out.append(text[idx : idx + end])
         pos = idx + end
@@ -289,13 +302,12 @@ class ChatSession:
     """One chat app instance: lazy agent, DB-persisted conversation."""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
-        from .server.state import TrainingGoalStore, TrainingPlanStore, UserState
+        from .server.state import TrainingStore, UserState
 
         self.cfg = cfg
         self._holder: dict[str, Any] = {}
         self._state = UserState(cfg["db_url"])
-        self._plan = TrainingPlanStore(cfg["db_url"])
-        self._goal = TrainingGoalStore(cfg["db_url"])
+        self._training = TrainingStore(cfg["db_url"])
         self._user_id = cfg.get("local_user_id") or 1
         self.initial_history: list[dict[str, str]] = []
 
@@ -309,12 +321,11 @@ class ChatSession:
 
     def close(self) -> None:
         """Release the shared pools (called when the Gradio server stops)."""
-        self._goal.close()
-        self._plan.close()
+        self._training.close()
         self._state.close()
 
     def _agent(self) -> Any:
-        from .server.state import PgMemory, TrainingAnchor, TrainingPlan
+        from .server.state import PgMemory, PgPrinciples, TrainingSeason
 
         if "agent" not in self._holder:
             db = _open_readonly(self.cfg)
@@ -323,8 +334,8 @@ class ChatSession:
                 self.cfg,
                 db,
                 memory=PgMemory(self._state, self._user_id),
-                plan=TrainingPlan(self._plan, self._user_id),
-                anchor=TrainingAnchor(self._goal, self._user_id),
+                principles=PgPrinciples(self._state, self._user_id),
+                training=TrainingSeason(self._training, self._user_id),
             )
         return self._holder["agent"]
 
@@ -341,7 +352,7 @@ class ChatSession:
             result,
             trace_writer=lambda r: self._state.append_trace(self._user_id, r),
         )
-        text, specs = _extract_charts(str(result.output))
+        text, specs = _extract_charts(_final_answer(result))
 
         # Fallback: the model may validate a chart via the tool but forget to
         # embed the spec in <chart> tags. Recover any validated specs that were

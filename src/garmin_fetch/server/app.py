@@ -10,17 +10,13 @@ API:
 - ``POST /sync``            — enqueue the caller's own sync (JWT)
 - ``GET  /sync/status``     — sync status for the caller (JWT)
 - ``POST /cron/sync``       — daemon-only: enqueue every active user
-- ``GET  /readiness``       — custom training-readiness score (JWT)
 - ``GET  /acwr``            — acute-to-chronic workload ratio (JWT)
-- ``GET  /training-plan``   — the caller's planned workouts (JWT, optional range)
-- ``POST /training-plan``   — add a workout (JWT)
-- ``PATCH /training-plan/{id}`` — partial update of a workout (JWT)
-- ``PUT  /training-plan/{id}`` — full replace of a workout (JWT)
-- ``DELETE /training-plan/{id}`` — delete a workout (JWT, undoable)
-- ``POST /training-plan/bulk`` — shift/repeat/delete-range/dry-run/undo (JWT)
-- ``POST /training-plan/undo`` — restore the pre-delete snapshot (JWT)
-- ``GET  /training-goal``    — goals + phases + waves + resolved week (JWT)
-- ``POST /training-goal/undo`` — restore the pre-delete anchor (JWT)
+- ``GET  /training/workouts``   — the caller's planned workouts (JWT, optional range)
+- ``POST /training/workouts``   — add a workout (JWT)
+- ``PATCH /training/workouts/{id}`` — partial update of a workout (JWT)
+- ``DELETE /training/workouts/{id}`` — delete a workout (JWT, undoable)
+- ``POST /training/undo``    — restore the whole season pre-destructive-edit (JWT)
+- ``GET  /training/anchor``    — goals + blocks + weeks + resolved week (JWT)
 - ``POST /ask``             — run the read-only agent (JWT, per-user rows)
 - ``GET  /ask/history``     — the stored conversation for the caller (JWT)
 - ``POST /ask/clear``       — drop the stored conversation, fresh session (JWT)
@@ -51,6 +47,7 @@ from ..ask import (
     _auto_compact,
     _build_agent,
     _build_chart_figure,
+    _final_answer,
     _messages_token_estimate,
     _prune_session_messages,
     _record_turn,
@@ -60,15 +57,16 @@ from ..ask_web import (
     _extract_charts,
     _history_to_messages,
     _messages_to_history,
-    _replace_plan_dumps,
+    _replace_workout_dumps,
 )
 from ..config import load_config
 from ..db import ensure_schema
 from .auth import AuthError, AuthService, UserStore
 from .setup_db import ensure_roles
 from .state import (
-    PgMemory, TrainingAnchor, TrainingGoalStore, TrainingPlan,
-    TrainingPlanStore, UserState,
+    PgMemory, PgPrinciples, TrainingAnchorStore, TrainingWorkoutStore,
+    TrainingSeason, TrainingStore, UserState, _block_week_count,
+    _resolve_block_weeks,
 )
 from .sync_worker import SyncManager
 
@@ -115,9 +113,32 @@ class ConfigRequest(BaseModel):
     auto_sync: bool | None = None
     sync_start_date: str | None = None
     reasoning_effort: str | None = None
+    training_principles: str | None = None
+    memory: dict[str, str] | None = None
 
 
-class TrainingPlanWorkout(BaseModel):
+class WorkoutStep(BaseModel):
+    """One interval in a structured workout.
+
+    ``kind`` is the step role (warmup/steady/work/recovery/cooldown/rest) and a
+    positive duration is required — use the friendly ``duration`` string
+    (``"15m"``, ``"90s"``, ``"1:30"``) or a plain number of minutes.
+    ``repeat`` > 1 expands the step, and the optional targets mirror the flat
+    workout targets.
+    """
+
+    kind: str = "steady"
+    label: str | None = None
+    duration: str | float | None = None
+    repeat: int | None = None
+    intensity: str | None = None
+    target_pace_min_km: float | None = None
+    target_hr_zone: str | None = None
+    target_power_w: int | None = None
+    notes: str | None = None
+
+
+class TrainingWorkout(BaseModel):
     """A planned workout (full create/replace body)."""
 
     planned_date: str
@@ -130,13 +151,12 @@ class TrainingPlanWorkout(BaseModel):
     target_pace_min_km: float | None = None
     target_hr_zone: str | None = None
     target_power_w: int | None = None
+    steps: list[WorkoutStep] | None = None
     status: str | None = None
-    completed: bool = False
     goal_id: int | None = None
-    block_id: int | None = None
 
 
-class TrainingPlanPatch(BaseModel):
+class TrainingWorkoutPatch(BaseModel):
     """A partial workout edit — only the supplied fields change (PATCH)."""
 
     planned_date: str | None = None
@@ -149,31 +169,23 @@ class TrainingPlanPatch(BaseModel):
     target_pace_min_km: float | None = None
     target_hr_zone: str | None = None
     target_power_w: int | None = None
+    steps: list[WorkoutStep] | None = None
     status: str | None = None
-    completed: bool | None = None
     goal_id: int | None = None
-    block_id: int | None = None
 
 
-class TrainingPlanBulk(BaseModel):
-    """A bulk plan edit (shift / repeat / delete-range / undo)."""
+class TrainingWeek(BaseModel):
+    """One week target of a block.
 
-    replace: bool = False
-    delete_ids: list[int] | None = None
-    delete_range: dict[str, str] | None = None
-    shift: dict[str, Any] | None = None
-    repeat_week: dict[str, Any] | None = None
-    workouts: list[TrainingPlanPatch] | None = None
-    undo: bool = False
+    The ``weeks`` list is the block's complete vector — entry 1 is the calendar
+    week containing the block start — so ``week_start`` is server-derived and
+    only meaningful when a week row is read back.
+    """
 
-
-class TrainingWave(BaseModel):
-    week_index: int | None = None
+    week_start: str | None = None
     distance_km: float | None = None
     duration_min: int | None = None
-    intensity: str | None = None
     is_deload: bool | None = None
-    notes: str | None = None
 
 
 class TrainingBlock(BaseModel):
@@ -182,25 +194,18 @@ class TrainingBlock(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     focus: str | None = None
-    notes: str | None = None
-    sort_order: int | None = None
-    meta: str | None = None
-    waves: list[TrainingWave] | None = None
-    clear_waves: bool | None = None
+    target_weekly_km: float | None = None
+    weeks: list[TrainingWeek] | None = None
 
 
-class TrainingGoal(BaseModel):
+class TrainingAnchor(BaseModel):
     title: str | None = None
     sport: str | None = None
-    event_type: str | None = None
+    start_date: str | None = None
     target_date: str | None = None
     target_distance_km: float | None = None
     target_time: str | None = None
-    notes: str | None = None
-    target_id: str | None = None
-    meta: str | None = None
     blocks: list[TrainingBlock] | None = None
-    replace_blocks: list[TrainingBlock] | None = None
     delete_blocks: list[int] | None = None
 
 
@@ -262,13 +267,13 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         auth = AuthService(cfg)
         sync = SyncManager(cfg)
         state = UserState(cfg["db_url"])
-        plan = TrainingPlanStore(cfg["db_url"])
-        goal = TrainingGoalStore(cfg["db_url"])
+        training = TrainingStore(cfg["db_url"])
         app.state.auth = auth
         app.state.sync = sync
         app.state.state = state
-        app.state.plan = plan
-        app.state.goal = goal
+        app.state.training = training
+        app.state.workouts = training.workouts
+        app.state.anchor = training.anchor
         app.state.cfg = cfg
         app.state.chart_cache = {}
         sync.start()
@@ -278,8 +283,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         finally:
             sync.shutdown()
             state.close()
-            plan.close()
-            goal.close()
+            training.close()
             auth.close()
 
     app = FastAPI(title="Garmin Agent", lifespan=lifespan)
@@ -355,7 +359,11 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     @app.get("/auth/config")
     def get_config(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
         auth: AuthService = request.app.state.auth
-        return auth.get_user_config(user["id"])
+        data = auth.get_user_config(user["id"])
+        state: UserState = request.app.state.state
+        data["training_principles"] = PgPrinciples(state, user["id"]).get()
+        data["memory"] = PgMemory(state, user["id"]).get()
+        return data
 
     @app.put("/auth/config")
     def put_config(
@@ -384,6 +392,23 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             kwargs["sync_start_date"] = body.sync_start_date
         if body.reasoning_effort is not None:
             kwargs["reasoning_effort"] = body.reasoning_effort
+        # Training principles live in ``user_state`` (not the users table), so
+        # they are written separately. Validate them before the config save so a
+        # rejected value never leaves the request half-applied.
+        if body.training_principles is not None:
+            state: UserState = request.app.state.state
+            try:
+                PgPrinciples(state, user["id"]).set(body.training_principles)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        # Long-term memory is edited here as a whole-profile replace (the same
+        # store the agent writes through), with the fact cap enforced.
+        if body.memory is not None:
+            state: UserState = request.app.state.state
+            try:
+                PgMemory(state, user["id"]).replace(body.memory)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         auth.save_user_config(user["id"], **kwargs)
         return {"status": "ok"}
 
@@ -431,33 +456,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         enqueued = request.app.state.sync.cron_sync()
         return {"enqueued": enqueued}
 
-    # -- readiness ------------------------------------------------------------
-
-    @app.get("/readiness")
-    def readiness(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
-        """The user's custom training-readiness score.
-
-        Read from the stored ``derived_metrics`` table (metric 'readiness'),
-        which the sync pipeline recomputes once per sync after the night's
-        sleep/HRV/RHR have landed. Returns the per-day series plus the most
-        recent scored day, and the auto-fit scale used for the current series.
-        """
-        from ..db import PostgresBackend
-        from ..readiness import effective_cutoffs, read_series
-
-        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
-        conn = backend.connect()
-        try:
-            days = read_series(conn)
-        finally:
-            conn.close()
-        scored = [d for d in days if d.get("score") is not None]
-        return {
-            "today": scored[-1] if scored else None,
-            "days": days,
-            "meta": {"scale": effective_cutoffs(days)},
-        }
-
     @app.get("/acwr")
     def acwr(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
         """The user's Acute-to-Chronic Workload Ratio.
@@ -501,10 +499,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         scored = [d for d in days if d.get("run_acwr") is not None]
         return {"today": scored[-1] if scored else None, "days": days}
 
-    # -- training plan --------------------------------------------------------
+    # -- training workouts ----------------------------------------------------
 
-    @app.get("/training-plan")
-    def training_plan_list(
+    @app.get("/training/workouts")
+    def training_workout_list(
         request: Request,
         user: dict = Depends(get_user),
         from_date: str | None = None,
@@ -521,79 +519,46 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                     raise HTTPException(
                         400, f"{label} must be a YYYY-MM-DD date (or blank)"
                     ) from exc
-        plan: TrainingPlanStore = request.app.state.plan
-        return {"workouts": plan.list(user["id"], from_date, to_date)}
+        workouts: TrainingWorkoutStore = request.app.state.workouts
+        return {"workouts": workouts.list(user["id"], from_date, to_date)}
 
-    @app.get("/training-plan/activity-types")
-    def training_plan_activity_types(
-        user: dict = Depends(get_user),
+    @app.post("/training/workouts")
+    def training_workout_create(
+        body: TrainingWorkout, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        """Garmin typeKeys that satisfy each plan ``activity_type``.
-
-        The single source of truth (``state.GARMIN_TYPE_MAP``) shared with the
-        plan tab's weekly volume matching, so the UI never keeps its own copy.
-        """
-        from .state import GARMIN_TYPE_MAP
-
-        return {"types": {k: sorted(v) for k, v in GARMIN_TYPE_MAP.items()}}
-
-    @app.post("/training-plan")
-    def training_plan_create(
-        body: TrainingPlanWorkout, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        plan: TrainingPlanStore = request.app.state.plan
+        workouts: TrainingWorkoutStore = request.app.state.workouts
         try:
-            return plan.create(user["id"], body.model_dump())
+            return workouts.create(user["id"], body.model_dump())
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-    @app.post("/training-plan/bulk")
-    def training_plan_bulk(
-        body: TrainingPlanBulk, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        """One atomic bulk edit: shift / repeat a week / delete a range / undo.
-
-        Destructive edits (replace/delete) snapshot the plan first, restorable
-        with ``{"undo": true}``.
-        """
-        plan: TrainingPlanStore = request.app.state.plan
-        spec = body.model_dump(exclude_unset=True)
-        if body.workouts is not None:
-            spec["workouts"] = [
-                w.model_dump(exclude_unset=True) for w in body.workouts
-            ]
-        try:
-            return plan.apply(user["id"], spec)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-
-    @app.post("/training-plan/undo")
-    def training_plan_undo(
+    @app.post("/training/undo")
+    def training_undo(
         request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        """Restore the plan from the snapshot taken before the last wipe."""
-        plan: TrainingPlanStore = request.app.state.plan
+        """Restore the whole season from the last destructive-edit snapshot."""
+        training: TrainingStore = request.app.state.training
         try:
-            restored = plan.undo(user["id"])
+            restored = training.undo(user["id"])
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         return {"restored": restored}
 
-    @app.patch("/training-plan/{workout_id}")
-    def training_plan_patch(
+    @app.patch("/training/workouts/{workout_id}")
+    def training_workout_patch(
         workout_id: int,
-        body: TrainingPlanPatch,
+        body: TrainingWorkoutPatch,
         request: Request,
         user: dict = Depends(get_user),
     ) -> dict[str, Any]:
         """Partial workout update — only the fields sent change.
 
-        This is the edit path the plan tab uses, so moving a workout never
-        clears its title, targets or goal/block link.
+        This is the edit path the plan tab uses (including drag-and-drop), so
+        moving a workout never clears its title, targets or goal/block link.
         """
-        plan: TrainingPlanStore = request.app.state.plan
+        workouts: TrainingWorkoutStore = request.app.state.workouts
         try:
-            row = plan.update(
+            row = workouts.update(
                 user["id"], workout_id, body.model_dump(exclude_unset=True),
                 partial=True,
             )
@@ -603,29 +568,14 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             raise HTTPException(404, "workout not found")
         return row
 
-    @app.put("/training-plan/{workout_id}")
-    def training_plan_update(
-        workout_id: int,
-        body: TrainingPlanWorkout,
-        request: Request,
-        user: dict = Depends(get_user),
-    ) -> dict[str, Any]:
-        plan: TrainingPlanStore = request.app.state.plan
-        try:
-            row = plan.update(user["id"], workout_id, body.model_dump())
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        if row is None:
-            raise HTTPException(404, "workout not found")
-        return row
-
-    @app.delete("/training-plan/{workout_id}")
-    def training_plan_delete(
+    @app.delete("/training/workouts/{workout_id}")
+    def training_workout_delete(
         workout_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        plan: TrainingPlanStore = request.app.state.plan
-        plan.snapshot(user["id"])
-        if not plan.delete(user["id"], workout_id):
+        workouts: TrainingWorkoutStore = request.app.state.workouts
+        training: TrainingStore = request.app.state.training
+        training.snapshot(user["id"])
+        if not workouts.delete(user["id"], workout_id):
             raise HTTPException(404, "workout not found")
         return {"status": "ok"}
 
@@ -639,7 +589,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         """The user's synced activities in an inclusive date range.
 
         Lightweight read for the Training Plan tab's weekly progress (actual
-        mileage vs the wave target). Returns activity_id, start_date,
+        mileage vs the week target). Returns activity_id, start_date,
         activity_type, distance_km and duration_hours.
         """
         from datetime import date as _date
@@ -674,37 +624,39 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     # -- long-term anchor -----------------------------------------------------
 
     def _goal_dump(
-        store: TrainingGoalStore, user_id: int, gid: int,
+        store: TrainingAnchorStore, user_id: int, gid: int,
         week_start: str | None = None,
     ) -> dict[str, Any]:
-        """One goal with its phases (+ waves), resolved phase and weekly target.
+        """One goal with its blocks (+ weeks), resolved block and weekly target.
 
-        Thin wrapper over ``TrainingGoalStore.resolve_goal`` (the single
+        Thin wrapper over ``TrainingAnchorStore.resolve_goal`` (the single
         composition shared with the agent tools), resolved for ``week_start``
-        (default today) so the plan tab never re-derives block/wave selection.
+        (default today) so the plan tab never re-derives block/week selection.
         """
         resolved = store.resolve_goal(user_id, gid, week_start)
         if resolved is None:
             raise HTTPException(404, "goal not found")
         return resolved
 
-    def _block_dump(store: TrainingGoalStore, user_id: int, block_id: int) -> dict[str, Any]:
-        """Nest one block with its waves (404 when it does not exist)."""
+    def _block_dump(store: TrainingAnchorStore, user_id: int, block_id: int) -> dict[str, Any]:
+        """Nest one block with its weeks (404 when it does not exist)."""
         row = store.get_block(user_id, block_id)
         if row is None:
             raise HTTPException(404, "block not found")
         row = dict(row)
-        row["waves"] = store.list_waves(user_id, block_id)
+        raw_weeks = store.list_weeks(user_id, block_id)
+        row["weeks"] = _resolve_block_weeks(row, raw_weeks)
+        row["week_count"] = _block_week_count(row)
         return row
 
-    @app.get("/training-goal")
-    def training_goal_get(
+    @app.get("/training/anchor")
+    def training_anchor_get(
         request: Request, user: dict = Depends(get_user),
         week_start: str | None = None,
     ) -> dict[str, Any]:
-        """The user's long-term anchors (goal + blocks + waves + current block).
+        """The user's long-term anchors (goal + blocks + weeks + current block).
 
-        ``week_start`` (YYYY-MM-DD, default today) selects the week whose wave
+        ``week_start`` (YYYY-MM-DD, default today) selects the week whose week
         target each goal reports as ``weekly_target``.
         """
         if week_start:
@@ -716,137 +668,121 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 raise HTTPException(
                     400, "week_start must be a YYYY-MM-DD date"
                 ) from exc
-        goal: TrainingGoalStore = request.app.state.goal
+        anchor: TrainingAnchorStore = request.app.state.anchor
         goals = [
-            _goal_dump(goal, user["id"], g["id"], week_start)
-            for g in goal.list_goals(user["id"])
+            _goal_dump(anchor, user["id"], g["id"], week_start)
+            for g in anchor.list_goals(user["id"])
         ]
         return {"goals": goals}
 
-    @app.post("/training-goal")
-    def training_goal_create(
-        body: TrainingGoal, request: Request, user: dict = Depends(get_user)
+    @app.post("/training/anchor")
+    def training_anchor_create(
+        body: TrainingAnchor, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
         """Create a new long-term goal (appends it; never wipes other goals)."""
-        goal: TrainingGoalStore = request.app.state.goal
+        anchor: TrainingAnchorStore = request.app.state.anchor
         try:
-            saved = goal.create_goal(user["id"], body.model_dump(exclude_none=True))
+            saved = anchor.create_goal(user["id"], body.model_dump(exclude_none=True))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return _goal_dump(goal, user["id"], saved["id"])
+        return _goal_dump(anchor, user["id"], saved["id"])
 
-    @app.post("/training-goal/undo")
-    def training_goal_undo(
-        request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        """Restore goals/blocks/waves from the last destructive-edit snapshot."""
-        goal: TrainingGoalStore = request.app.state.goal
-        try:
-            restored = goal.undo(user["id"])
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        return {"restored": restored}
-
-    @app.get("/training-goal/{goal_id}")
-    def training_goal_get_one(
+    @app.get("/training/anchor/{goal_id}")
+    def training_anchor_get_one(
         goal_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        goal: TrainingGoalStore = request.app.state.goal
-        if goal.get_goal(user["id"], goal_id) is None:
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        if anchor.get_goal(user["id"], goal_id) is None:
             raise HTTPException(404, "goal not found")
-        return _goal_dump(goal, user["id"], goal_id)
+        return _goal_dump(anchor, user["id"], goal_id)
 
-    @app.patch("/training-goal/{goal_id}")
-    def training_goal_update(
+    @app.patch("/training/anchor/{goal_id}")
+    def training_anchor_update(
         goal_id: int,
-        body: TrainingGoal,
+        body: TrainingAnchor,
         request: Request,
         user: dict = Depends(get_user),
     ) -> dict[str, Any]:
         """Partial update of one goal (only the fields sent change)."""
-        goal: TrainingGoalStore = request.app.state.goal
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        training: TrainingStore = request.app.state.training
         data = body.model_dump(exclude_unset=True)
-        if "replace_blocks" in data or "delete_blocks" in data:
-            # Destructive block edits are restorable via /training-goal/undo.
-            goal.snapshot(user["id"])
+        if "delete_blocks" in data:
+            # Destructive block edits are restorable via the season undo.
+            training.snapshot(user["id"])
         try:
-            saved = goal.update_goal(user["id"], goal_id, data)
+            saved = anchor.update_goal(user["id"], goal_id, data)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         if saved is None:
             raise HTTPException(404, "goal not found")
-        return _goal_dump(goal, user["id"], goal_id)
+        return _goal_dump(anchor, user["id"], goal_id)
 
-    @app.delete("/training-goal/{goal_id}")
-    def training_goal_delete(
+    @app.delete("/training/anchor/{goal_id}")
+    def training_anchor_delete(
         goal_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        goal: TrainingGoalStore = request.app.state.goal
-        goal.snapshot(user["id"])
-        if not goal.delete_goal(user["id"], goal_id):
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        training: TrainingStore = request.app.state.training
+        training.snapshot(user["id"])
+        if not anchor.delete_goal(user["id"], goal_id):
             raise HTTPException(404, "goal not found")
         return {"status": "ok"}
 
-    @app.get("/training-goal/block/{block_id}/waves")
-    def training_wave_list(
+    @app.get("/training/anchor/block/{block_id}/weeks")
+    def training_week_list(
         block_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        goal: TrainingGoalStore = request.app.state.goal
-        if goal.get_block(user["id"], block_id) is None:
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        if anchor.get_block(user["id"], block_id) is None:
             raise HTTPException(404, "block not found")
-        return {"waves": goal.list_waves(user["id"], block_id)}
+        return {"weeks": anchor.list_weeks(user["id"], block_id)}
 
-    @app.put("/training-goal/block/{block_id}/waves")
-    def training_wave_replace(
+    @app.put("/training/anchor/block/{block_id}/weeks")
+    def training_week_replace(
         block_id: int,
         body: TrainingBlock,
         request: Request,
         user: dict = Depends(get_user),
     ) -> dict[str, Any]:
-        """Replace a block's wave (microcycle) target list."""
-        goal: TrainingGoalStore = request.app.state.goal
-        waves = [w.model_dump(exclude_none=True) for w in (body.waves or [])]
+        """Replace a block's explicit week target list (one row per week)."""
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        training: TrainingStore = request.app.state.training
+        weeks = [w.model_dump(exclude_none=True) for w in (body.weeks or [])]
+        training.snapshot(user["id"])
         try:
-            result = goal.replace_waves(user["id"], block_id, waves)
+            result = anchor.replace_weeks(user["id"], block_id, weeks)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return {"waves": result}
+        return {"weeks": result}
 
-    @app.patch("/training-goal/block/{block_id}")
+    @app.patch("/training/anchor/block/{block_id}")
     def training_block_update(
         block_id: int,
         body: TrainingBlock,
         request: Request,
         user: dict = Depends(get_user),
     ) -> dict[str, Any]:
-        """Partial block update — adjust dates/notes/waves without rewriting the season."""
-        goal: TrainingGoalStore = request.app.state.goal
+        """Partial block update — adjust dates/weeks without rewriting the season."""
+        anchor: TrainingAnchorStore = request.app.state.anchor
         try:
-            row = goal.update_block(
+            row = anchor.update_block(
                 user["id"], block_id, body.model_dump(exclude_unset=True)
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         if row is None:
             raise HTTPException(404, "block not found")
-        return _block_dump(goal, user["id"], block_id)
+        return _block_dump(anchor, user["id"], block_id)
 
-    @app.put("/training-goal/block/{block_id}")
-    def training_block_replace(
-        block_id: int,
-        body: TrainingBlock,
-        request: Request,
-        user: dict = Depends(get_user),
-    ) -> dict[str, Any]:
-        """Full block update (all provided fields applied)."""
-        return training_block_update(block_id, body, request, user)
-
-    @app.delete("/training-goal/block/{block_id}")
+    @app.delete("/training/anchor/block/{block_id}")
     def training_block_delete(
         block_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        goal: TrainingGoalStore = request.app.state.goal
-        if not goal.delete_block(user["id"], block_id):
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        training: TrainingStore = request.app.state.training
+        training.snapshot(user["id"])
+        if not anchor.delete_block(user["id"], block_id):
             raise HTTPException(404, "block not found")
         return {"status": "ok"}
 
@@ -934,8 +870,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                     user_cfg,
                     db,
                     memory=memory,
-                    plan=TrainingPlan(request.app.state.plan, user["id"]),
-                    anchor=TrainingAnchor(request.app.state.goal, user["id"]),
+                    principles=PgPrinciples(state, user["id"]),
+                    training=TrainingSeason(request.app.state.training, user["id"]),
                     chart_cache=chart_cache,
                 )
                 if body.history:
@@ -949,10 +885,15 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 def _trace_writer(record: dict) -> None:
                     state.append_trace(user["id"], record)
 
-                _record_turn(user_cfg, body.question, result, trace_writer=_trace_writer)
-                answer = str(result.output)
+                _record_turn(
+                    user_cfg,
+                    body.question,
+                    result,
+                    trace_writer=_trace_writer,
+                )
+                answer = _final_answer(result)
                 text, specs = _extract_charts(answer)
-                text = _replace_plan_dumps(text)
+                text = _replace_workout_dumps(text)
                 figures = [chart_cache.get(s.get("sql", "").strip()) for s in specs]
                 messages = _prune_session_messages(result.all_messages())
                 state.set_session_messages(user["id"], messages)
@@ -985,8 +926,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                         user_cfg,
                         db,
                         memory=memory,
-                        plan=TrainingPlan(request.app.state.plan, user["id"]),
-                        anchor=TrainingAnchor(request.app.state.goal, user["id"]),
+                        principles=PgPrinciples(state, user["id"]),
+                        training=TrainingSeason(request.app.state.training, user["id"]),
                         chart_cache=chart_cache,
                         on_status=on_status,
                     )
@@ -1003,17 +944,27 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                     # that preamble returned as the whole answer. ``agent.iter``
                     # streams the same text but always runs the graph to
                     # completion, so the real final output is captured.
+                    #
+                    # Text emitted in a response that *also* carries a tool call
+                    # is pre-tool narration, not the answer — only the response
+                    # with no tool calls is the final output. Buffer each model
+                    # response's text and forward it only once that response is
+                    # known to be tool-call-free, so the live bubble shows the
+                    # answer (plus the tool ``status`` updates) rather than the
+                    # model's running commentary.
                     from pydantic_ai.messages import (
                         PartDeltaEvent,
                         PartStartEvent,
                         TextPart,
                         TextPartDelta,
+                        ToolCallPart,
                     )
 
                     async with agent.iter(body.question, message_history=history) as agent_run:
                         async for node in agent_run:
                             if not agent.is_model_request_node(node):
                                 continue
+                            buffered: list[str] = []
                             async with node.stream(agent_run.ctx) as stream:
                                 async for event in stream:
                                     if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
@@ -1023,12 +974,17 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                                     else:
                                         continue
                                     if delta:
-                                        await queue.put(("delta", {"text": delta}))
+                                        buffered.append(delta)
+                                has_tool_calls = any(
+                                    isinstance(part, ToolCallPart) for part in stream.response.parts
+                                )
+                            if buffered and not has_tool_calls:
+                                await queue.put(("delta", {"text": "".join(buffered)}))
 
                         if agent_run.result is None:
                             raise RuntimeError("agent run finished without a result")
                         result = agent_run.result
-                        answer = str(result.output)
+                        answer = _final_answer(result)
 
                         def _trace_writer(record: dict) -> None:
                             state.append_trace(user["id"], record)
@@ -1041,7 +997,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                             answer=answer,
                         )
                         text, specs = _extract_charts(answer)
-                        text = _replace_plan_dumps(text)
+                        text = _replace_workout_dumps(text)
                         figures = [chart_cache.get(s.get("sql", "").strip()) for s in specs]
                         messages = _prune_session_messages(result.all_messages())
                         state.set_session_messages(user["id"], messages)
@@ -1097,7 +1053,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         for item in history:
             if item.get("role") in ("assistant", "bot"):
                 text, specs = _extract_charts(item["content"])
-                item["content"] = _replace_plan_dumps(text)
+                item["content"] = _replace_workout_dumps(text)
                 item["chart_specs"] = specs
                 item["chart_figures"] = [
                     cache.get(s.get("sql", "").strip()) for s in specs
@@ -1142,8 +1098,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 user_cfg,
                 db,
                 memory=PgMemory(state, user["id"]),
-                plan=TrainingPlan(request.app.state.plan, user["id"]),
-                anchor=TrainingAnchor(request.app.state.goal, user["id"]),
+                principles=PgPrinciples(state, user["id"]),
+                training=TrainingSeason(request.app.state.training, user["id"]),
             )
             compacted = _auto_compact(agent, messages, max_tokens=0)
             state.set_session_messages(user["id"], compacted)

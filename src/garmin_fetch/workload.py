@@ -13,7 +13,7 @@ Interpretation:
 - <0.8       Detraining / excessive taper
 - 1.3-1.5    Elevated (the gap between the published bands)
 
-Like readiness, ACWR is fully derived: it is recomputed from
+ACWR is fully derived: it is recomputed from
 ``activity_summaries`` and stored once per sync in ``derived_metrics``
 (metric='acwr' plus acwr_acute_load / acwr_chronic_load / acwr_daily_load),
 so the UI and the AI agent read the same stored values. Rest days (dates with

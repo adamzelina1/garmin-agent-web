@@ -34,11 +34,6 @@ def _load_key(enc_key: str | None) -> bytes:
     return key
 
 
-def generate_key() -> str:
-    """Return a fresh base64 32-byte key for GARMIN_ENC_KEY."""
-    return base64.b64encode(os.urandom(32)).decode()
-
-
 class Encryptor:
     """AES-256-GCM encrypt/decrypt helper for one key."""
 
