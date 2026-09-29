@@ -761,17 +761,20 @@ def _block_week_count(block: dict[str, Any]) -> int | None:
 
 
 def _covering_block(
-    day: date, blocks: list[dict[str, Any]]
+    blocks: list[dict[str, Any]], start: date, end: date | None = None
 ) -> dict[str, Any] | None:
-    """The shortest *dated* block covering ``day``, or None.
+    """The shortest *dated* block overlapping ``start``..``end`` (default: that
+    one day), or None.
 
-    When several blocks overlap the day the most specific (shortest) phase
-    wins. Undated blocks never cover a day.
+    When several blocks overlap, the most specific (shortest) phase wins.
+    Undated blocks never cover anything.
     """
+    lo = start.isoformat()
+    hi = (end or start).isoformat()
     covering = [
         b for b in blocks
         if b.get("start_date") and b.get("end_date")
-        and b["start_date"] <= day.isoformat() <= b["end_date"]
+        and b["start_date"] <= hi and b["end_date"] >= lo
     ]
     if not covering:
         return None
@@ -783,73 +786,62 @@ def _covering_block(
     )
 
 
-def _covering_block_for_week(
-    monday: date, blocks: list[dict[str, Any]]
+def _effective_week(
+    block: dict[str, Any], monday: str | None, stored: dict[str, Any] | None
 ) -> dict[str, Any] | None:
-    """The shortest dated block overlapping the calendar week [monday, monday + 6 days]."""
-    cur_start = monday.isoformat()
-    cur_end = (monday + timedelta(days=6)).isoformat()
-    covering = [
-        b for b in blocks
-        if b.get("start_date") and b.get("end_date")
-        and b["start_date"] <= cur_end and b["end_date"] >= cur_start
-    ]
-    if not covering:
+    """The target for one calendar week of a block.
+
+    The ONE place the block's ``target_weekly_km`` baseline applies. A stored
+    week row wins (a missing ``distance_km`` on it falls back to the baseline).
+    With no row, a dated block that spans ``monday`` and has a baseline yields a
+    synthetic week; otherwise None.
+    """
+    baseline = block.get("target_weekly_km")
+    if stored is not None:
+        week = dict(stored)
+        if week.get("distance_km") is None and baseline is not None:
+            week["distance_km"] = baseline
+        if week.get("is_deload") is None:
+            week["is_deload"] = False
+        return week
+    if baseline is None or not monday:
         return None
-    return min(
-        covering,
-        key=lambda b: (
-            date.fromisoformat(b["end_date"]) - date.fromisoformat(b["start_date"])
-        ).days,
-    )
+    if not (block.get("start_date") and block.get("end_date")):
+        return None
+    first = _first_monday(date.fromisoformat(block["start_date"])).isoformat()
+    last = _first_monday(date.fromisoformat(block["end_date"])).isoformat()
+    if first <= monday <= last:
+        return {
+            "week_start": monday,
+            "distance_km": baseline,
+            "duration_min": None,
+            "is_deload": False,
+        }
+    return None
 
 
 def _resolve_block_weeks(
     block: dict[str, Any], raw_weeks: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Synthesize full calendar-week targets for a block with fallback to target_weekly_km."""
+    """Every calendar-week target of a block: stored row or baseline for each
+    week of a dated block's span, plus any stored week outside that span."""
+    by_start = {w["week_start"]: w for w in raw_weeks if w.get("week_start")}
+    resolved: list[dict[str, Any]] = []
     count = _block_week_count(block)
-    raw_by_start = {
-        w["week_start"]: w for w in raw_weeks if w.get("week_start")
-    }
-    if count is not None and block.get("start_date"):
+    if count is not None:
         base = _first_monday(date.fromisoformat(block["start_date"]))
-        used_starts = set()
-        resolved_weeks = []
-        for wi in range(count):
-            ws = (base + timedelta(days=7 * wi)).isoformat()
-            used_starts.add(ws)
-            w = raw_by_start.get(ws)
-            if w is not None:
-                w_copy = dict(w)
-                if w_copy.get("distance_km") is None and block.get("target_weekly_km") is not None:
-                    w_copy["distance_km"] = block.get("target_weekly_km")
-                if w_copy.get("is_deload") is None:
-                    w_copy["is_deload"] = False
-                resolved_weeks.append(w_copy)
-            else:
-                resolved_weeks.append({
-                    "week_start": ws,
-                    "distance_km": block.get("target_weekly_km"),
-                    "duration_min": None,
-                    "is_deload": False,
-                })
-        for w in raw_weeks:
-            if w.get("week_start") not in used_starts:
-                w_copy = dict(w)
-                if w_copy.get("distance_km") is None and block.get("target_weekly_km") is not None:
-                    w_copy["distance_km"] = block.get("target_weekly_km")
-                resolved_weeks.append(w_copy)
-        return resolved_weeks
-    else:
-        resolved_weeks = []
-        for w in raw_weeks:
-            w_copy = dict(w)
-            if w_copy.get("distance_km") is None and block.get("target_weekly_km") is not None:
-                w_copy["distance_km"] = block.get("target_weekly_km")
-            resolved_weeks.append(w_copy)
-        return resolved_weeks
-
+        for i in range(count):
+            ws = (base + timedelta(days=7 * i)).isoformat()
+            resolved.append(
+                _effective_week(block, ws, by_start.get(ws))
+                or {"week_start": ws, "distance_km": None,
+                    "duration_min": None, "is_deload": False}
+            )
+    in_span = {w["week_start"] for w in resolved}
+    for w in raw_weeks:
+        if w.get("week_start") not in in_span:
+            resolved.append(_effective_week(block, w.get("week_start"), w))
+    return resolved
 
 
 def _coverage_entry(
@@ -1006,82 +998,41 @@ class TrainingWorkoutStore:
                 fields.get("duration_min"), fields.get("distance_km"),
                 fields.get("intensity"), fields.get("target_pace_min_km"),
                 fields.get("target_hr_zone"), fields.get("target_power_w"),
-                fields.get("steps"), fields.get("status"),
+                fields.get("steps"), fields.get("status") or "planned",
                 fields.get("goal_id"), now, now,
             ),
         ).fetchone()
         return _workout_row(row)
 
     def update(
-        self,
-        user_id: int,
-        workout_id: int,
-        data: dict[str, Any],
-        *,
-        partial: bool = False,
+        self, user_id: int, workout_id: int, data: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Update a workout; ``partial`` changes only the supplied fields.
-
-        The default (full) mode rewrites every editable column, so a caller
-        must send the complete desired state. ``partial=True`` is the PATCH
-        path used by the UI's edit modal and the agent's ``training`` tool
-        upsert, so changing one field never clears the others.
-        """
+        """PATCH a workout: only the supplied fields change (the UI's edit
+        modal and drag-and-drop, and the agent's upsert), so changing one field
+        never clears the others. None when the id is unknown."""
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
-            return self._update(conn, user_id, workout_id, data, partial=partial)
+            return self._update(conn, user_id, workout_id, data)
 
     def _update(
-        self,
-        conn: Any,
-        user_id: int,
-        workout_id: int,
-        data: dict[str, Any],
-        *,
-        partial: bool = False,
+        self, conn: Any, user_id: int, workout_id: int, data: dict[str, Any],
     ) -> dict[str, Any] | None:
-        fields = _normalize_workout(data, partial=partial)
-        current = conn.execute(
-            "SELECT * FROM training_workout WHERE user_id = %s AND id = %s",
-            (user_id, workout_id),
-        ).fetchone()
-        if current is None:
-            return None
-        now = datetime.now(timezone.utc).isoformat()
-        if partial:
-            if not fields:
-                return _workout_row(current)
-            assigns, params = _build_set(fields, now)
+        fields = _normalize_workout(data, partial=True)
+        if not fields:
+            row = conn.execute(
+                "SELECT * FROM training_workout WHERE user_id = %s AND id = %s",
+                (user_id, workout_id),
+            ).fetchone()
+        else:
+            assigns, params = _build_set(
+                fields, datetime.now(timezone.utc).isoformat()
+            )
             row = conn.execute(
                 f"UPDATE training_workout SET {assigns} "
                 "WHERE user_id = %s AND id = %s RETURNING *",
                 (*params, user_id, workout_id),
             ).fetchone()
-        else:
-            row = conn.execute(
-                "UPDATE training_workout SET planned_date = %s, activity_type = %s, "
-                "title = %s, description = %s, duration_min = %s, distance_km = %s, "
-                "intensity = %s, target_pace_min_km = %s, target_hr_zone = %s, "
-                "target_power_w = %s, steps = %s, status = %s, "
-                "goal_id = %s, updated_at = %s "
-                "WHERE user_id = %s AND id = %s RETURNING *",
-                (
-                    fields["planned_date"], fields["activity_type"],
-                    fields.get("title"), fields.get("description"),
-                    fields.get("duration_min"), fields.get("distance_km"),
-                    fields.get("intensity"), fields.get("target_pace_min_km"),
-                    fields.get("target_hr_zone"), fields.get("target_power_w"),
-                    fields.get("steps"), fields.get("status"),
-                    fields.get("goal_id"), now,
-                    user_id, workout_id,
-                ),
-            ).fetchone()
         return _workout_row(row) if row else None
-
-    def delete(self, user_id: int, workout_id: int) -> bool:
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return self._delete(conn, user_id, workout_id)
 
     def _delete(self, conn: Any, user_id: int, workout_id: int) -> bool:
         cur = conn.execute(
@@ -1132,7 +1083,7 @@ class TrainingWorkoutStore:
                 wid = _opt_int(wid, "workout id")
                 if wid is None:
                     raise ValueError("workout id must be an integer")
-                if self._update(conn, user_id, wid, workout, partial=True) is None:
+                if self._update(conn, user_id, wid, workout) is None:
                     raise ValueError(f"workout id {wid} not found")
                 updated += 1
                 updated_ids.append(wid)
@@ -1373,6 +1324,53 @@ def _workout_matches_sport(sport: str | None, activity_type: str | None) -> bool
     return allowed is not None and activity_type in allowed
 
 
+def workout_in_goal(
+    goal: dict[str, Any], blocks: list[dict[str, Any]], workout: dict[str, Any]
+) -> bool:
+    """The ONE rule for "does this planned workout belong to this goal".
+
+    An explicit ``goal_id`` decides. Otherwise the workout's type must fit the
+    goal's sport and its ``planned_date`` must fall inside one of the goal's
+    dated blocks or, failing that, the goal's own start..target window (open
+    bounds match). The store's coverage numbers and the agent's ``planned``
+    lists both go through this, so they cannot disagree.
+    """
+    gid = workout.get("goal_id")
+    if gid is not None:
+        return int(gid) == int(goal["id"])
+    if not _workout_matches_sport(goal.get("sport"), workout.get("activity_type")):
+        return False
+    day = workout.get("planned_date")
+    if not day:
+        return False
+    if any(
+        b.get("start_date") and b.get("end_date")
+        and b["start_date"] <= day <= b["end_date"]
+        for b in blocks
+    ):
+        return True
+    start, target = goal.get("start_date"), goal.get("target_date")
+    return (not start or start <= day) and (not target or day <= target)
+
+
+def goal_workouts(
+    goal: dict[str, Any], blocks: list[dict[str, Any]],
+    workouts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The workouts that belong to ``goal`` (see :func:`workout_in_goal`)."""
+    return [w for w in workouts if workout_in_goal(goal, blocks, w)]
+
+
+def goal_activities(
+    goal: dict[str, Any], activities: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The synced activities that count toward ``goal``'s sport."""
+    return [
+        a for a in activities
+        if _goal_matches(goal.get("sport"), a.get("activity_type"))
+    ]
+
+
 def _closest_activity(
     candidates: list[dict[str, Any]], workout: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -1486,24 +1484,16 @@ class TrainingAnchorStore:
         self._insert_blocks(conn, user_id, goal_row["id"], blocks, now)
         return _goal_row(goal_row)
 
-    def update_goal(
-        self, user_id: int, goal_id: int, data: dict[str, Any]
+    def _update_goal(
+        self, conn: Any, user_id: int, goal_id: int, data: dict[str, Any],
     ) -> dict[str, Any] | None:
         """Partial update of one goal (never touches other goals).
 
         Only the fields present in ``data`` change. Block handling:
         ``blocks`` upserts (an entry with an ``id`` patches that block, one
         without creates a block) and ``delete_blocks`` removes specific blocks
-        **of this goal**.
+        **of this goal**. Reached only through :meth:`TrainingStore.apply`.
         """
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return self._update_goal(conn, user_id, goal_id, data)
-
-    def _update_goal(
-        self, conn: Any, user_id: int, goal_id: int, data: dict[str, Any],
-        *, merge_weeks: bool = False,
-    ) -> dict[str, Any] | None:
         fields = _normalize_goal(data, partial=True)
         has_children = any(
             key in data for key in ("blocks", "delete_blocks")
@@ -1525,10 +1515,7 @@ class TrainingAnchorStore:
                 (*params, user_id, goal_id),
             ).fetchone()
         if "blocks" in data:
-            self._upsert_blocks(
-                conn, user_id, goal_id, data["blocks"], now,
-                merge_weeks=merge_weeks,
-            )
+            self._upsert_blocks(conn, user_id, goal_id, data["blocks"], now)
         for block_id in data.get("delete_blocks") or []:
             block_id = _opt_int(block_id, "delete_blocks")
             if block_id is None:
@@ -1545,11 +1532,6 @@ class TrainingAnchorStore:
             (user_id, goal_id),
         ).fetchone()
         return _goal_row(row) if row else None
-
-    def delete_goal(self, user_id: int, goal_id: int) -> bool:
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return self._delete_goal(conn, user_id, goal_id)
 
     def _delete_goal(self, conn: Any, user_id: int, goal_id: int) -> bool:
         """Delete a goal + its blocks/weeks, detaching any planned workouts.
@@ -1622,7 +1604,7 @@ class TrainingAnchorStore:
             gid = _opt_int(goal_id, "goal_id")
             if gid is None:
                 raise ValueError("goal_id must be an integer")
-            row = self._update_goal(conn, user_id, gid, spec, merge_weeks=True)
+            row = self._update_goal(conn, user_id, gid, spec)
             if row is None:
                 raise ValueError(f"goal {gid} not found")
             target_goal_id = gid
@@ -1636,7 +1618,7 @@ class TrainingAnchorStore:
             existing = self._list_goals(conn, user_id)
             if len(existing) == 1:
                 gid = existing[0]["id"]
-                row = self._update_goal(conn, user_id, gid, spec, merge_weeks=True)
+                row = self._update_goal(conn, user_id, gid, spec)
                 if row is None:
                     raise ValueError(f"goal {gid} not found")
                 target_goal_id = gid
@@ -1680,16 +1662,6 @@ class TrainingAnchorStore:
             ).fetchall()
         return [dict(b) for b in blocks], [dict(w) for w in weeks]
 
-    def week_number(self, user_id: int, block_id: int, day: str | None = None) -> int | None:
-        """1-based calendar week (Mon..Sun) of ``day`` within a dated block."""
-        block = self.get_block(user_id, block_id)
-        if block is None or not block["start_date"]:
-            return None
-        day = day or date.today().isoformat()
-        return _block_week_number(
-            date.fromisoformat(block["start_date"]), date.fromisoformat(day)
-        )
-
     def resolve_goal(
         self, user_id: int, goal_id: int, day: str | None = None
     ) -> dict[str, Any] | None:
@@ -1698,8 +1670,8 @@ class TrainingAnchorStore:
         The single composition of the goal/block/week resolution used by the REST
         API, the agent tools and (indirectly) the plan tab, so those views can
         never disagree. Every block carries its ``week_count`` (from its dates)
-        and the resolved ``week_number`` is the position of ``day`` within the
-        current block. Returns None when the goal does not exist.
+        and ``week_number`` is the position of ``day``'s week within its block.
+        Returns None when the goal does not exist.
         """
         goal = self.get_goal(user_id, goal_id)
         if goal is None:
@@ -1707,23 +1679,18 @@ class TrainingAnchorStore:
         day = day or date.today().isoformat()
         blocks, weeks_by_block = self.list_blocks_with_weeks(user_id, goal_id)
         for block in blocks:
-            raw_weeks = weeks_by_block.get(block["id"], [])
-            block["weeks"] = _resolve_block_weeks(block, raw_weeks)
+            block["weeks"] = _resolve_block_weeks(
+                block, weeks_by_block.get(block["id"], [])
+            )
             block["week_count"] = _block_week_count(block)
-        current = self.current_block(user_id, day, goal_id, blocks=blocks)
-        week_number = (
-            self.week_number(user_id, current["id"], day) if current else None
-        )
-        target = self.weekly_target(
-            user_id, day, goal_id, blocks=blocks, weeks_by_block=weeks_by_block,
-        )
+        target = self._weekly_target(user_id, day, goal, blocks, weeks_by_block)
         return {
             "goal": goal,
             "blocks": blocks,
-            "current_block": current,
-            "week_number": week_number,
-            # ``{"block": <row>, "week": <row>}`` (the API/plan-tab shape); the
-            # agent tools slim it down.
+            "current_block": _covering_block(blocks, date.fromisoformat(day)),
+            "week_number": target["week_number"] if target else None,
+            # ``{"block", "week", "coverage", "week_number", "week_count"}``
+            # (the API/plan-tab shape); the agent tools slim it down.
             "weekly_target": target,
         }
 
@@ -1772,15 +1739,6 @@ class TrainingAnchorStore:
                 weeks.setdefault(row["block_id"], []).append(_week_row(row))
         return blocks, weeks
 
-    def get_block(self, user_id: int, block_id: int) -> dict[str, Any] | None:
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            row = conn.execute(
-                "SELECT * FROM training_block WHERE user_id = %s AND id = %s",
-                (user_id, block_id),
-            ).fetchone()
-        return _block_row(row) if row else None
-
     def _create_block(
         self, conn: Any, user_id: int, goal_id: int, data: dict[str, Any],
         now: str,
@@ -1803,23 +1761,17 @@ class TrainingAnchorStore:
                 fields.get("target_weekly_km"), now, now,
             ),
         ).fetchone()
-        self._replace_weeks(conn, user_id, row["id"], weeks, now)
+        if weeks:
+            self._merge_weeks(conn, user_id, row["id"], weeks, now)
         return _block_row(row)
-
-    def update_block(
-        self, user_id: int, block_id: int, data: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """Partial update of one block; ``weeks`` (if present) replaces the
-        block's complete week list (``[]`` clears it). Other blocks stay
-        untouched."""
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return self._update_block(conn, user_id, block_id, data)
 
     def _update_block(
         self, conn: Any, user_id: int, block_id: int, data: dict[str, Any],
-        *, goal_id: int | None = None, merge_weeks: bool = False,
+        *, goal_id: int | None = None,
     ) -> dict[str, Any] | None:
+        """Partial block update; ``weeks`` (if present) patches by ``week_start``
+        (see :meth:`_merge_weeks`). Weeks are keyed by absolute Monday, so a
+        date change never needs to re-date them."""
         fields = _normalize_block(data, partial=True)
         fields.pop("goal_id", None)
         now = datetime.now(timezone.utc).isoformat()
@@ -1835,7 +1787,6 @@ class TrainingAnchorStore:
             fields.get("start_date", row["start_date"]),
             fields.get("end_date", row["end_date"]),
         )
-        old_start = row["start_date"]
         if fields:
             assigns, params = _build_set(fields, now)
             row = conn.execute(
@@ -1844,203 +1795,114 @@ class TrainingAnchorStore:
                 (*params, user_id, block_id),
             ).fetchone()
         if "weeks" in data:
-            weeks = data["weeks"]
-            if not isinstance(weeks, list):
-                raise ValueError("block['weeks'] must be a list")
-            if merge_weeks:
-                self._merge_weeks(conn, user_id, block_id, weeks, now)
-            else:
-                self._replace_weeks(conn, user_id, block_id, weeks, now)
-        elif "start_date" in data or "end_date" in data:
-            # Weeks carry an absolute ``week_start`` anchored to the block, so a
-            # date change must re-date them (not just re-run the arithmetic later).
-            self._reanchor_weeks(conn, user_id, block_id, now, old_start)
+            self._merge_weeks(conn, user_id, block_id, data["weeks"], now)
         return _block_row(row)
-
-    def delete_block(self, user_id: int, block_id: int) -> bool:
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return self._delete_block(conn, user_id, block_id)
-
-    # -- weeks -----------------------------------------------------------------
-
-    def list_weeks(self, user_id: int, block_id: int) -> list[dict[str, Any]]:
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            rows = conn.execute(
-                "SELECT * FROM training_week WHERE user_id = %s AND block_id = %s "
-                "ORDER BY week_start",
-                (user_id, block_id),
-            ).fetchall()
-        return [_week_row(r) for r in rows]
-
-    def replace_weeks(
-        self, user_id: int, block_id: int, weeks: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Wipe a block's weeks and write the supplied list (validated)."""
-        if not isinstance(weeks, list):
-            raise ValueError("weeks must be a list")
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            now = datetime.now(timezone.utc).isoformat()
-            self._replace_weeks(conn, user_id, block_id, weeks, now)
-        return self.list_weeks(user_id, block_id)
 
     # -- resolution ------------------------------------------------------------
 
-    def current_block(
-        self, user_id: int, day: str | None = None, goal_id: int | None = None,
-        blocks: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any] | None:
-        """Best-effort resolver: the block whose date range covers ``day``.
+    def _weekly_volumes(
+        self, user_id: int, goal: dict[str, Any], blocks: list[dict[str, Any]],
+        start: date, end: date,
+    ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+        """Planned and actual km/min per Mon..Sun week (keyed by Monday) for one goal.
 
-        Returns None when no block has dates (undated anchors) or nothing covers
-        the day — the caller surfaces that so the agent can assign dates or treat
-        the phase as undated. When several blocks overlap, the *shortest* wins
-        (the most specific phase). Pass ``blocks`` to reuse an existing fetch.
+        Two queries for the whole window, never one per week. Planned counts the
+        workouts attributed to the goal (:func:`workout_in_goal`); actual counts
+        the synced activities of the goal's sport (:func:`goal_activities`).
         """
-        if blocks is None:
-            blocks = self.list_blocks(user_id, goal_id)
-        day = day or date.today().isoformat()
-        return _covering_block(date.fromisoformat(day), blocks)
-
-    def weekly_target(
-        self, user_id: int, day: str | None = None, goal_id: int | None = None,
-        blocks: list[dict[str, Any]] | None = None,
-        weeks_by_block: dict[int, list[dict[str, Any]]] | None = None,
-    ) -> dict[str, Any] | None:
-        """Resolve the week target for the block that covers ``day``.
-
-        A block's ``weeks`` are one row per calendar week (Mon..Sun), keyed by
-        its absolute ``week_start``. They do not repeat, so a week with no
-        stored row resolves to ``week`` = None. ``coverage`` compares the
-        planned workouts and the synced activities for the goal against the
-        week's target, and ``week_number``/``week_count`` report the position in
-        the block so callers never re-derive it. Returns
-        ``{"block", "week", "coverage", "week_number", "week_count"}`` or None.
-        """
-        day = day or date.today().isoformat()
-        target_monday_dt = _first_monday(date.fromisoformat(day))
-        target_monday = target_monday_dt.isoformat()
-        block = self.current_block(user_id, day, goal_id, blocks=blocks)
-        if block is None:
-            all_blocks = blocks if blocks is not None else self.list_blocks(user_id, goal_id)
-            block = _covering_block_for_week(target_monday_dt, all_blocks)
-            if block is None:
-                return None
-        if weeks_by_block is not None:
-            weeks = weeks_by_block.get(block["id"], [])
-        else:
-            weeks = self.list_weeks(user_id, block["id"])
-        week = None
-        if weeks:
-            found = next(
-                (w for w in weeks if w.get("week_start") == target_monday), None
-            )
-            if found is not None:
-                week = dict(found)
-        if week is None:
-            if block.get("target_weekly_km") is not None and block.get("start_date") and block.get("end_date"):
-                b_start = _first_monday(date.fromisoformat(block["start_date"])).isoformat()
-                b_end = _first_monday(date.fromisoformat(block["end_date"])).isoformat()
-                if b_start <= target_monday <= b_end:
-                    week = {
-                        "week_start": target_monday,
-                        "distance_km": block.get("target_weekly_km"),
-                        "duration_min": None,
-                        "is_deload": False,
-                    }
-        else:
-            if week.get("distance_km") is None and block.get("target_weekly_km") is not None:
-                week["distance_km"] = block.get("target_weekly_km")
-        coverage = (
-            self._week_coverage(user_id, goal_id, block, week)
-            if week is not None else None
-        )
-        return {
-            "block": block,
-            "week": week,
-            "coverage": coverage,
-            "week_number": (
-                _block_week_number(
-                    date.fromisoformat(block["start_date"]),
-                    date.fromisoformat(day),
-                )
-                if block.get("start_date") else None
-            ),
-            "week_count": _block_week_count(block),
-        }
-
-    def _week_coverage(
-        self, user_id: int, goal_id: int | None, block: dict[str, Any],
-        week: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Planned + actual volume for ``week`` vs its target (km or min).
-
-        Resolves the week's Mon..Sun range from its absolute ``week_start``,
-        sums the planned workouts for the goal over that range and the synced
-        activities matching the goal's sport, and reports the delta so the plan
-        and the anchor can be reconciled instead of eyeballed.
-        """
-        ws = week.get("week_start")
-        if not ws:
-            return None
-        we = (date.fromisoformat(ws) + timedelta(days=6)).isoformat()
+        lo, hi = start.isoformat(), end.isoformat()
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
-            sport = None
-            if goal_id is not None:
-                row = conn.execute(
-                    "SELECT sport FROM training_goal WHERE user_id = %s AND id = %s",
-                    (user_id, goal_id),
-                ).fetchone()
-                sport = row["sport"] if row else None
-            rows = conn.execute(
-                "SELECT planned_date, activity_type, distance_km, duration_min, goal_id "
-                "FROM training_workout WHERE user_id = %s "
+            workouts = conn.execute(
+                "SELECT planned_date, activity_type, distance_km, duration_min, "
+                "goal_id FROM training_workout WHERE user_id = %s "
                 "AND planned_date >= %s AND planned_date <= %s",
-                (user_id, ws, we),
+                (user_id, lo, hi),
             ).fetchall()
-            actual_km, actual_min = self._activity_totals(
-                conn, user_id, goal_id, ws, we
-            )
-        planned_km = planned_min = 0.0
-        for r in rows:
-            if goal_id is not None and r["goal_id"] is not None and r["goal_id"] != goal_id:
-                continue
-            if not _workout_matches_sport(sport, r["activity_type"]):
-                continue
-            planned_km += float(r["distance_km"] or 0)
-            planned_min += float(r["duration_min"] or 0)
-        return _coverage_entry(
-            week, ws, we, planned_km, planned_min, actual_km, actual_min
-        )
+            acts = conn.execute(
+                "SELECT start_date, activity_type, distance_km, duration_hours "
+                "FROM activity_summaries WHERE user_id = %s "
+                "AND start_date >= %s AND start_date <= %s",
+                (user_id, lo, hi),
+            ).fetchall()
+        planned: dict[str, dict[str, float]] = {}
+        for w in goal_workouts(goal, blocks, workouts):
+            ws = _first_monday(date.fromisoformat(w["planned_date"])).isoformat()
+            bucket = planned.setdefault(ws, {"km": 0.0, "min": 0.0})
+            bucket["km"] += float(w["distance_km"] or 0)
+            bucket["min"] += float(w["duration_min"] or 0)
+        actual: dict[str, dict[str, float]] = {}
+        for a in goal_activities(goal, acts):
+            ws = _first_monday(date.fromisoformat(a["start_date"])).isoformat()
+            bucket = actual.setdefault(ws, {"km": 0.0, "min": 0.0})
+            bucket["km"] += float(a["distance_km"] or 0)
+            bucket["min"] += float(a["duration_hours"] or 0) * 60
+        return planned, actual
 
-    @staticmethod
-    def _activity_totals(
-        conn: Any, user_id: int, goal_id: int | None, ws: str, we: str
-    ) -> tuple[float, float]:
-        """Sum synced activity km/minutes for a goal's sport over one week."""
-        sport = None
-        if goal_id is not None:
-            row = conn.execute(
-                "SELECT sport FROM training_goal WHERE user_id = %s AND id = %s",
-                (user_id, goal_id),
-            ).fetchone()
-            sport = row["sport"] if row else None
-        acts = conn.execute(
-            "SELECT activity_type, distance_km, duration_hours "
-            "FROM activity_summaries WHERE user_id = %s "
-            "AND start_date >= %s AND start_date <= %s",
-            (user_id, ws, we),
-        ).fetchall()
-        km = mins = 0.0
-        for a in acts:
-            if not _goal_matches(sport, a["activity_type"]):
-                continue
-            km += float(a["distance_km"] or 0)
-            mins += float(a["duration_hours"] or 0) * 60
-        return km, mins
+    def _coverage_rows(
+        self, user_id: int, goal: dict[str, Any],
+        blocks: list[dict[str, Any]],
+        weeks_by_block: dict[int, list[dict[str, Any]]],
+        start: date, end: date,
+    ) -> list[dict[str, Any]]:
+        """One row per Mon..Sun week touched by ``start``..``end`` that a dated
+        block covers: ``{block, week, week_number, week_count, coverage}``.
+
+        The single week-resolution path: ``week`` is the block's effective
+        target (:func:`_effective_week`) and ``coverage`` compares the planned and
+        actual volume of that whole week against it. Both the plan tab's current
+        week and the agent's multi-week agenda are built from these rows.
+        """
+        if not blocks:
+            return []
+        cur = _first_monday(start)
+        planned, actual = self._weekly_volumes(
+            user_id, goal, blocks, cur, _first_monday(end) + timedelta(days=6)
+        )
+        zero = {"km": 0.0, "min": 0.0}
+        rows: list[dict[str, Any]] = []
+        while cur <= end:
+            ws = cur.isoformat()
+            we = (cur + timedelta(days=6)).isoformat()
+            block = _covering_block(blocks, cur, cur + timedelta(days=6))
+            if block is not None:
+                stored = next(
+                    (w for w in weeks_by_block.get(block["id"], [])
+                     if w.get("week_start") == ws),
+                    None,
+                )
+                week = _effective_week(block, ws, stored)
+                p, a = planned.get(ws, zero), actual.get(ws, zero)
+                rows.append({
+                    "block": block,
+                    "week": week,
+                    "week_number": _block_week_number(
+                        date.fromisoformat(block["start_date"]), cur
+                    ),
+                    "week_count": _block_week_count(block),
+                    "coverage": _coverage_entry(
+                        week or {}, ws, we, p["km"], p["min"], a["km"], a["min"]
+                    ),
+                })
+            cur += timedelta(days=7)
+        return rows
+
+    def _weekly_target(
+        self, user_id: int, day: str, goal: dict[str, Any],
+        blocks: list[dict[str, Any]],
+        weeks_by_block: dict[int, list[dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        """The target row for the calendar week containing ``day`` (or None)."""
+        monday = _first_monday(date.fromisoformat(day))
+        rows = self._coverage_rows(
+            user_id, goal, blocks, weeks_by_block, monday, monday
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        if row["week"] is None:
+            row = {**row, "coverage": None}
+        return row
 
     def coverage_range(
         self,
@@ -2051,115 +1913,44 @@ class TrainingAnchorStore:
     ) -> list[dict[str, Any]]:
         """Per-goal, per-calendar-week target and coverage for a window.
 
-        Walks the Mon..Sun weeks touched by ``date_start``..``date_end`` and
-        emits one entry per (goal, week) that maps to a dated block's explicit
-        week row, carrying the week target and the goal-scoped
-        planned/actual-vs-target coverage. Batched: one blocks+weeks fetch and
-        one query each for planned and actual totals per goal (never a query
+        One entry per (goal, week) that maps to a dated block, carrying the week
+        target and the goal-scoped planned/actual-vs-target coverage. Batched:
+        one blocks+weeks fetch and two volume queries per goal (never a query
         per week), so a multi-week agenda stays cheap.
         """
-        start = _first_monday(date.fromisoformat(date_start))
+        start = date.fromisoformat(date_start)
         end = date.fromisoformat(date_end)
         goals = self.list_goals(user_id)
         if goal_id is not None:
             goals = [g for g in goals if g["id"] == int(goal_id)]
         out: list[dict[str, Any]] = []
         for goal in goals:
-            blocks, weeks_by_block = self.list_blocks_with_weeks(
-                user_id, goal["id"]
-            )
-            if not blocks:
-                continue
-            with self._pool.connection() as conn:
-                self._set_user(conn, user_id)
-                rows = conn.execute(
-                    "SELECT planned_date, activity_type, distance_km, duration_min, goal_id "
-                    "FROM training_workout WHERE user_id = %s "
-                    "AND planned_date >= %s AND planned_date <= %s",
-                    (user_id, start.isoformat(), end.isoformat()),
-                ).fetchall()
-                acts = conn.execute(
-                    "SELECT start_date, activity_type, distance_km, duration_hours "
-                    "FROM activity_summaries WHERE user_id = %s "
-                    "AND start_date >= %s AND start_date <= %s",
-                    (user_id, start.isoformat(), end.isoformat()),
-                ).fetchall()
-            planned: dict[str, dict[str, float]] = {}
-            sport = goal.get("sport")
-            for r in rows:
-                if r["goal_id"] is not None and r["goal_id"] != goal["id"]:
-                    continue
-                if not _workout_matches_sport(sport, r["activity_type"]):
-                    continue
-                ws = _first_monday(
-                    date.fromisoformat(r["planned_date"])
-                ).isoformat()
-                bucket = planned.setdefault(ws, {"km": 0.0, "min": 0.0})
-                bucket["km"] += float(r["distance_km"] or 0)
-                bucket["min"] += float(r["duration_min"] or 0)
-            actual: dict[str, dict[str, float]] = {}
-            for a in acts:
-                if not _goal_matches(goal.get("sport"), a["activity_type"]):
-                    continue
-                ws = _first_monday(date.fromisoformat(a["start_date"])).isoformat()
-                bucket = actual.setdefault(ws, {"km": 0.0, "min": 0.0})
-                bucket["km"] += float(a["distance_km"] or 0)
-                bucket["min"] += float(a["duration_hours"] or 0) * 60
-            cur = start
-            while cur <= end:
-                ws = cur.isoformat()
-                block = _covering_block_for_week(cur, blocks)
-                week = None
-                if block is not None:
-                    weeks = weeks_by_block.get(block["id"], [])
-                    found = next(
-                        (w for w in weeks if w.get("week_start") == ws), None
-                    )
-                    if found is not None:
-                        week = dict(found)
-                    if week is None:
-                        if block.get("target_weekly_km") is not None:
-                            week = {
-                                "week_start": ws,
-                                "distance_km": block.get("target_weekly_km"),
-                                "duration_min": None,
-                                "is_deload": False,
-                            }
-                    elif week.get("distance_km") is None and block.get("target_weekly_km") is not None:
-                        week["distance_km"] = block.get("target_weekly_km")
-                if block is not None:
-                    p = planned.get(ws, {"km": 0.0, "min": 0.0})
-                    a = actual.get(ws, {"km": 0.0, "min": 0.0})
-                    week_dict = week or {}
-                    out.append({
-                        "goal_id": goal["id"],
-                        "goal": goal["title"],
-                        "block_id": block["id"],
-                        "block": block["name"],
-                        "week_start": ws,
-                        "week_number": (
-                            _block_week_number(
-                                date.fromisoformat(block["start_date"]), cur
-                            )
-                            if block.get("start_date") else None
-                        ),
-                        "week_count": _block_week_count(block),
-                        "week_target": {
-                            "distance_km": week_dict.get("distance_km"),
-                            "duration_min": week_dict.get("duration_min"),
-                            "is_deload": week_dict.get("is_deload"),
-                        },
-                        "coverage": _coverage_entry(
-                            week_dict, ws,
-                            (cur + timedelta(days=6)).isoformat(),
-                            p["km"], p["min"], a["km"], a["min"],
-                        ),
-                    })
-                cur += timedelta(days=7)
+            blocks, weeks_by_block = self.list_blocks_with_weeks(user_id, goal["id"])
+            for row in self._coverage_rows(
+                user_id, goal, blocks, weeks_by_block, start, end
+            ):
+                week = row["week"] or {}
+                block = row["block"]
+                out.append({
+                    "goal_id": goal["id"],
+                    "goal": goal["title"],
+                    "block_id": block["id"],
+                    "block": block["name"],
+                    "week_start": row["coverage"]["week_start"],
+                    "week_number": row["week_number"],
+                    "week_count": row["week_count"],
+                    "week_target": {
+                        "distance_km": week.get("distance_km"),
+                        "duration_min": week.get("duration_min"),
+                        "is_deload": week.get("is_deload"),
+                    },
+                    "coverage": row["coverage"],
+                })
         return out
 
     def close(self) -> None:
-        self._pool.close()
+        if self._owns_pool:
+            self._pool.close()
 
     # -- private ---------------------------------------------------------------
 
@@ -2170,7 +1961,7 @@ class TrainingAnchorStore:
         """Write a goal's initial block set (create path only)."""
         if not isinstance(blocks, list):
             raise ValueError("goal['blocks'] must be a list")
-        for index, block in enumerate(blocks):
+        for block in blocks:
             if not isinstance(block, dict):
                 raise ValueError("each block must be a JSON object")
             self._create_block(conn, user_id, goal_id, block, now)
@@ -2178,14 +1969,11 @@ class TrainingAnchorStore:
     def _upsert_blocks(
         self, conn: Any, user_id: int, goal_id: int,
         blocks: list[dict[str, Any]], now: str,
-        *, merge_weeks: bool = False,
     ) -> None:
         """Add/patch blocks without touching the others.
 
         An entry with an ``id`` patches that block (partial); one without an
-        ``id`` creates a new block. ``merge_weeks`` selects patch-by-week
-        semantics for a patched block's ``weeks`` (the agent path) instead of
-        the default whole-vector replace (the UI path).
+        ``id`` creates a new block.
         """
         if not isinstance(blocks, list):
             raise ValueError("goal['blocks'] must be a list")
@@ -2200,79 +1988,9 @@ class TrainingAnchorStore:
             if block_id is None:
                 raise ValueError("block id must be an integer")
             if self._update_block(
-                conn, user_id, block_id, block, goal_id=goal_id,
-                merge_weeks=merge_weeks,
+                conn, user_id, block_id, block, goal_id=goal_id
             ) is None:
                 raise ValueError(f"block {block_id} not found in goal {goal_id}")
-
-    def _replace_weeks(
-        self, conn: Any, user_id: int, block_id: int,
-        weeks: list[dict[str, Any]], now: str,
-    ) -> None:
-        """Replace a block's week targets; accepts full or partial week lists.
-
-        Week targets can be keyed explicitly with ``week_start`` or given
-        positionally relative to the block start. Partial lists are accepted
-        without requiring blank ``{}`` padding for untargeted weeks. An empty
-        list clears all week targets. A block must be dated before week targets
-        can be set.
-        """
-        if not isinstance(weeks, list):
-            raise ValueError("block['weeks'] must be a list")
-        row = conn.execute(
-            "SELECT start_date, end_date FROM training_block "
-            "WHERE user_id = %s AND id = %s",
-            (user_id, block_id),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"block {block_id} not found")
-        if weeks and not row["start_date"]:
-            raise ValueError(
-                "a block needs a start_date before week targets can be set"
-            )
-        base = (
-            _first_monday(date.fromisoformat(row["start_date"]))
-            if row["start_date"] else None
-        )
-        normalized: list[dict[str, Any]] = []
-        for week in weeks:
-            if not isinstance(week, dict):
-                raise ValueError("each week must be a JSON object")
-            normalized.append(_normalize_week(week, partial=False))
-        conn.execute(
-            "DELETE FROM training_week WHERE user_id = %s AND block_id = %s",
-            (user_id, block_id),
-        )
-        seen_starts: set[str] = set()
-        for index, w in enumerate(normalized):
-            if w.get("week_start"):
-                ws = _first_monday(date.fromisoformat(w["week_start"])).isoformat()
-            elif base is not None:
-                ws = (base + timedelta(days=7 * index)).isoformat()
-            else:
-                ws = None
-            has_target = (
-                w.get("distance_km") is not None
-                or w.get("duration_min") is not None
-                or w.get("is_deload")
-            )
-            if not has_target and not w.get("week_start"):
-                continue
-            if ws in seen_starts:
-                continue
-            if ws is not None:
-                seen_starts.add(ws)
-            conn.execute(
-                "INSERT INTO training_week (user_id, block_id, week_start, "
-                "distance_km, duration_min, is_deload, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    user_id, block_id, ws,
-                    w.get("distance_km"), w.get("duration_min"),
-                    w.get("is_deload"),
-                    now, now,
-                ),
-            )
 
     def _merge_weeks(
         self, conn: Any, user_id: int, block_id: int,
@@ -2280,7 +1998,8 @@ class TrainingAnchorStore:
     ) -> None:
         """Patch a block's week targets keyed by ``week_start`` (agent path).
 
-        Unlike :meth:`_replace_weeks`, only the weeks actually sent are written:
+        The only week writer (UI, REST and agent all use it). Only the weeks
+        actually sent are written:
         every other stored week is left untouched, so correcting one week never
         wipes the rest of the block. A bare ``{week_start}`` entry clears that
         week; otherwise fields you send override and fields you omit keep their
@@ -2369,13 +2088,6 @@ class TrainingAnchorStore:
                     "WHERE user_id = %s AND block_id = %s AND week_start = %s",
                     (distance, duration, deload, now, user_id, block_id, ws),
                 )
-
-    def _reanchor_weeks(
-        self, conn: Any, user_id: int, block_id: int, now: str,
-        old_start: str | None,
-    ) -> None:
-        """Preserve week targets by their calendar week_start when block dates change."""
-        pass
 
     def _delete_block(
         self, conn: Any, user_id: int, block_id: int, *, goal_id: int | None = None,
@@ -2474,17 +2186,23 @@ class TrainingStore:
             )
         if anchor_spec is not None and not isinstance(anchor_spec, dict):
             raise ValueError("'anchor' must be an object")
+        # Destructive = removes rows or overwrites weeks of an existing block.
+        blocks = (anchor_spec or {}).get("blocks") or []
+        rewrites_weeks = any(
+            isinstance(b, dict) and b.get("id") is not None and "weeks" in b
+            for b in blocks
+        )
         destructive = bool(
             (anchor_spec and (
                 anchor_spec.get("delete_goal_ids")
                 or anchor_spec.get("delete_blocks")
+                or rewrites_weeks
             ))
             or (workouts_spec and workouts_spec.get("delete_ids"))
         )
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
-            if destructive:
-                self._snapshot(conn, user_id)
+            before = self._capture(conn, user_id) if destructive else None
             result: dict[str, Any] = {}
             if anchor_spec is not None:
                 result["anchor"] = self.anchor.apply_spec(
@@ -2494,17 +2212,24 @@ class TrainingStore:
                 result["workouts"] = self.workouts.apply(
                     user_id, workouts_spec, conn=conn
                 )
+            # Same transaction as the edit, and only when it really removed
+            # something — deleting an unknown id must not clobber the last
+            # good snapshot with a no-op one.
+            if before is not None and (
+                anchor_spec and (
+                    anchor_spec.get("delete_blocks") or rewrites_weeks
+                )
+                or result.get("anchor", {}).get("deleted_goals")
+                or result.get("workouts", {}).get("deleted")
+            ):
+                _write_snapshot(conn, user_id, before)
         return result
 
     # -- one season-wide snapshot / undo --------------------------------------
 
-    def snapshot(self, user_id: int) -> None:
-        """Capture the whole season (plan + anchor) as the one undo snapshot."""
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            self._snapshot(conn, user_id)
-
-    def _snapshot(self, conn: Any, user_id: int) -> None:
+    @staticmethod
+    def _capture(conn: Any, user_id: int) -> dict[str, Any]:
+        """The whole season (plan + anchor), as the undo snapshot payload."""
         plan = conn.execute(
             "SELECT * FROM training_workout WHERE user_id = %s ORDER BY id",
             (user_id,),
@@ -2523,12 +2248,12 @@ class TrainingStore:
             "ORDER BY block_id, week_start",
             (user_id,),
         ).fetchall()
-        _write_snapshot(conn, user_id, {
+        return {
             "workouts": [dict(r) for r in plan],
             "goals": [dict(r) for r in goals],
             "blocks": [dict(r) for r in blocks],
             "weeks": [dict(r) for r in weeks],
-        })
+        }
 
     def can_undo(self, user_id: int) -> bool:
         """True when a season snapshot exists (so ``undo`` would do something)."""

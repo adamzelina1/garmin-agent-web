@@ -3214,7 +3214,8 @@ async function saveGoal() {
         target_weekly_km: b.target_weekly_km == null || b.target_weekly_km === "" ? null : Number(b.target_weekly_km),
       };
       // Undated blocks cannot carry week targets, so only a dated block sends
-      // the vector (the editor keeps it sized to the block's span).
+      // its weeks. The server patches by week_start, so EVERY week is sent: one
+      // with no targets clears that week's stored row.
       if (b.start_date) {
         const base = mondayOf(parseISO(b.start_date));
         entry.weeks = (b.weeks || [])
@@ -3228,8 +3229,7 @@ async function saveGoal() {
               duration_min: w.duration_min == null || w.duration_min === "" ? null : Number(w.duration_min),
               is_deload: !!w.is_deload,
             };
-          })
-          .filter((w) => w.distance_km != null || w.duration_min != null || w.is_deload);
+          });
       }
       return entry;
     }),

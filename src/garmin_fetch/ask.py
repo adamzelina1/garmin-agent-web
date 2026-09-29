@@ -2542,37 +2542,15 @@ def build_agent(
                     ]
 
                 workouts = season.list_workouts(win_start, win_end)
-                target_goal = next(
-                    (g for g in goals if g["id"] == int(goal_id)), None
-                ) if goal_id is not None else None
-                if goal_id is not None:
-                    from .server.state import _goal_matches, _workout_matches_sport
-                    goal_blocks = season.blocks(int(goal_id)) if target_goal else []
+                # ``goals`` is already narrowed to the requested goal, so the
+                # same shared attribution rule the coverage numbers use applies.
+                target_goal = goals[0] if goal_id is not None else None
+                if target_goal is not None:
+                    from .server.state import goal_activities, goal_workouts
 
-                    def _workout_matches_target_goal(w: dict[str, Any]) -> bool:
-                        w_gid = w.get("goal_id")
-                        if w_gid is not None:
-                            return int(w_gid) == int(goal_id)
-                        if not target_goal:
-                            return False
-                        if not _workout_matches_sport(target_goal.get("sport"), w.get("activity_type")):
-                            return False
-                        p_date = w.get("planned_date")
-                        if not p_date:
-                            return False
-                        if any(
-                            b.get("start_date") and b.get("end_date")
-                            and b["start_date"] <= p_date <= b["end_date"]
-                            for b in goal_blocks
-                        ):
-                            return True
-                        start = target_goal.get("start_date")
-                        target = target_goal.get("target_date")
-                        if (not start or start <= p_date) and (not target or target >= p_date):
-                            return True
-                        return False
-
-                    workouts = [w for w in workouts if _workout_matches_target_goal(w)]
+                    workouts = goal_workouts(
+                        target_goal, season.blocks(target_goal["id"]), workouts
+                    )
                 total = len(workouts)
                 workouts = workouts[:_MAX_WORKOUTS]
                 if not detail:
@@ -2583,12 +2561,8 @@ def build_agent(
                                 desc[:_DESC_PREVIEW_CHARS].rstrip() + "…"
                             )
                 actual = season.activities(win_start, win_end)
-                if goal_id is not None and target_goal is not None:
-                    from .server.state import _goal_matches
-                    actual = [
-                        a for a in actual
-                        if _goal_matches(target_goal.get("sport"), a.get("activity_type"))
-                    ]
+                if target_goal is not None:
+                    actual = goal_activities(target_goal, actual)
                 targets = season.coverage_range(
                     win_start, win_end, goal_id
                 )

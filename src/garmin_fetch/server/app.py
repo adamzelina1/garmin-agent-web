@@ -65,8 +65,7 @@ from .auth import AuthError, AuthService, UserStore
 from .setup_db import ensure_roles
 from .state import (
     PgMemory, PgPrinciples, TrainingAnchorStore, TrainingWorkoutStore,
-    TrainingSeason, TrainingStore, UserState, _block_week_count,
-    _resolve_block_weeks,
+    TrainingSeason, TrainingStore, UserState,
 )
 from .sync_worker import SyncManager
 
@@ -177,9 +176,8 @@ class TrainingWorkoutPatch(BaseModel):
 class TrainingWeek(BaseModel):
     """One week target of a block.
 
-    The ``weeks`` list is the block's complete vector — entry 1 is the calendar
-    week containing the block start — so ``week_start`` is server-derived and
-    only meaningful when a week row is read back.
+    Weeks are patched by ``week_start`` (any date; snapped to its Monday): only
+    the weeks sent are written, and a week sent with no targets is cleared.
     """
 
     week_start: str | None = None
@@ -559,8 +557,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         workouts: TrainingWorkoutStore = request.app.state.workouts
         try:
             row = workouts.update(
-                user["id"], workout_id, body.model_dump(exclude_unset=True),
-                partial=True,
+                user["id"], workout_id, body.model_dump(exclude_unset=True)
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -572,10 +569,11 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     def training_workout_delete(
         workout_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        workouts: TrainingWorkoutStore = request.app.state.workouts
         training: TrainingStore = request.app.state.training
-        training.snapshot(user["id"])
-        if not workouts.delete(user["id"], workout_id):
+        result = training.apply(
+            user["id"], {"workouts": {"delete_ids": [workout_id]}}
+        )
+        if not result["workouts"]["deleted"]:
             raise HTTPException(404, "workout not found")
         return {"status": "ok"}
 
@@ -638,17 +636,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             raise HTTPException(404, "goal not found")
         return resolved
 
-    def _block_dump(store: TrainingAnchorStore, user_id: int, block_id: int) -> dict[str, Any]:
-        """Nest one block with its weeks (404 when it does not exist)."""
-        row = store.get_block(user_id, block_id)
-        if row is None:
-            raise HTTPException(404, "block not found")
-        row = dict(row)
-        raw_weeks = store.list_weeks(user_id, block_id)
-        row["weeks"] = _resolve_block_weeks(row, raw_weeks)
-        row["week_count"] = _block_week_count(row)
-        return row
-
     @app.get("/training/anchor")
     def training_anchor_get(
         request: Request, user: dict = Depends(get_user),
@@ -687,15 +674,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
         return _goal_dump(anchor, user["id"], saved["id"])
 
-    @app.get("/training/anchor/{goal_id}")
-    def training_anchor_get_one(
-        goal_id: int, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        if anchor.get_goal(user["id"], goal_id) is None:
-            raise HTTPException(404, "goal not found")
-        return _goal_dump(anchor, user["id"], goal_id)
-
     @app.patch("/training/anchor/{goal_id}")
     def training_anchor_update(
         goal_id: int,
@@ -703,87 +681,33 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         request: Request,
         user: dict = Depends(get_user),
     ) -> dict[str, Any]:
-        """Partial update of one goal (only the fields sent change)."""
+        """Partial update of one goal (only the fields sent change).
+
+        Goes through the same transactional ``TrainingStore.apply`` as the
+        agent, so a destructive edit (removed blocks, rewritten weeks) is
+        snapshotted for undo in the same transaction.
+        """
         anchor: TrainingAnchorStore = request.app.state.anchor
         training: TrainingStore = request.app.state.training
+        if anchor.get_goal(user["id"], goal_id) is None:
+            raise HTTPException(404, "goal not found")
         data = body.model_dump(exclude_unset=True)
-        if "delete_blocks" in data:
-            # Destructive block edits are restorable via the season undo.
-            training.snapshot(user["id"])
         try:
-            saved = anchor.update_goal(user["id"], goal_id, data)
+            training.apply(user["id"], {"anchor": {**data, "goal_id": goal_id}})
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        if saved is None:
-            raise HTTPException(404, "goal not found")
         return _goal_dump(anchor, user["id"], goal_id)
 
     @app.delete("/training/anchor/{goal_id}")
     def training_anchor_delete(
         goal_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        anchor: TrainingAnchorStore = request.app.state.anchor
         training: TrainingStore = request.app.state.training
-        training.snapshot(user["id"])
-        if not anchor.delete_goal(user["id"], goal_id):
+        result = training.apply(
+            user["id"], {"anchor": {"delete_goal_ids": [goal_id]}}
+        )
+        if not result["anchor"]["deleted_goals"]:
             raise HTTPException(404, "goal not found")
-        return {"status": "ok"}
-
-    @app.get("/training/anchor/block/{block_id}/weeks")
-    def training_week_list(
-        block_id: int, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        if anchor.get_block(user["id"], block_id) is None:
-            raise HTTPException(404, "block not found")
-        return {"weeks": anchor.list_weeks(user["id"], block_id)}
-
-    @app.put("/training/anchor/block/{block_id}/weeks")
-    def training_week_replace(
-        block_id: int,
-        body: TrainingBlock,
-        request: Request,
-        user: dict = Depends(get_user),
-    ) -> dict[str, Any]:
-        """Replace a block's explicit week target list (one row per week)."""
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        training: TrainingStore = request.app.state.training
-        weeks = [w.model_dump(exclude_none=True) for w in (body.weeks or [])]
-        training.snapshot(user["id"])
-        try:
-            result = anchor.replace_weeks(user["id"], block_id, weeks)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        return {"weeks": result}
-
-    @app.patch("/training/anchor/block/{block_id}")
-    def training_block_update(
-        block_id: int,
-        body: TrainingBlock,
-        request: Request,
-        user: dict = Depends(get_user),
-    ) -> dict[str, Any]:
-        """Partial block update — adjust dates/weeks without rewriting the season."""
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        try:
-            row = anchor.update_block(
-                user["id"], block_id, body.model_dump(exclude_unset=True)
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        if row is None:
-            raise HTTPException(404, "block not found")
-        return _block_dump(anchor, user["id"], block_id)
-
-    @app.delete("/training/anchor/block/{block_id}")
-    def training_block_delete(
-        block_id: int, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        training: TrainingStore = request.app.state.training
-        training.snapshot(user["id"])
-        if not anchor.delete_block(user["id"], block_id):
-            raise HTTPException(404, "block not found")
         return {"status": "ok"}
 
     # -- weather ---------------------------------------------------------------
