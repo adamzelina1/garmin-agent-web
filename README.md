@@ -350,7 +350,8 @@ src/garmin_fetch/
     geocode.py    # home city/country -> lat/lon via Open-Meteo
     sync_worker.py# background sync pool + APScheduler cron + backoff
     setup_db.py   # garmin_app / garmin_readonly role bootstrap
-    state.py      # per-user memory/session + training-plan/goal stores
+    state/        # user_state (memory/session/trace) + training_* (validation, rules,
+                  #   workouts, anchor, store: goals/blocks/weeks/workouts, undo)
     static/       # index.html (Chat · Today · Training Plan · Settings)
 docker/
   initdb/       # 01-roles.sh (creates non-superuser roles on fresh volume)
