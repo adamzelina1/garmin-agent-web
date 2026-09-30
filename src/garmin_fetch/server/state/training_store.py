@@ -11,6 +11,7 @@ from typing import Any
 from ...db import open_pg_pool
 from .training_workouts import TrainingWorkoutStore
 from .training_anchor import TrainingAnchorStore
+from .training_agenda import build_agenda
 
 
 #: ``user_state`` key holding the one season undo snapshot. Reusing the existing
@@ -265,47 +266,20 @@ class TrainingStore:
 
 
 class TrainingSeason:
-    """Per-user, user-scoped view of the one ``TrainingStore`` for the agent.
+    """Per-user view of the one ``TrainingStore`` for the agent.
 
     The agent gets exactly one training tool; this facade exposes what that tool
-    needs — read the tree and the resolved week, and apply one season spec —
-    without threading a user id through ``build_agent``.
+    needs — the windowed agenda and one atomic season edit — without threading
+    a user id through ``build_agent``.
     """
 
     def __init__(self, store: TrainingStore, user_id: int) -> None:
         self._store = store
         self._user_id = user_id
 
-    def list_goals(self) -> list[dict[str, Any]]:
-        return self._store.anchor.list_goals(self._user_id)
-
-    def resolve_goal(
-        self, goal_id: int, day: str | None = None
-    ) -> dict[str, Any] | None:
-        return self._store.anchor.resolve_goal(self._user_id, goal_id, day)
-
-    def blocks(self, goal_id: int) -> list[dict[str, Any]]:
-        return self._store.anchor.list_blocks(self._user_id, goal_id)
-
-    def coverage_range(
-        self, date_start: str, date_end: str, goal_id: int | None = None
-    ) -> list[dict[str, Any]]:
-        return self._store.anchor.coverage_range(
-            self._user_id, date_start, date_end, goal_id
-        )
-
-    def activities(
-        self, date_start: str | None = None, date_end: str | None = None
-    ) -> list[dict[str, Any]]:
-        return self._store.workouts.activities(self._user_id, date_start, date_end)
-
-    def list_workouts(
-        self, date_start: str | None = None, date_end: str | None = None
-    ) -> list[dict[str, Any]]:
-        return self._store.workouts.list(self._user_id, date_start, date_end)
+    def agenda(self, **window: Any) -> dict[str, Any]:
+        """See :func:`.training_agenda.build_agenda` for the arguments."""
+        return build_agenda(self._store, self._user_id, **window)
 
     def apply(self, spec: dict[str, Any]) -> dict[str, Any]:
         return self._store.apply(self._user_id, spec)
-
-    def can_undo(self) -> bool:
-        return self._store.can_undo(self._user_id)

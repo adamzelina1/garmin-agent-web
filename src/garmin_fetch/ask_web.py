@@ -24,6 +24,7 @@ from typing import Any
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from .ask import (
+    ReadOnlyDB,
     _build_agent,
     _build_chart_figure,
     _final_answer,
@@ -41,13 +42,6 @@ def _history_to_messages(
     Only the text of user/assistant turns is kept — tool call/result details
     and chart blocks are dropped, which is all the model needs to hold context.
     """
-    from pydantic_ai.messages import (
-        ModelRequest,
-        ModelResponse,
-        TextPart,
-        UserPromptPart,
-    )
-
     msgs: list[Any] = []
     for item in history:
         role = item.get("role")
@@ -76,8 +70,6 @@ def _messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
     the chat only ever shows the final text-only reply. The terminal answer
     is its own response with no tool calls, so it is always kept.
     """
-    from pydantic_ai.messages import ModelResponse, ModelRequest, TextPart, UserPromptPart
-
     history: list[dict[str, str]] = []
     for message in messages:
         if isinstance(message, ModelRequest):

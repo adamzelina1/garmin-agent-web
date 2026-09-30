@@ -44,14 +44,13 @@ from pydantic import BaseModel
 
 from ..ask import (
     ReadOnlyDB,
-    _auto_compact,
     _build_agent,
     _build_chart_figure,
     _final_answer,
     _messages_token_estimate,
     _prune_session_messages,
     _record_turn,
-    _refresh_resumed_prompt,
+    compact,
 )
 from ..ask_web import (
     _extract_charts,
@@ -231,7 +230,7 @@ def _readonly(
     # Hide columns the account can't have data for (disabled data types) so the
     # agent's schema introspection stays lean and never costs tokens on metrics
     # it will only ever see as NULL.
-    return ReadOnlyDB.from_url(url, user_id=user_id, excluded_types=excluded_types)
+    return ReadOnlyDB(url, user_id=user_id, excluded_types=excluded_types)
 
 
 def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dict[str, Any]:
@@ -275,7 +274,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         app.state.workouts = training.workouts
         app.state.anchor = training.anchor
         app.state.cfg = cfg
-        app.state.chart_cache = {}
         sync.start()
         logger.info("garmin server started")
         try:
@@ -767,10 +765,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
 
     # -- ask ------------------------------------------------------------------
 
-    @app.post("/ask")
-    async def ask(
-        body: AskRequest, request: Request, user: dict = Depends(get_user)
-    ):
+    def _require_llm(request: Request, user: dict) -> dict[str, Any]:
+        """The user's agent config, or 503 when no LLM is configured."""
         auth: AuthService = request.app.state.auth
         if not auth.user_llm_configured(user):
             raise HTTPException(
@@ -778,57 +774,86 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 "the LLM agent is not configured: set LLM_API_KEY (or a local "
                 "LLM_BASE_URL with LLM_MODEL) in the server .env and restart",
             )
-        user_cfg = _user_agent_cfg(request.app.state.cfg, user, auth)
-        db = _readonly(
+        return _user_agent_cfg(request.app.state.cfg, user, auth)
+
+    def _user_readonly(request: Request, user: dict) -> ReadOnlyDB:
+        return _readonly(
             request.app.state.cfg,
             user["id"],
             excluded_types=user.get("excluded_data_types") or "",
         )
+
+    def _user_agent(
+        request: Request,
+        user: dict,
+        user_cfg: dict[str, Any],
+        db: ReadOnlyDB,
+        *,
+        charts: dict[str, Any] | None = None,
+        on_status: Any = None,
+    ) -> Any:
+        """The agent for one user's request, wired to their state stores."""
         state: UserState = request.app.state.state
-        chart_cache = getattr(request.app.state, "chart_cache", {})
+        return _build_agent(
+            user_cfg,
+            db,
+            memory=PgMemory(state, user["id"]),
+            principles=PgPrinciples(state, user["id"]),
+            training=TrainingSeason(request.app.state.training, user["id"]),
+            charts=charts,
+            on_status=on_status,
+        )
+
+    def _turn_history(request: Request, user: dict, body: AskRequest) -> list[Any] | None:
+        """The history a turn resumes from: client-supplied, else the stored session."""
+        if body.history:
+            return _history_to_messages(body.history)
+        return request.app.state.state.get_session_messages(user["id"])
+
+    def _finish_turn(
+        request: Request,
+        user: dict,
+        user_cfg: dict[str, Any],
+        question: str,
+        result: Any,
+        charts: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Trace, persist and shape one completed turn for the client."""
+        state: UserState = request.app.state.state
+        answer = _final_answer(result)
+        _record_turn(
+            user_cfg, question, result, answer=answer,
+            trace_writer=lambda record: state.append_trace(user["id"], record),
+        )
+        text, specs = _extract_charts(answer)
+        messages = _prune_session_messages(result.all_messages())
+        state.set_session_messages(user["id"], messages)
+        return {
+            "answer": _replace_workout_dumps(text),
+            "chart_specs": specs,
+            "chart_figures": [charts.get(s.get("sql", "").strip()) for s in specs],
+            "tokens": _messages_token_estimate(messages),
+        }
+
+    @app.post("/ask")
+    async def ask(
+        body: AskRequest, request: Request, user: dict = Depends(get_user)
+    ):
+        user_cfg = _require_llm(request, user)
+        db = _user_readonly(request, user)
+        # Figures the chart tool validated during this turn, keyed by SQL.
+        # Per request, so a figure can never reach another user.
+        charts: dict[str, Any] = {}
 
         is_streaming = body.stream or (request.headers.get("accept") == "text/event-stream")
 
         if not is_streaming:
             try:
-                memory = PgMemory(state, user["id"])
-                agent = _build_agent(
-                    user_cfg,
-                    db,
-                    memory=memory,
-                    principles=PgPrinciples(state, user["id"]),
-                    training=TrainingSeason(request.app.state.training, user["id"]),
-                    chart_cache=chart_cache,
+                agent = _user_agent(request, user, user_cfg, db, charts=charts)
+                result = await agent.run(
+                    body.question, message_history=_turn_history(request, user, body)
                 )
-                if body.history:
-                    history = _history_to_messages(body.history)
-                else:
-                    history = state.get_session_messages(user["id"])
-                    if history:
-                        _refresh_resumed_prompt(history, db)
-                result = await agent.run(body.question, message_history=history)
-
-                def _trace_writer(record: dict) -> None:
-                    state.append_trace(user["id"], record)
-
-                _record_turn(
-                    user_cfg,
-                    body.question,
-                    result,
-                    trace_writer=_trace_writer,
-                )
-                answer = _final_answer(result)
-                text, specs = _extract_charts(answer)
-                text = _replace_workout_dumps(text)
-                figures = [chart_cache.get(s.get("sql", "").strip()) for s in specs]
-                messages = _prune_session_messages(result.all_messages())
-                state.set_session_messages(user["id"], messages)
-                return {
-                    "answer": text,
-                    "chart_specs": specs,
-                    "chart_figures": figures,
-                    "tokens": _messages_token_estimate(messages),
-                }
+                return _finish_turn(request, user, user_cfg, body.question, result, charts)
             except Exception as exc:  # noqa: BLE001 - a bad question must not crash the server
                 logger.exception("ask failed for user %s", user["id"])
                 raise HTTPException(500, f"ask failed: {exc}") from exc
@@ -847,22 +872,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
 
             async def runner():
                 try:
-                    memory = PgMemory(state, user["id"])
-                    agent = _build_agent(
-                        user_cfg,
-                        db,
-                        memory=memory,
-                        principles=PgPrinciples(state, user["id"]),
-                        training=TrainingSeason(request.app.state.training, user["id"]),
-                        chart_cache=chart_cache,
-                        on_status=on_status,
+                    agent = _user_agent(
+                        request, user, user_cfg, db, charts=charts, on_status=on_status
                     )
-                    if body.history:
-                        history = _history_to_messages(body.history)
-                    else:
-                        history = state.get_session_messages(user["id"])
-                        if history:
-                            _refresh_resumed_prompt(history, db)
+                    history = _turn_history(request, user, body)
 
                     # ``agent.run_stream`` treats the *first* text part as the
                     # final output and stops the graph there, so a model that
@@ -909,34 +922,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
 
                         if agent_run.result is None:
                             raise RuntimeError("agent run finished without a result")
-                        result = agent_run.result
-                        answer = _final_answer(result)
-
-                        def _trace_writer(record: dict) -> None:
-                            state.append_trace(user["id"], record)
-
-                        _record_turn(
-                            user_cfg,
-                            body.question,
-                            result,
-                            trace_writer=_trace_writer,
-                            answer=answer,
+                        payload = _finish_turn(
+                            request, user, user_cfg, body.question, agent_run.result, charts
                         )
-                        text, specs = _extract_charts(answer)
-                        text = _replace_workout_dumps(text)
-                        figures = [chart_cache.get(s.get("sql", "").strip()) for s in specs]
-                        messages = _prune_session_messages(result.all_messages())
-                        state.set_session_messages(user["id"], messages)
-
-                        await queue.put((
-                            "done",
-                            {
-                                "answer": text,
-                                "chart_specs": specs,
-                                "chart_figures": figures,
-                                "tokens": _messages_token_estimate(messages),
-                            },
-                        ))
+                    await queue.put(("done", payload))
                 except Exception as exc:
                     logger.exception("streaming ask failed for user %s", user["id"])
                     await queue.put(("error", {"error": str(exc)}))
@@ -970,20 +959,16 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         rendering the resumed session in the UI on login/reload. Stored
         assistant messages keep the raw markdown (including <chart> blocks), so
         the same post-processing as the live ask path is applied here: charts
-        are extracted to chart_specs (so they re-render) and plan dumps are
-        replaced with the <plan_table /> marker."""
+        are extracted to chart_specs (the client draws each via /ask/chart) and
+        plan dumps are replaced with the <plan_table /> marker."""
         state: UserState = request.app.state.state
         messages = state.get_session_messages(user["id"]) or []
         history = _messages_to_history(messages)
-        cache = getattr(request.app.state, "chart_cache", {})
         for item in history:
             if item.get("role") in ("assistant", "bot"):
                 text, specs = _extract_charts(item["content"])
                 item["content"] = _replace_workout_dumps(text)
                 item["chart_specs"] = specs
-                item["chart_figures"] = [
-                    cache.get(s.get("sql", "").strip()) for s in specs
-                ] if cache else []
         return {
             "history": history,
             "tokens": _messages_token_estimate(messages),
@@ -999,68 +984,37 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
 
     @app.post("/ask/compact")
     def ask_compact(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
-        """Fold the stored conversation into a compact summary (system-prompt
-        head kept), so the next turn resumes from a small seed instead of the
-        whole transcript. Called by the chat's Compact button — it is never run
-        automatically, so a slow tool-calling turn is never slowed further."""
-        auth: AuthService = request.app.state.auth
-        if not auth.user_llm_configured(user):
-            raise HTTPException(
-                503, "the LLM agent is not configured: set LLM_API_KEY (or a "
-                "local LLM_BASE_URL with LLM_MODEL) in the server .env and restart"
-            )
-        user_cfg = _user_agent_cfg(request.app.state.cfg, user, auth)
-        db = _readonly(
-            request.app.state.cfg,
-            user["id"],
-            excluded_types=user.get("excluded_data_types") or "",
-        )
+        """Fold the stored conversation into a compact summary, so the next turn
+        resumes from a small seed instead of the whole transcript. Called by the
+        chat's Compact button — never automatically."""
+        user_cfg = _require_llm(request, user)
         state: UserState = request.app.state.state
+        messages = state.get_session_messages(user["id"]) or []
+        if not messages:
+            return {"tokens": 0, "unchanged": True}
+        db = _user_readonly(request, user)
         try:
-            messages = state.get_session_messages(user["id"]) or []
-            if not messages:
-                return {"tokens": 0, "unchanged": True}
-            agent = _build_agent(
-                user_cfg,
-                db,
-                memory=PgMemory(state, user["id"]),
-                principles=PgPrinciples(state, user["id"]),
-                training=TrainingSeason(request.app.state.training, user["id"]),
-            )
-            compacted = _auto_compact(agent, messages, max_tokens=0)
-            state.set_session_messages(user["id"], compacted)
-            return {
-                "tokens": _messages_token_estimate(compacted),
-                "unchanged": compacted is messages,
-            }
+            compacted = compact(_user_agent(request, user, user_cfg, db), messages)
         finally:
             db.close()
+        state.set_session_messages(user["id"], compacted)
+        return {
+            "tokens": _messages_token_estimate(compacted),
+            "unchanged": compacted is messages,
+        }
 
     @app.post("/ask/chart")
     def ask_chart(
         body: ChartRequest, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        cfg = request.app.state.cfg
-        spec = body.spec
-        sql = spec.get("sql")
+        """Draw a chart spec by running its SQL as the requesting user (RLS)."""
+        sql = body.spec.get("sql")
         if not isinstance(sql, str):
             raise HTTPException(400, "chart spec needs a string 'sql' key")
-        cache = getattr(request.app.state, "chart_cache", None)
-        if cache:
-            cached = cache.get(sql.strip()) or cache.get(json.dumps(spec, sort_keys=True))
-            if cached:
-                return cached
-        db = _readonly(cfg, user["id"])
+        db = _readonly(request.app.state.cfg, user["id"])
         try:
-            result = db.run_sql(sql)
-            figure = _build_chart_figure(spec, result)
-            fig_dict = json.loads(figure.to_json())
-            if cache is not None:
-                if len(cache) > 500:
-                    cache.clear()
-                cache[sql.strip()] = fig_dict
-                cache[json.dumps(spec, sort_keys=True)] = fig_dict
-            return fig_dict
+            figure = _build_chart_figure(body.spec, db.run_sql(sql))
+            return json.loads(figure.to_json())
         except Exception as exc:  # noqa: BLE001 - invalid spec -> client error
             raise HTTPException(400, f"invalid chart spec: {exc}") from exc
         finally:
