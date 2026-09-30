@@ -661,15 +661,46 @@ def _build_chart_figure(
                     kwargs["labels"] = kwargs.pop("x")
                 if "values" not in kwargs and "y" in kwargs:
                     kwargs["values"] = kwargs.pop("y")
+        # Name the trace after its y column so legends and hovers don't read
+        # "trace 0"; axis titles below follow the same rule.
+        if "name" not in kwargs and isinstance(tr.get("y"), str):
+            kwargs["name"] = tr["y"]
         cls = getattr(go, go_name, None) or getattr(go, _go_class_name(go, go_name))
         traces.append(cls(**kwargs))
 
-    fig = go.Figure(data=traces)
+    # An empty template keeps the JSON small and leaves theming to the UI.
+    fig = go.Figure(data=traces, layout={"template": "none"})
+    for axis in ("x", "y"):
+        cols = {tr.get(axis) for tr in spec["traces"]}
+        if len(cols) == 1 and isinstance(col := cols.pop(), str):
+            fig.update_layout({f"{axis}axis": {"title": {"text": col}}})
+    if len(traces) > 1:
+        fig.update_layout(hovermode="x unified")
     layout = spec.get("layout")
     if layout:
         fig.update_layout(**layout)
     return fig
 
+
+def _chart_ranges(spec: dict[str, Any], result: dict[str, Any]) -> str:
+    """``; y_col first -> last, min, max`` per numeric y column of a chart spec, so
+    the model can describe the chart without the data being returned."""
+    columns, rows = result["columns"], result["rows"]
+    parts: list[str] = []
+    for tr in spec.get("traces", []):
+        col = tr.get("y") if isinstance(tr, dict) else None
+        if not isinstance(col, str) or col not in columns:
+            continue
+        i = columns.index(col)
+        vals = [
+            r[i] for r in rows
+            if isinstance(r[i], int | float) and not isinstance(r[i], bool)
+        ]
+        if vals:
+            parts.append(
+                f"{col} {vals[0]:g} -> {vals[-1]:g}, min {min(vals):g}, max {max(vals):g}"
+            )
+    return "; " + "; ".join(parts) if parts else ""
 
 
 #: The activity_summaries columns ``_format_activity`` reads.
@@ -1619,12 +1650,19 @@ def _register_tools(
         if not isinstance(parsed, dict) or not isinstance(parsed.get("sql"), str):
             raise ValueError("spec must be a JSON object with a string 'sql' key")
         result = db.run_sql(parsed["sql"])
+        if result["truncated"]:
+            raise ValueError(
+                f"query returned more than {len(result['rows'])} rows and the "
+                "chart would be cut off; aggregate (e.g. by day or week) or "
+                "narrow the date range"
+            )
         figure = _build_chart_figure(parsed, result)
         if charts is not None:
             charts[parsed["sql"].strip()] = json.loads(figure.to_json())
         return (
             "OK: " + json.dumps(parsed, ensure_ascii=False)
-            + f" (query returned {len(result['rows'])} rows)"
+            + f" (query returned {len(result['rows'])} rows"
+            + _chart_ranges(parsed, result) + ")"
         )
 
     if weather is not None:
