@@ -7,18 +7,27 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/texmath.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/markdown-it-task-lists@2.1.1/dist/markdown-it-task-lists.min.js"></script>
+<!-- Deferred so the login screen paints without waiting on Plotly (~3.5 MB);
+     pinned with SRI because this page holds the JWT in localStorage. -->
+<script defer src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8" crossorigin="anonymous"
+        integrity="sha384-7TVmlZWH60iKX5Uk7lSvQhjtcgw2tkFjuwLcXoRSR4zXTyWFJRm9aPAguMh7CIra"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous"
+      integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"
+        integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js" crossorigin="anonymous"
+        integrity="sha384-wLhprpjsmjc/XYIcF+LpMxd8yS1gss6jhevOp6F6zhiIoFK6AmHtm4bGKtehTani"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/texmath.min.js" crossorigin="anonymous"
+        integrity="sha384-IJTt8+6hpcfxunTzDwSuS8o8lsOFjDwoUddKsTvs+x8oa9muA1PbBBcXaz8D6yR0"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/markdown-it-task-lists@2.1.1/dist/markdown-it-task-lists.min.js" crossorigin="anonymous"
+        integrity="sha384-FKY5Inm02LmR+QgGl8g9DxuTQ+UuOo3tWGSVd7ZmWSPl9DyYsmi7kE3tTjC3ZEow"></script>
 <style>
   :root { --bg:#0f1419; --panel:#171d24; --panel2:#1d242e; --text:#e7edf3;
           --muted:#9aa8b6; --accent:#3b82f6; --border:#2a323d; --ok:#22c55e; --err:#ef4444;
           --surface-1:rgba(255,255,255,.02); --surface-2:rgba(255,255,255,.04);
           --surface-3:rgba(255,255,255,.06); --line:rgba(255,255,255,.07);
-          --font:"Inter", system-ui, -apple-system, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+          --font:"Inter", system-ui, -apple-system, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+          color-scheme:dark; /* native date pickers, scrollbars match the theme */ }
   * { box-sizing: border-box; }
   html, body { height:100%; overflow:hidden; }
   body { margin:0; font-family:var(--font);
@@ -26,10 +35,60 @@
          background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
   .wrap { max-width: 1240px; margin: 0 auto; padding: 16px; width:100%;
           flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
-  header { display:flex; align-items:center; justify-content:space-between;
-           padding:12px 16px; background:var(--panel); border-bottom:1px solid var(--border); }
-  header h1 { font-size:18px; margin:0; }
+  header { display:flex; align-items:center; gap:24px; min-height:52px;
+           padding:0 16px; background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { font-size:18px; margin:0; flex:none; }
+  header .hdr-right { margin-left:auto; display:flex; align-items:center; gap:12px; }
   header .who { color:var(--muted); font-size:13px; }
+  /* Underline tabs: the app nav in the header and the Settings sub-tabs. */
+  .utabs { display:flex; gap:22px; align-self:stretch; }
+  .utabs button { background:none; border:0; border-bottom:2px solid transparent; border-radius:0;
+                  color:var(--muted); padding:0 2px; font-size:14px; font-weight:600; }
+  .utabs button:hover:not(:disabled) { color:var(--text); filter:none; }
+  .utabs button:active:not(:disabled) { transform:none; }
+  .utabs button.active { color:var(--text); border-bottom-color:var(--accent); }
+  #settings-tabs { align-self:auto; height:38px; margin-top:4px; border-bottom:1px solid var(--line); }
+  button.danger { background:transparent; border:1px solid var(--err); color:var(--err); }
+  button.danger:hover:not(:disabled) { background:rgba(239,68,68,.1); filter:none; }
+  button.sm { padding:4px 10px; font-size:12px; }
+  button.linkish { background:none; border:0; padding:2px 4px; color:var(--accent); font-size:12.5px; font-weight:600; }
+  button.linkish:disabled { color:var(--muted); opacity:.6; }
+  /* Segmented control (plan Week/List, chart ranges). */
+  .seg { display:inline-flex; background:var(--surface-2); border-radius:8px; padding:2px; gap:2px; }
+  .seg button { background:none; border:0; color:var(--muted); padding:4px 11px; font-size:12.5px;
+                font-weight:600; border-radius:6px; }
+  .seg button:hover:not(:disabled) { color:var(--text); filter:none; }
+  .seg button.active { background:var(--panel2); color:var(--text); box-shadow:0 1px 2px rgba(0,0,0,.35); }
+  .ico { display:inline-flex; width:14px; height:14px; flex:none; }
+  .ico svg { width:100%; height:100%; }
+  /* Toasts: transient confirmations, errors and undo actions. */
+  #toasts { position:fixed; left:50%; bottom:76px; /* clear of the chat input row */ transform:translateX(-50%); z-index:200;
+            display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
+  .toast { display:flex; align-items:center; gap:14px; background:#232b36; color:var(--text);
+           border:1px solid var(--border); border-radius:10px; padding:10px 14px; font-size:13.5px;
+           box-shadow:0 8px 24px rgba(0,0,0,.45); pointer-events:auto; max-width:min(560px, 92vw);
+           animation:toastIn .18s ease; }
+  .toast.ok { border-left:3px solid var(--ok); }
+  .toast.err { border-left:3px solid var(--err); }
+  .toast button { background:none; border:0; padding:0; color:var(--accent); font-weight:700; font-size:13px; }
+  .toast .t-x { color:var(--muted); font-weight:400; font-size:15px; }
+  .toast.leaving { opacity:0; transform:translateY(6px); transition:opacity .18s ease, transform .18s ease; }
+  @keyframes toastIn { from { opacity:0; transform:translateY(8px); } }
+  /* Loading skeletons. */
+  .skel { display:block; border-radius:6px; background:linear-gradient(90deg, var(--surface-2) 25%,
+          var(--surface-3) 50%, var(--surface-2) 75%); background-size:200% 100%;
+          animation:shimmer 1.3s linear infinite; }
+  .skel.inline { display:inline-block; vertical-align:middle; }
+  @keyframes shimmer { from { background-position:200% 0; } to { background-position:-200% 0; } }
+  @media (prefers-reduced-motion:reduce) { .skel, .toast { animation:none; } }
+  .save-state { font-size:12px; color:var(--ok); margin-left:8px; opacity:0; transition:opacity .2s ease; }
+  .save-state.show { opacity:1; }
+  .save-state.err { color:var(--err); }
+  .save-note { font-size:12px; color:var(--muted); margin-top:4px; }
+  .save-note:empty { display:none; }
+  .card-title { margin:0 0 10px; }
+  label.check-row { display:flex; align-items:center; gap:8px; margin-top:14px; font-size:13px; color:var(--text); }
+  input.date-input { max-width:220px; }
   button { background:var(--accent); color:#fff; border:0; border-radius:6px;
            padding:8px 14px; cursor:pointer; font-size:14px;
            transition:background .15s ease, filter .15s ease, transform .05s ease, opacity .15s ease; }
@@ -66,7 +125,7 @@
   .td-head { display:flex; align-items:center; gap:12px; width:100%; background:none;
              border:none; cursor:pointer; padding:15px 18px; text-align:left; }
   .td-head:hover { background:var(--panel2); }
-  .td-head .td-chev { flex:none; color:var(--muted); font-size:12px; transition:transform .15s ease; }
+  .td-head .td-chev { flex:none; color:var(--muted); font-size:16px; line-height:1; transition:transform .15s ease; }
   .td-card.open .td-chev { transform:rotate(90deg); }
   .td-head .td-ttl { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1; }
   .td-head .td-t { font-weight:700; font-size:15px; color:var(--text); }
@@ -134,16 +193,34 @@
   /* Other tabs: fill the space and scroll their own content (viewport is
      locked so the page itself can never scroll). */
   #tab-today, #tab-plan, #tab-settings { flex:1 1 auto; min-height:0; overflow-y:auto; }
-  #tab-chat .chattop, #tab-chat .prompt-chips, #tab-chat .askrow { flex:none; }
+  #tab-chat .chattop, #tab-chat .askrow { flex:none; }
+  #tab-chat .chat-stage { flex:1 1 auto; min-height:0; position:relative; display:flex; flex-direction:column; }
   #tab-chat .chatbox { flex:1 1 auto; min-height:0; max-height:none;
                        overflow-y:auto; overflow-x:auto; }
   .chattop { display:flex; align-items:center; gap:8px; margin-top:16px; color:var(--muted); font-size:12px; }
+  .chattop .spacer { flex:1; }
+  /* Empty-chat welcome, laid over the (empty) message box. */
+  .chat-empty { position:absolute; inset:6px 0 0; display:flex; flex-direction:column; align-items:center;
+                justify-content:center; gap:14px; padding:24px; text-align:center; pointer-events:none; }
+  .chat-empty > * { pointer-events:auto; }
+  .chat-empty h2 { margin:0; font-size:20px; font-weight:700; }
+  .chat-empty p { margin:0; color:var(--muted); font-size:13.5px; max-width:440px; line-height:1.5; }
+  .chat-empty .prompt-chips { justify-content:center; max-width:560px; margin-top:4px; }
+  .chat-empty .prompt-chip { font-size:13px; padding:7px 13px; border-radius:18px; }
   .chatbox { background:var(--panel); border:1px solid var(--border); border-radius:10px;
              min-height:340px; max-height:60vh; overflow-y:auto; overscroll-behavior:contain;
              padding:14px; margin-top:6px; }
-  .msg { margin:10px 0; }
-  .msg .role { font-size:12px; color:var(--muted); margin-bottom:3px; }
-  .msg .body { font-size:14px; line-height:1.5; }
+  .msg { margin:14px 0; }
+  .msg .role { font-size:12px; color:var(--muted); margin-bottom:3px; font-weight:600; }
+  .msg .body { font-size:14px; line-height:1.55; }
+  /* Your messages: a right-aligned bubble. Agent answers stay full-width for
+     tables and charts. */
+  .msg.user { display:flex; flex-direction:column; align-items:flex-end; }
+  .msg.user .role { display:none; }
+  .msg.user .body { max-width:min(78%, 640px); background:rgba(59,130,246,.16);
+                    border:1px solid rgba(59,130,246,.28); border-radius:14px 14px 4px 14px;
+                    padding:8px 13px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.note { color:var(--muted); font-size:12.5px; text-align:center; }
   .msg .body p { margin:6px 0; }
   .msg .body h2, .msg .body h3, .msg .body h4 { margin:10px 0 4px; font-size:15px; }
   .msg .body ul, .msg .body ol { margin:6px 0; padding-left:22px; }
@@ -185,12 +262,14 @@
   .pwd-toggle { position:absolute; right:6px; background:none; border:none; color:var(--muted);
                 padding:4px 6px; font-size:14px; cursor:pointer; border-radius:4px; line-height:1; }
   .pwd-toggle:hover { color:var(--text); background:rgba(255,255,255,.06); }
+  .pwd-toggle { display:inline-flex; }
+  .pwd-toggle .ico { width:16px; height:16px; }
   .planbox { margin:10px 0 4px; }
   .planbox .planbox-head { font-size:12px; color:var(--muted); margin-bottom:4px; }
-  .msg.user .body { color:#cfe4ff; }
   .askrow { display:flex; gap:8px; margin-top:10px; align-items:flex-end; }
   .askrow textarea { flex:1; resize:none; min-height:38px; max-height:180px; margin:0; line-height:1.4; padding:8px 10px; font-family:inherit; }
-  .askrow button { height:38px; flex:none; }
+  .askrow button { height:38px; flex:none; min-width:76px; font-weight:600; }
+  #btn-ask.stop { background:var(--panel2); border:1px solid var(--border); color:var(--text); }
   .chartbox { margin-top:8px; }
   .toolbar { display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap; }
   .stat { font-size:13px; color:var(--muted); }
@@ -212,8 +291,14 @@
   .metric-comp .r-value { font-size:20px; font-weight:600; margin:2px 0; }
   .metric-comp .r-sub { font-size:12px; color:var(--muted); }
   .plan-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
-  .plan-head .plan-week-label { flex:1; text-align:center; font-weight:600; font-size:14px; }
-  .plan-week-progress { flex:1 1 200px; min-width:140px; max-width:360px; }
+  .plan-nav { display:flex; align-items:center; gap:2px; }
+  .plan-nav .nav-arrow { width:30px; height:30px; padding:0; font-size:17px; line-height:1;
+                         background:none; border:0; color:var(--muted); border-radius:6px; }
+  .plan-nav .nav-arrow:hover { background:var(--surface-3); color:var(--text); filter:none; }
+  .plan-head .plan-week-label { min-width:150px; text-align:center; font-weight:700; font-size:15px;
+                                font-variant-numeric:tabular-nums; }
+  .plan-anchor .wp-host { margin-top:10px; }
+  .plan-anchor .wp-host:empty { display:none; }
   .plan-anchor { background:var(--surface-2); border:0; border-radius:10px;
                  padding:9px 12px; margin-bottom:14px; cursor:pointer;
                  transition:background .15s ease; }
@@ -324,14 +409,23 @@
   .phase-detail .pd-week { margin-top:3px; }
   .phase-detail .pd-week-head { font-variant-numeric:tabular-nums; }
   .plan-day.block { box-shadow:inset 0 2px 0 rgba(59,130,246,.55); }
-  .plan-week { display:grid; grid-template-columns:repeat(7,1fr); gap:10px; }
+  .plan-week { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:10px; }
   .plan-day { background:var(--surface-1); border:0; border-radius:10px;
               padding:10px; min-height:150px; display:flex; flex-direction:column; }
   .plan-day.today { box-shadow:inset 0 0 0 1px var(--accent); }
   .plan-day.block.today { box-shadow:inset 0 0 0 1px var(--accent), inset 0 2px 0 rgba(59,130,246,.55); }
   .plan-day-header { display:flex; justify-content:space-between; align-items:baseline;
                      font-size:11.5px; color:var(--muted); margin-bottom:2px; }
-  .plan-day-header .dow { font-weight:600; color:var(--text); }
+  .plan-day-header { align-items:center; flex-wrap:wrap; row-gap:3px; margin-bottom:6px; }
+  .plan-card .pc-meta { min-width:0; }
+  .plan-card { overflow-wrap:anywhere; }
+  .plan-day-header .plan-day-left { display:inline-flex; align-items:baseline; gap:5px; min-width:0; }
+  .plan-day-header .dow { font-weight:600; color:var(--muted); text-transform:uppercase;
+                          letter-spacing:.05em; font-size:10.5px; }
+  .plan-day-header .dnum { font-weight:700; font-size:15px; color:var(--text); font-variant-numeric:tabular-nums; }
+  .plan-day.today .dnum { color:var(--accent); }
+  .today-pill { align-self:center; font-size:9.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+                background:var(--accent); color:#fff; border-radius:4px; padding:1px 5px; }
   .plan-day-header .plan-day-right { display:inline-flex; align-items:center; gap:5px; }
   .plan-day-header .wx-slot { display:inline-flex; align-items:center; justify-content:flex-end; gap:3px;
                               width:40px; font-size:12px; line-height:1; }
@@ -359,7 +453,7 @@
   .plan-card .pc-title { font-weight:600; color:var(--text); margin:3px 0; }
   .plan-card .pc-meta { display:flex; flex-wrap:wrap; align-items:baseline; color:var(--muted); font-size:11.5px; }
   .pc-metric { color:var(--muted); white-space:nowrap; }
-  .pc-metric.plain { color:var(--muted); }
+  .pc-metric.plain { color:var(--muted); white-space:normal; }
   .pc-metric + .pc-metric::before { content:"·"; margin:0 7px; color:var(--muted); opacity:.5; }
   .pc-metric b { font-weight:600; color:#c6d0da; }
   .pc-metric em { font-style:normal; font-size:.82em; opacity:.7; margin-left:3px; }
@@ -387,8 +481,15 @@
   @media (hover:none) { .plan-add { opacity:1; pointer-events:auto; } }
   .plan-empty { color:var(--muted); font-size:12px; text-align:center; padding:16px 4px; }
   .plan-empty.rest { color:var(--muted); }
+  .plan-day .plan-list-cards { flex:1; display:flex; flex-direction:column; }
+  /* An empty upcoming day is itself the "add" target. */
+  .plan-empty-add { flex:1; width:100%; min-height:90px; background:transparent; color:var(--muted);
+                    border:1px dashed transparent; border-radius:8px; font-size:12px; opacity:.55;
+                    transition:opacity .15s ease, border-color .15s ease, color .15s ease; }
+  .plan-empty-add:hover:not(:disabled), .plan-empty-add:focus-visible { opacity:1; color:var(--accent);
+                    border-color:var(--accent); filter:none; }
+  .plan-week.loading { opacity:.55; transition:opacity .15s ease; }
   .plan-head .spacer { flex:1; }
-  .view-toggle.active { background:var(--accent); color:#06210f; border-color:var(--accent); }
   .plan-card.skipped { opacity:.6; }
   .plan-card.skipped .pc-title { text-decoration:line-through; }
   .plan-card .pc-skip { display:inline-flex; align-items:center; font-size:10px; font-weight:700;
@@ -428,7 +529,15 @@
   .goal-actions { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
   .goal-list { display:flex; flex-direction:column; gap:6px; margin-bottom:10px; }
   .goal-list button { text-align:left; }
-  .goal-list button.active { background:var(--accent); color:#06210f; border-color:var(--accent); }
+  .goal-list button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .modal-actions .spacer { flex:1; }
+  .phase-badge { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; background:var(--surface-2);
+                 border:1px solid var(--border); border-radius:6px; font-size:12.5px; color:var(--text); }
+  .block-head-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  .block-head-row .danger { margin-left:auto; }
+  .zone-note { font-size:12px; color:var(--muted); margin:2px 0 10px; }
+  .td-toolbar { display:flex; align-items:center; justify-content:flex-end; margin:4px 0 2px; }
+  #tab-today .briefing, #tab-today .today-grid { margin-top:16px; }
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center;
               justify-content:center; z-index:50; }
   .modal { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px;
@@ -479,9 +588,18 @@
 <body>
 <header>
   <h1>Garmin AI</h1>
-  <span class="who" id="who"></span>
-  <button id="logout" class="secondary hidden">Sign out</button>
+  <nav class="utabs hidden" id="app-tabs">
+    <button class="active" data-tab="chat">Chat</button>
+    <button data-tab="today">Today</button>
+    <button data-tab="plan">Training Plan</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <div class="hdr-right">
+    <span class="who" id="who"></span>
+    <button id="logout" class="secondary sm hidden">Sign out</button>
+  </div>
 </header>
+<div id="toasts" aria-live="polite"></div>
 <div class="wrap">
 
   <!-- Auth view -->
@@ -497,7 +615,7 @@
         <label>Password</label>
         <div class="pwd-wrap">
           <input id="login-password" type="password" autocomplete="current-password">
-          <button type="button" class="pwd-toggle" data-for="login-password" title="Show password" aria-label="Show password">👁</button>
+          <button type="button" class="pwd-toggle" data-for="login-password" title="Show password" aria-label="Show password"></button>
         </div>
         <div class="banner err hidden" id="login-error"></div>
         <div class="banner ok hidden" id="login-ok"></div>
@@ -509,14 +627,14 @@
         <label>Password (min 8 chars)</label>
         <div class="pwd-wrap">
           <input id="reg-password" type="password" autocomplete="new-password">
-          <button type="button" class="pwd-toggle" data-for="reg-password" title="Show password" aria-label="Show password">👁</button>
+          <button type="button" class="pwd-toggle" data-for="reg-password" title="Show password" aria-label="Show password"></button>
         </div>
         <label>Garmin Connect email</label>
         <input id="reg-garmin-email" type="email" autocomplete="off">
         <label>Garmin Connect password</label>
         <div class="pwd-wrap">
           <input id="reg-garmin-password" type="password" autocomplete="off">
-          <button type="button" class="pwd-toggle" data-for="reg-garmin-password" title="Show password" aria-label="Show password">👁</button>
+          <button type="button" class="pwd-toggle" data-for="reg-garmin-password" title="Show password" aria-label="Show password"></button>
         </div>
         <div id="reg-mfa" class="hidden">
           <label>Garmin verification code</label>
@@ -532,35 +650,38 @@
 
   <!-- App view -->
   <div id="app">
-    <div class="tabs" id="app-tabs">
-      <button class="active" data-tab="chat">Chat</button>
-      <button data-tab="today">Today</button>
-      <button data-tab="plan">Training Plan</button>
-      <button data-tab="settings">Settings</button>
-    </div>
-
     <div id="tab-chat">
       <div class="banner warn hidden" id="llm-missing">Chat is unavailable: set
         <code>LLM_API_KEY</code> (or a local <code>LLM_BASE_URL</code>) in <code>.env</code>
         and restart the server.</div>
-      <div class="chattop"><span>Context</span> <span id="ctx-tokens">…</span></div>
-      <div class="chatbox" id="chat"></div>
-      <div id="prompt-chips" class="prompt-chips">
-        <span class="prompt-chip-label">Try:</span>
-        <button type="button" class="prompt-chip" data-prompt="How was my sleep and HRV this week?">Sleep &amp; HRV this week</button>
-        <button type="button" class="prompt-chip" data-prompt="Analyze my acute-to-chronic workload ratio (ACWR)">ACWR risk</button>
-        <button type="button" class="prompt-chip" data-prompt="What was my hardest workout in the past 30 days?">Hardest workout (30d)</button>
-        <button type="button" class="prompt-chip" data-prompt="Did I have form drift or cadence changes on my recent runs?">Form &amp; cadence drift</button>
+      <div class="chattop">
+        <span>Context</span> <span id="ctx-tokens">…</span>
+        <span class="spacer"></span>
+        <button id="btn-compact" class="secondary sm" title="Compress this conversation into a summary to cut the context size (manual)">Compact</button>
+        <button id="btn-new-chat" class="secondary sm" title="Forget this conversation and start a fresh session (long-term memory is kept)">New chat</button>
+      </div>
+      <div class="chat-stage">
+        <div class="chatbox" id="chat"></div>
+        <div class="chat-empty" id="chat-empty">
+          <h2>Ask about your training</h2>
+          <p>Sleep, HRV, training load, recent runs or your plan. The agent reads your synced
+            Garmin data and can draw charts.</p>
+          <div class="prompt-chips">
+            <button type="button" class="prompt-chip" data-prompt="How was my sleep and HRV this week?">Sleep &amp; HRV this week</button>
+            <button type="button" class="prompt-chip" data-prompt="Analyze my acute-to-chronic workload ratio (ACWR)">ACWR risk</button>
+            <button type="button" class="prompt-chip" data-prompt="What was my hardest workout in the past 30 days?">Hardest workout (30d)</button>
+            <button type="button" class="prompt-chip" data-prompt="Did I have form drift or cadence changes on my recent runs?">Form &amp; cadence drift</button>
+          </div>
+        </div>
       </div>
       <div class="askrow">
         <textarea id="question" rows="1" placeholder="Ask about your Garmin data… (Enter to send, Shift+Enter for new line)" autocomplete="off"></textarea>
         <button id="btn-ask">Ask</button>
-        <button id="btn-new-chat" title="Forget this conversation and start a fresh session (long-term memory is kept)">New chat</button>
-        <button id="btn-compact" title="Compress this conversation into a summary to cut the context size (manual)">Compact</button>
       </div>
     </div>
 
     <div id="tab-today" class="hidden">
+      <div id="plan-briefing" class="briefing hidden"></div>
       <div class="today-grid">
       <div class="card td-card" data-load="acwr">
         <button class="td-head" aria-expanded="false">
@@ -574,9 +695,8 @@
         <div class="td-details hidden">
           <div class="banner warn hidden" id="acwr-hint">No training-load data yet — ACWR will appear
             once activities with a training load have been synced.</div>
-          <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
-            0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated</div>
           <div id="acwr-summary"></div>
+          <div class="td-toolbar hidden" id="acwr-toolbar"></div>
           <div id="acwr-chart"></div>
         </div>
       </div>
@@ -593,9 +713,8 @@
         <div class="td-details hidden">
           <div class="banner warn hidden" id="runacwr-hint">No running data yet — Running ACWR will appear
             once running activities (with distance) have been synced.</div>
-          <div class="banner" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);font-size:12px">
-            0.8–1.3 Sweet Spot · &gt;1.5 Danger Zone · &lt;0.8 Detraining / taper · 1.3–1.5 Elevated · running only</div>
           <div id="runacwr-summary"></div>
+          <div class="td-toolbar hidden" id="runacwr-toolbar"></div>
           <div id="runacwr-chart"></div>
         </div>
       </div>
@@ -605,14 +724,17 @@
     <div id="tab-plan" class="hidden">
       <div class="card plan-shell">
         <div class="plan-head">
-          <button id="plan-prev" class="secondary" title="Previous week">‹</button>
-          <span class="plan-week-label" id="plan-week-label"></span>
-          <button id="btn-plan-today" class="secondary" title="Jump to this week">Today</button>
-          <button id="plan-next" class="secondary" title="Next week">›</button>
-          <span class="plan-week-progress" id="plan-week-progress"></span>
+          <div class="plan-nav">
+            <button id="plan-prev" class="nav-arrow" title="Previous week" aria-label="Previous week">‹</button>
+            <span class="plan-week-label" id="plan-week-label"></span>
+            <button id="plan-next" class="nav-arrow" title="Next week" aria-label="Next week">›</button>
+          </div>
+          <button id="btn-plan-today" class="linkish" title="Jump to this week">Today</button>
           <span class="spacer"></span>
-          <button id="plan-view-week" class="secondary view-toggle active" title="Week calendar">Week</button>
-          <button id="plan-view-list" class="secondary view-toggle" title="List the next 8 weeks">List</button>
+          <div class="seg" role="group" aria-label="Plan view">
+            <button id="plan-view-week" class="active" title="Week calendar">Week</button>
+            <button id="plan-view-list" title="List the next 8 weeks">List</button>
+          </div>
           <button id="btn-edit-goals" class="secondary" title="Edit goals, blocks and weeks">Goals</button>
         </div>
         <div class="goal-tabs hidden" id="plan-goal-tabs"></div>
@@ -625,42 +747,41 @@
         <div class="banner err hidden" id="plan-error"></div>
         <div class="plan-week" id="plan-week"></div>
         <div class="plan-list hidden" id="plan-list"></div>
-        <div id="plan-briefing" class="briefing hidden"></div>
       </div>
     </div>
 
     <div id="tab-settings" class="hidden">
-      <div class="tabs" id="settings-tabs">
+      <nav class="utabs" id="settings-tabs">
         <button class="active" data-subtab="sync">Sync</button>
-        <button data-subtab="config">Config</button>
-      </div>
+        <button data-subtab="config">Preferences</button>
+      </nav>
 
       <div id="sub-sync">
         <div class="card">
-          <h3 style="margin:0 0 10px">Garmin sync</h3>
+          <h3 class="card-title">Garmin sync</h3>
           <div class="banner err hidden" id="sync-error"></div>
           <div class="banner warn hidden" id="bind-pending">Waiting to bind to Garmin — will retry
             automatically. If it stays pending, Garmin is rate-limiting or your credentials are
             invalid.</div>
           <div class="toolbar">
             <button id="btn-sync">Sync now</button>
-            <button id="btn-sync-full" title="Fetch new data, then rebuild daily_metrics and activity tables from raw (ignores incremental parse markers)">Sync + full re-parse</button>
+            <button id="btn-sync-full" class="secondary" title="Fetch new data, then rebuild daily_metrics and activity tables from raw (ignores incremental parse markers)">Sync + full re-parse</button>
             <span class="stat" id="sync-status">not synced yet</span>
             <span class="stat hidden" id="sync-running">(running…)</span>
           </div>
-          <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--text)">
-            <input type="checkbox" id="cfg-autosync" style="width:auto;margin:0">
+          <label class="check-row">
+            <input type="checkbox" id="cfg-autosync">
             Auto-sync on a schedule <span class="muted">(off by default — your account only syncs
             when you press “Sync now”)</span>
+            <span class="save-state" id="autosync-saved"></span>
           </label>
-          <div class="muted" id="autosync-state" style="margin:4px 0 0;font-size:12px"></div>
-          <label style="display:block;margin-top:12px">Sync start date <span class="muted">(optional —
+          <div class="save-note" id="autosync-state"></div>
+          <label for="cfg-sync-start">Sync start date <span class="muted">(optional —
             backfills your Garmin history from this date on the next sync; blank keeps the
-            current window)</span></label>
-          <input id="cfg-sync-start" type="text" inputmode="numeric" autocomplete="off"
-                 placeholder="YYYY-MM-DD" maxlength="10">
-          <div class="muted" id="sync-start-state" style="margin:4px 0 0;font-size:12px"></div>
-          <div class="banner warn" style="margin-top:10px">Garmin rate-limits unofficial
+            current window)</span><span class="save-state" id="sync-start-saved"></span></label>
+          <input id="cfg-sync-start" type="date" class="date-input">
+          <div class="save-note" id="sync-start-state"></div>
+          <div class="banner warn" style="margin-top:12px">Garmin rate-limits unofficial
             clients and can suspend accounts that hammer it. Syncs are spaced and auto-back-off on
             failures.</div>
         </div>
@@ -668,41 +789,41 @@
 
       <div id="sub-config" class="hidden">
         <div class="card">
-          <h3 style="margin:0 0 10px">Your preferences</h3>
-           <div class="banner err hidden" id="cfg-error"></div>
-           <label>Home city <span class="muted">(for the training-plan weather forecast)</span></label>
+          <h3 class="card-title">Your preferences</h3>
+          <div class="save-note" style="margin:-4px 0 6px">Changes save automatically.</div>
+          <div class="banner err hidden" id="cfg-error"></div>
+          <label for="cfg-home-city">Home city <span class="muted">(for the training-plan weather forecast)</span><span class="save-state" data-saved-for="cfg-home-city"></span></label>
           <input id="cfg-home-city" type="text" autocomplete="off" placeholder="e.g. Bratislava">
-          <label>Home country</label>
+          <label for="cfg-home-country">Home country<span class="save-state" data-saved-for="cfg-home-country"></span></label>
           <input id="cfg-home-country" type="text" autocomplete="off" placeholder="e.g. Slovakia">
-           <label>Don't fetch these Garmin features (check what you don't have)</label>
-           <div id="cfg-excluded"></div>
-           <label for="cfg-reasoning">Agent reasoning effort</label>
-           <select id="cfg-reasoning">
-             <option value="">Default (server .env)</option>
-             <option value="low">Low</option>
-             <option value="medium">Medium</option>
-             <option value="high">High</option>
-           </select>
-           <div class="muted" style="font-size:12px">How hard the AI agent thinks before answering (Gemini/OpenAI reasoning effort).</div>
-           <label>Coaching context</label>
-           <button type="button" class="setting-row" id="open-principles">
-             <span class="setting-row-text">
-               <span class="setting-row-name">Training principles</span>
-               <span class="muted" id="principles-summary">Not set</span>
-             </span>
-             <span class="setting-row-action">Edit</span>
-           </button>
-           <button type="button" class="setting-row" id="open-memory">
-             <span class="setting-row-text">
-               <span class="setting-row-name">Long-term memory</span>
-               <span class="muted" id="memory-summary">No facts yet</span>
-             </span>
-             <span class="setting-row-action">Edit</span>
-           </button>
-           <div class="muted" style="font-size:12px">Training principles are authoritative coaching instructions; long-term memory holds facts the agent remembers about you (and updates during chat). Click either to edit.</div>
-           <textarea id="cfg-principles" class="hidden"></textarea>
-           <textarea id="cfg-memory" class="hidden"></textarea>
-           <div style="margin-top:16px"><button id="btn-save-config">Save config</button></div>
+          <label>Don't fetch these Garmin features (check what you don't have)<span class="save-state" data-saved-for="cfg-excluded"></span></label>
+          <div id="cfg-excluded"></div>
+          <label for="cfg-reasoning">Agent reasoning effort<span class="save-state" data-saved-for="cfg-reasoning"></span></label>
+          <select id="cfg-reasoning">
+            <option value="">Default (server .env)</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+          <div class="save-note">How hard the AI agent thinks before answering (Gemini/OpenAI reasoning effort).</div>
+          <label>Coaching context</label>
+          <button type="button" class="setting-row" id="open-principles">
+            <span class="setting-row-text">
+              <span class="setting-row-name">Training principles</span>
+              <span class="muted" id="principles-summary">Not set</span>
+            </span>
+            <span class="setting-row-action">Edit</span>
+          </button>
+          <button type="button" class="setting-row" id="open-memory">
+            <span class="setting-row-text">
+              <span class="setting-row-name">Long-term memory</span>
+              <span class="muted" id="memory-summary">No facts yet</span>
+            </span>
+            <span class="setting-row-action">Edit</span>
+          </button>
+          <div class="save-note">Training principles are authoritative coaching instructions; long-term memory holds facts the agent remembers about you (and updates during chat). Click either to edit.</div>
+          <textarea id="cfg-principles" class="hidden"></textarea>
+          <textarea id="cfg-memory" class="hidden"></textarea>
         </div>
       </div>
     </div>
@@ -785,11 +906,11 @@
       <div class="step-hint" id="pm-steps-total">No structured steps</div>
       <div style="margin-top:4px">
         <label style="margin:0 0 4px">Training Phase</label>
-        <div id="pm-phase-badge" class="badge" style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;font-size:12.5px;color:var(--text)">📍 Standalone workout</div>
+        <div id="pm-phase-badge" class="phase-badge">Standalone workout</div>
       </div>
       <div class="modal-actions">
-        <button id="pm-delete" class="secondary" style="border-color:var(--err);color:var(--err)">Delete</button>
-        <span></span>
+        <button id="pm-delete" class="danger">Delete</button>
+        <span class="spacer"></span>
         <button id="pm-cancel" class="secondary">Cancel</button>
         <button id="pm-save">Save</button>
       </div>
@@ -804,7 +925,7 @@
       <div id="goal-modal-body"></div>
       <div class="modal-actions">
         <button id="goal-undo" class="secondary" title="Restore the goals/blocks from before the last destructive save">Undo last save</button>
-        <span></span>
+        <span class="spacer"></span>
         <button id="goal-cancel" class="secondary">Close</button>
         <button id="goal-new" class="secondary">New goal</button>
         <button id="goal-save">Save goal</button>
@@ -820,7 +941,7 @@
       <textarea id="tm-text" rows="14"></textarea>
       <div class="muted" id="tm-help" style="font-size:12px"></div>
       <div class="modal-actions">
-        <span></span>
+        <span class="spacer"></span>
         <button id="tm-cancel" class="secondary">Cancel</button>
         <button id="tm-save">Save</button>
       </div>
@@ -871,8 +992,27 @@ function api(path, body, method) {
   });
 }
 
-function showAuth() { $("auth").style.display = ""; $("app").style.display = "none"; }
-function showApp() { $("auth").style.display = "none"; $("app").style.display = "flex"; }
+// Leaving the app (sign-out or expired session) drops everything tied to the
+// previous user so the next sign-in starts clean.
+function showAuth() {
+  $("auth").style.display = ""; $("app").style.display = "none";
+  $("app-tabs").classList.add("hidden");
+  $("who").textContent = "";
+  $("logout").classList.add("hidden");
+  clearTimeout(statusTimer);
+  planLoadSeq++;   // drop any plan load still in flight for the old user
+  $("chat").innerHTML = "";
+  $("plan-week").innerHTML = "";
+  for (const k of Object.keys(TODAY_CARDS)) delete TODAY_CARDS[k];
+  planGoals = []; planWorkouts = []; planActivities = []; planActiveBlocks = [];
+  planSelectedGoalId = null;
+  planWeatherByDate = {};
+  planWeekStart = mondayOf(new Date());
+}
+function showApp() {
+  $("auth").style.display = "none"; $("app").style.display = "flex";
+  $("app-tabs").classList.remove("hidden");
+}
 
 function switchTab(which) {
   $("tab-login").classList.toggle("active", which === "login");
@@ -887,24 +1027,41 @@ function switchTab(which) {
   $("btn-register").textContent = "Create account";
 }
 
+// The open tab lives in the URL hash (#plan), so reload keeps it and the
+// browser's back/forward buttons move between tabs.
+const APP_TABS = ["chat", "today", "plan", "settings"];
+function tabFromHash() {
+  const t = location.hash.replace(/^#/, "");
+  return APP_TABS.includes(t) ? t : "chat";
+}
+
 async function switchAppTab(which) {
   for (const b of document.querySelectorAll("#app-tabs button")) {
     b.classList.toggle("active", b.dataset.tab === which);
+    b.setAttribute("aria-current", b.dataset.tab === which ? "page" : "false");
   }
   $("tab-chat").classList.toggle("hidden", which !== "chat");
   $("tab-today").classList.toggle("hidden", which !== "today");
   $("tab-plan").classList.toggle("hidden", which !== "plan");
   $("tab-settings").classList.toggle("hidden", which !== "settings");
   if (which === "today") loadToday();
-  if (which === "plan") { await loadPlan(); loadBriefing(); }
+  if (which === "plan") await loadPlan();
+  if (which === "settings") loadSettingsSubTab();
 }
 
+let settingsSubTab = "sync";
 function switchSettingsSubTab(which) {
+  settingsSubTab = which;
   for (const b of document.querySelectorAll("#settings-tabs button")) {
     b.classList.toggle("active", b.dataset.subtab === which);
   }
   $("sub-sync").classList.toggle("hidden", which !== "sync");
   $("sub-config").classList.toggle("hidden", which !== "config");
+  loadSettingsSubTab();
+}
+function loadSettingsSubTab() {
+  if (settingsSubTab === "config") loadConfig();
+  else { loadAutoSync(); refreshStatus(); }
 }
 
 function setErr(el, msg) { el.textContent = msg || ""; el.classList.toggle("hidden", !msg); }
@@ -920,6 +1077,86 @@ function clearBusy(btn) {
   btn.disabled = false;
   btn.removeAttribute("data-busy");
   if (btn.dataset.orig) { btn.innerHTML = btn.dataset.orig; delete btn.dataset.orig; }
+}
+
+// Inline SVG icons (stroke = currentColor) — emoji render differently on every
+// OS/browser; these don't.
+const ICONS = {
+  eye: '<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M17.9 17.9A10.4 10.4 0 0 1 12 19C5 19 1 12 1 12a18.5 18.5 0 0 1 5.1-5.9M9.9 5.2A9.6 9.6 0 0 1 12 5c7 0 11 7 11 7a18.6 18.6 0 0 1-2.2 3.2M14.1 14.1a3 3 0 1 1-4.2-4.2"/><path d="M1 1l22 22"/>',
+  pin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  circle: '<circle cx="12" cy="12" r="8"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+};
+function icon(name) {
+  const s = document.createElement("span");
+  s.className = "ico";
+  s.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[name] + "</svg>";
+  return s;
+}
+// Replace an element's content with an icon followed by plain text.
+function setIconText(el, name, text) {
+  el.innerHTML = "";
+  el.appendChild(icon(name));
+  el.appendChild(document.createTextNode(text));
+}
+
+// Toasts: short confirmations/errors, optionally with one action (e.g. Undo).
+function toast(msg, opts) {
+  const o = opts || {};
+  const t = document.createElement("div");
+  t.className = "toast" + (o.type ? " " + o.type : "");
+  t.setAttribute("role", o.type === "err" ? "alert" : "status");
+  const text = document.createElement("span");
+  text.textContent = msg;
+  t.appendChild(text);
+  let timer = null;
+  const dismiss = () => {
+    clearTimeout(timer);
+    if (!t.isConnected) return;
+    t.classList.add("leaving");
+    setTimeout(() => t.remove(), 200);
+  };
+  if (o.action) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = o.action.label;
+    b.addEventListener("click", () => { dismiss(); o.action.fn(); });
+    t.appendChild(b);
+  }
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "t-x";
+  x.setAttribute("aria-label", "Dismiss");
+  x.textContent = "×";
+  x.addEventListener("click", dismiss);
+  t.appendChild(x);
+  $("toasts").appendChild(t);
+  timer = setTimeout(dismiss, o.timeout || (o.action ? 7000 : 3500));
+  return dismiss;
+}
+
+// Undo the last destructive plan edit (workout/goal delete) via the server's
+// season-wide snapshot, then refresh whatever shows the plan.
+async function undoSeason(label) {
+  try {
+    await api("/training/undo", {}, "POST");
+    toast(label + " restored", { type: "ok" });
+  } catch (e) { toast("Undo failed: " + e.message, { type: "err" }); }
+  loadPlan();
+}
+
+// Brief "Saved ✓" next to a settings field (or the error, which stays).
+const savedTimers = new WeakMap();
+function flashSaved(el, err) {
+  if (!el) return;
+  clearTimeout(savedTimers.get(el));
+  el.classList.toggle("err", !!err);
+  el.textContent = err ? "Couldn't save: " + err : "Saved ✓";
+  el.classList.add("show");
+  if (!err) savedTimers.set(el, setTimeout(() => el.classList.remove("show"), 2000));
 }
 
 async function loginFlow() {
@@ -1013,12 +1250,13 @@ async function registerFlow() {
 
 function wirePasswordToggles() {
   document.querySelectorAll(".pwd-toggle").forEach((btn) => {
+    btn.replaceChildren(icon("eye"));
     btn.addEventListener("click", () => {
       const input = $(btn.dataset.for);
       if (!input) return;
       const isPwd = input.type === "password";
       input.type = isPwd ? "text" : "password";
-      btn.textContent = isPwd ? "🙈" : "👁";
+      btn.replaceChildren(icon(isPwd ? "eyeOff" : "eye"));
       btn.title = isPwd ? "Hide password" : "Show password";
       btn.setAttribute("aria-label", isPwd ? "Hide password" : "Show password");
     });
@@ -1280,6 +1518,7 @@ function autoResizeQuestion() {
 function wirePromptChips() {
   document.querySelectorAll(".prompt-chip").forEach((btn) => {
     btn.addEventListener("click", () => {
+      if (asking) return;
       $("question").value = btn.dataset.prompt;
       autoResizeQuestion();
       ask();
@@ -1287,13 +1526,51 @@ function wirePromptChips() {
   });
 }
 
+// True when the chat is scrolled to (or within a few lines of) the bottom, so
+// streaming only keeps following the answer if the user hasn't scrolled up.
+function chatNearBottom() {
+  const box = $("chat");
+  return box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+}
+
+// One question at a time: Enter and the prompt chips bypass the Ask button, so
+// the guard lives here. While a question runs, the Ask button becomes Stop.
+let asking = false;
+let askAbort = null;
+
+function setAsking(on) {
+  asking = on;
+  const btn = $("btn-ask");
+  btn.textContent = on ? "Stop" : "Ask";
+  btn.classList.toggle("stop", on);
+  btn.title = on ? "Stop generating this answer" : "";
+  $("btn-new-chat").disabled = on;
+  $("btn-compact").disabled = on;
+}
+
+function chatNote(text) {
+  const n = document.createElement("div");
+  n.className = "msg note";
+  n.textContent = text;
+  $("chat").appendChild(n);
+  return n;
+}
+
+// The empty-chat welcome shows whenever the message box has nothing in it,
+// however it got emptied (new chat, compact, sign-out, first load).
+function syncChatEmpty() {
+  $("chat-empty").classList.toggle("hidden", $("chat").childElementCount > 0);
+}
+
 async function ask() {
+  if (asking) return;
   const q = $("question").value.trim();
   if (!q) return;
+  setAsking(true);
+  askAbort = new AbortController();
   addMsg("user", q);
   $("question").value = "";
   autoResizeQuestion();
-  $("btn-ask").disabled = true;
 
   const msgEl = document.createElement("div");
   msgEl.className = "msg assistant";
@@ -1311,6 +1588,8 @@ async function ask() {
   $("chat").appendChild(msgEl);
   $("chat").scrollTop = $("chat").scrollHeight;
 
+  let accumulatedText = "";
+  let renderTimer = null;
   try {
     const res = await fetch(API + "/ask", {
       method: "POST",
@@ -1319,6 +1598,7 @@ async function ask() {
         "Authorization": "Bearer " + token,
       },
       body: JSON.stringify({ question: q, stream: true }),
+      signal: askAbort.signal,
     });
 
     if (res.status === 401) {
@@ -1337,9 +1617,16 @@ async function ask() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let accumulatedText = "";
       let isStreamingText = false;
       let finalData = null;
+      // Re-parsing the whole answer on every delta is quadratic; render at most
+      // every 50 ms instead (a timer, not rAF, which stalls in background tabs).
+      const renderStream = () => {
+        renderTimer = null;
+        const stick = chatNearBottom();
+        bubbleEl.innerHTML = renderMarkdown(accumulatedText);
+        if (stick) $("chat").scrollTop = $("chat").scrollHeight;
+      };
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1374,8 +1661,7 @@ async function ask() {
               bubbleEl.innerHTML = "";
             }
             accumulatedText += payload.text;
-            bubbleEl.innerHTML = renderMarkdown(accumulatedText);
-            $("chat").scrollTop = $("chat").scrollHeight;
+            if (!renderTimer) renderTimer = setTimeout(renderStream, 50);
           } else if (eventType === "done") {
             finalData = payload;
           } else if (eventType === "error") {
@@ -1385,8 +1671,12 @@ async function ask() {
       }
 
       if (finalData) {
+        // addMsg jumps to the bottom; keep the reader's place if they scrolled up.
+        const stick = chatNearBottom();
+        const top = $("chat").scrollTop;
         msgEl.remove();
         addMsg("assistant", finalData.answer, finalData.chart_specs || [], finalData.chart_figures || []);
+        if (!stick) $("chat").scrollTop = top;
         updateTokens(finalData.tokens);
       } else if (accumulatedText) {
         updateTokens(Math.round(accumulatedText.length / 4));
@@ -1400,16 +1690,25 @@ async function ask() {
       updateTokens(data.tokens);
     }
   } catch (e) {
+    clearTimeout(renderTimer);
     msgEl.remove();
-    addMsg("assistant", "Error: " + e.message);
+    if (e.name === "AbortError") {
+      // Keep whatever had streamed in so far.
+      if (accumulatedText) addMsg("assistant", accumulatedText);
+      chatNote("Stopped.");
+      $("chat").scrollTop = $("chat").scrollHeight;
+    } else {
+      addMsg("assistant", "Error: " + e.message);
+    }
   } finally {
-    $("btn-ask").disabled = false;
+    askAbort = null;
+    setAsking(false);
     $("question").focus();
   }
 }
 
 async function triggerSync() {
-  $("btn-sync").disabled = true;
+  setBusy($("btn-sync"), "Starting…");
   try {
     const data = await api("/sync", {});
     if (data.running) {
@@ -1419,18 +1718,18 @@ async function triggerSync() {
       $("sync-status").textContent = "sync queued";
       pollStatus();
     }
-  } catch (e) { setErr($("sync-error"), e.message); } finally { $("btn-sync").disabled = false; }
+  } catch (e) { setErr($("sync-error"), e.message); } finally { clearBusy($("btn-sync")); }
 }
 
 async function triggerSyncFull() {
-  $("btn-sync-full").disabled = true;
+  setBusy($("btn-sync-full"), "Starting…");
   try {
     const data = await api("/sync/full", {});
     $("sync-status").textContent = data.queued
       ? "sync + full re-parse queued…"
       : "a sync is already running — please wait";
     pollStatus();
-  } catch (e) { setErr($("sync-error"), e.message); } finally { $("btn-sync-full").disabled = false; }
+  } catch (e) { setErr($("sync-error"), e.message); } finally { clearBusy($("btn-sync-full")); }
 }
 
 let statusTimer = null;
@@ -1508,26 +1807,89 @@ function fmt(d) {
        + "-" + String(d.getDate()).padStart(2, "0");
 }
 
+// Human dates for labels: "Sep 28" (plus the year when it isn't this year, or
+// when asked).
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function fmtDay(d, withYear) {
+  const s = MONTHS[d.getMonth()] + " " + d.getDate();
+  return (withYear || d.getFullYear() !== new Date().getFullYear()) ? s + ", " + d.getFullYear() : s;
+}
+// "Sep 28 – Oct 4"; "Dec 29, 2025 – Jan 4, 2026" across a year boundary.
+function fmtRange(a, b) {
+  const thisYear = new Date().getFullYear();
+  const showYear = a.getFullYear() !== b.getFullYear() || a.getFullYear() !== thisYear;
+  const left = MONTHS[a.getMonth()] + " " + a.getDate() + (showYear ? ", " + a.getFullYear() : "");
+  const right = (a.getMonth() === b.getMonth() && !showYear ? "" : MONTHS[b.getMonth()] + " ")
+    + b.getDate() + (showYear ? ", " + b.getFullYear() : "");
+  return left + " – " + right;
+}
+
+// Placeholder week while the first load is in flight (later loads just dim the
+// current grid so nothing jumps).
+function renderPlanSkeleton() {
+  const grid = $("plan-week");
+  grid.innerHTML = "";
+  for (let i = 0; i < 7; i++) {
+    const day = document.createElement("div");
+    day.className = "plan-day";
+    for (const [w, h] of [["55%", 12], ["100%", 46]]) {
+      const s = document.createElement("span");
+      s.className = "skel";
+      s.style.cssText = "width:" + w + ";height:" + h + "px;margin-bottom:8px";
+      day.appendChild(s);
+    }
+    grid.appendChild(day);
+  }
+}
+
+function updatePlanWeekLabel() {
+  const end = new Date(planWeekStart);
+  end.setDate(end.getDate() + 6);
+  $("plan-week-label").textContent = fmtRange(planWeekStart, end);
+  // "Today" is only useful when you've navigated away from this week.
+  $("btn-plan-today").disabled = fmt(planWeekStart) === fmt(mondayOf(new Date()));
+}
+
+// Bumped by every loadPlan (and on sign-out). A load checks it after each await
+// and bails if a newer one started, so rapid prev/next clicks can't let a slow
+// response for an old week overwrite the current one.
+let planLoadSeq = 0;
+const planLoadStale = (seq) => seq != null && seq !== planLoadSeq;
+
 async function loadPlan() {
+  const seq = ++planLoadSeq;
   initOnboardBanner();
   const end = new Date(planWeekStart);
   end.setDate(end.getDate() + 6);
   const fromStr = fmt(planWeekStart);
   const toStr = fmt(end);
+  updatePlanWeekLabel();
+  const grid = $("plan-week");
+  if (!grid.querySelector(".plan-day[data-date]")) renderPlanSkeleton();
+  else grid.classList.add("loading");
   try {
     const [planRes, actRes] = await Promise.all([
       api("/training/workouts?from_date=" + fromStr + "&to_date=" + toStr, undefined, "GET"),
       api("/activities?from_date=" + fromStr + "&to_date=" + toStr, undefined, "GET").catch(() => null),
     ]);
+    if (planLoadStale(seq)) return;
     planWorkouts = planRes.workouts || [];
     planActivities = (actRes && actRes.activities) || [];
     renderPlan(planWorkouts);
     setErr($("plan-error"), "");
-  } catch (e) { planWorkouts = []; planActivities = []; setErr($("plan-error"), e.message); }
-  await loadAnchor(fromStr);
-  await loadWeather(fromStr, toStr);
+  } catch (e) {
+    if (planLoadStale(seq)) return;
+    planWorkouts = []; planActivities = []; setErr($("plan-error"), e.message);
+    renderPlan([]);
+  } finally {
+    if (!planLoadStale(seq)) grid.classList.remove("loading");
+  }
+  await loadAnchor(fromStr, seq);
+  if (planLoadStale(seq)) return;
+  await loadWeather(fromStr, toStr, seq);
+  if (planLoadStale(seq)) return;
   applyPlanView();
-  if (planView === "list") await loadPlanList();
+  if (planView === "list") await loadPlanList(seq);
 }
 
 function applyPlanView() {
@@ -1542,11 +1904,11 @@ function applyPlanView() {
 async function setPlanView(view) {
   planView = view;
   applyPlanView();
-  if (view === "list") await loadPlanList();
+  if (view === "list") await loadPlanList(planLoadSeq);
 }
 
 // 8-week list view: the season shape at a glance, grouped by week.
-async function loadPlanList() {
+async function loadPlanList(seq) {
   const box = $("plan-list");
   if (!box) return;
   const start = new Date(planWeekStart);
@@ -1557,8 +1919,10 @@ async function loadPlanList() {
   try {
     const data = await api(
       "/training/workouts?from_date=" + fmt(start) + "&to_date=" + fmt(end), undefined, "GET");
+    if (planLoadStale(seq)) return;
     workouts = data.workouts || [];
   } catch (e) {
+    if (planLoadStale(seq)) return;
     box.innerHTML = "";
     setErr($("plan-error"), e.message);
     return;
@@ -1596,7 +1960,7 @@ function renderPlanList(workouts) {
     const head = document.createElement("div");
     head.className = "pl-week-head";
     const label = document.createElement("span");
-    label.textContent = "Week of " + ws;
+    label.textContent = "Week of " + fmtDay(parseISO(ws));
     head.appendChild(label);
     const range = document.createElement("span");
     range.className = "pl-range";
@@ -1617,7 +1981,7 @@ function renderPlanList(workouts) {
         + (w.status === "skipped" ? " skipped" : "");
       const date = document.createElement("span");
       date.className = "pl-date";
-      date.textContent = w.planned_date.slice(5) + " " + DAY_LABELS[(parseISO(w.planned_date).getDay() + 6) % 7];
+      date.textContent = DAY_LABELS[(parseISO(w.planned_date).getDay() + 6) % 7] + " " + parseISO(w.planned_date).getDate();
       row.appendChild(date);
       const badge = document.createElement("span");
       badge.className = "pl-badge";
@@ -1639,7 +2003,7 @@ function renderPlanList(workouts) {
   }
 }
 
-async function loadAnchor(weekStart) {
+async function loadAnchor(weekStart, seq) {
   const box = $("plan-anchor");
   if (!box) return;
   let goals = [];
@@ -1648,6 +2012,7 @@ async function loadAnchor(weekStart) {
     const data = await api("/training/anchor" + q, undefined, "GET");
     goals = data.goals || [];
   } catch (e) { goals = []; }
+  if (planLoadStale(seq)) return;
   renderAnchor(goals);
 }
 
@@ -1660,8 +2025,6 @@ function renderAnchor(goals) {
   if (!g) {
     box.classList.add("hidden");
     box.innerHTML = "";
-    const wp = $("plan-week-progress");
-    if (wp) wp.innerHTML = "";
     planActiveBlocks = [];
     applyBlockHighlight();
     return;
@@ -1810,8 +2173,14 @@ function renderOneAnchor(container, anchor) {
     box.appendChild(sub);
   }
 
+  // This week's target-vs-actual bar sits on the ribbon, next to the week it
+  // describes.
+  const wp = document.createElement("div");
+  wp.className = "wp-host";
+  renderWeeklyProgressInto(wp, anchor);
+  box.appendChild(wp);
+
   box.addEventListener("click", () => openGoalDrawer(anchor));
-  renderWeeklyProgressInto($("plan-week-progress"), anchor);
   container.appendChild(box);
 }
 
@@ -1886,7 +2255,8 @@ function goalDateBadge(G) {
     { day: "numeric", month: "long", year: "numeric" });
   const badge = document.createElement("div");
   badge.className = "gd-badge";
-  badge.appendChild(document.createTextNode("📅 " + when));
+  badge.appendChild(icon("calendar"));
+  badge.appendChild(document.createTextNode(when));
   const d = document.createElement("span");
   d.className = "gd-days";
   d.textContent = "(" + days + " days)";
@@ -2153,7 +2523,7 @@ function wxCondition(code) {
   return { sym: "🌡️", label: "" };
 }
 
-async function loadWeather(fromStr, toStr) {
+async function loadWeather(fromStr, toStr, seq) {
   const cells = Array.from(document.querySelectorAll("#plan-week .plan-day[data-date]"));
   for (const c of cells) {
     const slot = c.querySelector(".wx-slot");
@@ -2165,6 +2535,7 @@ async function loadWeather(fromStr, toStr) {
       "&to_date=" + encodeURIComponent(toStr), undefined, "GET");
     days = data.days || [];
   } catch (e) { return; } // no coords / forecast unavailable -> just hide weather
+  if (planLoadStale(seq)) return;
   const map = {};
   for (const d of days) map[d.date] = d;
   planWeatherByDate = map;
@@ -2381,19 +2752,26 @@ function renderPlan(workouts) {
     }
     const head = document.createElement("div");
     head.className = "plan-day-header";
+    const left = document.createElement("span");
+    left.className = "plan-day-left";
     const dow = document.createElement("span");
     dow.className = "dow";
     dow.textContent = DAY_LABELS[i];
+    const dnum = document.createElement("span");
+    dnum.className = "dnum";
+    dnum.textContent = String(d.getDate());
+    left.appendChild(dow); left.appendChild(dnum);
+    if (iso === today) {
+      const pill = document.createElement("span");
+      pill.className = "today-pill";
+      pill.textContent = "Today";
+      left.appendChild(pill);
+    }
     // Weather lives in a fixed-width slot so headers stay uniform whether or not
     // a forecast is available (no layout shift, no per-day special cases).
-    const right = document.createElement("span");
-    right.className = "plan-day-right";
     const wxSlot = document.createElement("span");
     wxSlot.className = "wx-slot";
-    const dnum = document.createElement("span");
-    dnum.textContent = iso.slice(8);
-    right.appendChild(wxSlot); right.appendChild(dnum);
-    head.appendChild(dow); head.appendChild(right);
+    head.appendChild(left); head.appendChild(wxSlot);
     day.appendChild(head);
     const dayWorkouts = byDate[iso] || [];
     // Completed, rest, and empty past days are "spent" — fade them so Today and
@@ -2403,34 +2781,43 @@ function renderPlan(workouts) {
       : iso < today;
     if (lowPriority && iso !== today) day.classList.add("dim");
     const list = document.createElement("div");
+    list.className = "plan-list-cards";
     for (const w of dayWorkouts) list.appendChild(workoutCard(w));
-    if (!dayWorkouts.length) {
-      const empty = document.createElement("div");
-      empty.className = "plan-empty";
-      // A past day with no planned workout and no synced activity was a rest
-      // day in practice — say so instead of an opaque dash.
-      const hadActivity = planActivities.some((a) => a.start_date === iso);
-      if (iso < today && !hadActivity) {
-        empty.classList.add("rest");
-        empty.textContent = "Rest";
-        empty.title = "No workout planned and nothing synced that day";
-      } else {
-        empty.textContent = "—";
-      }
-      list.appendChild(empty);
-    }
-    const add = document.createElement("button");
-    add.className = "plan-add";
-    add.textContent = "+ add";
-    add.addEventListener("click", () => openPlanModal(null, iso));
     day.appendChild(list);
-    day.appendChild(add);
+    if (!dayWorkouts.length && iso >= today) {
+      // An empty upcoming day is itself the add target.
+      const addDay = document.createElement("button");
+      addDay.type = "button";
+      addDay.className = "plan-empty-add";
+      addDay.textContent = "+ Add workout";
+      addDay.addEventListener("click", () => openPlanModal(null, iso));
+      list.appendChild(addDay);
+    } else {
+      if (!dayWorkouts.length) {
+        const empty = document.createElement("div");
+        empty.className = "plan-empty";
+        // A past day with no planned workout and no synced activity was a rest
+        // day in practice — say so instead of an opaque dash.
+        const hadActivity = planActivities.some((a) => a.start_date === iso);
+        if (!hadActivity) {
+          empty.classList.add("rest");
+          empty.textContent = "Rest";
+          empty.title = "No workout planned and nothing synced that day";
+        } else {
+          empty.textContent = "—";
+        }
+        list.appendChild(empty);
+      }
+      const add = document.createElement("button");
+      add.className = "plan-add";
+      add.textContent = "+ add";
+      add.addEventListener("click", () => openPlanModal(null, iso));
+      day.appendChild(add);
+    }
     installDayDrop(day);
     grid.appendChild(day);
   }
-  const end = new Date(planWeekStart);
-  end.setDate(end.getDate() + 6);
-  $("plan-week-label").textContent = fmt(planWeekStart) + " — " + fmt(end);
+  updatePlanWeekLabel();
 }
 
 // Decimal min/km -> "M:SS /km" (5.5 -> "5:30 /km").
@@ -2736,11 +3123,20 @@ function installDayDrop(day) {
     const w = dragWorkout;
     dragWorkout = null;
     if (!w || target === w.planned_date) return;
+    const from = w.planned_date;
     try {
       setErr($("plan-error"), "");
       await api("/training/workouts/" + w.id, { planned_date: target }, "PATCH");
       loadPlan();
-    } catch (err) { setErr($("plan-error"), err.message); }
+      toast("Moved " + (w.title || w.activity_type) + " to " + fmtDay(parseISO(target)), {
+        action: { label: "Undo", fn: async () => {
+          try {
+            await api("/training/workouts/" + w.id, { planned_date: from }, "PATCH");
+          } catch (e) { toast("Undo failed: " + e.message, { type: "err" }); }
+          loadPlan();
+        } },
+      });
+    } catch (err) { toast("Couldn't move workout: " + err.message, { type: "err" }); }
   });
 }
 
@@ -2753,7 +3149,7 @@ function updateWorkoutPhaseBadge() {
   const d = $("pm-date") ? $("pm-date").value.trim() : "";
   const type = $("pm-type") ? $("pm-type").value.trim() : "";
   if (!d) {
-    badge.textContent = "📍 Pick a date";
+    setIconText(badge, "pin", "Pick a date");
     return;
   }
   let bestBlock = null;
@@ -2775,7 +3171,7 @@ function updateWorkoutPhaseBadge() {
     }
   }
   if (bestBlock && bestGoal) {
-    badge.textContent = "📍 " + (bestBlock.name || "Block") + " · " + (bestGoal.title || "Goal");
+    setIconText(badge, "pin", (bestBlock.name || "Block") + " · " + (bestGoal.title || "Goal"));
     return;
   }
   for (const g of planGoals) {
@@ -2783,11 +3179,11 @@ function updateWorkoutPhaseBadge() {
     const sport = goal.sport;
     const sportMatch = !sport || sport === "other" || sport === "rest" || !type || type === "other" || type === "rest" || sport === type;
     if (sportMatch && (!goal.start_date || goal.start_date <= d) && (!goal.target_date || goal.target_date >= d)) {
-      badge.textContent = "🎯 " + (goal.title || "Goal") + " (Unphased)";
+      setIconText(badge, "target", (goal.title || "Goal") + " (Unphased)");
       return;
     }
   }
-  badge.textContent = "⚪ Standalone workout";
+  setIconText(badge, "circle", "Standalone workout");
 }
 
 // ---- Structured-workout step editor ----------------------------------------
@@ -2945,16 +3341,21 @@ async function savePlan() {
     else await api("/training/workouts", body, "POST");
     closePlanModal();
     loadPlan();
+    toast(planEditId ? "Workout saved" : "Workout added", { type: "ok" });
   } catch (e) { setErr($("plan-modal-error"), e.message); }
 }
 
 async function deletePlan() {
   if (!planEditId) return;
+  // No confirm dialog: a delete snapshots the season server-side, so the toast
+  // offers Undo instead.
+  const title = $("pm-title").value.trim() || "Workout";
   setErr($("plan-modal-error"), "");
   try {
     await api("/training/workouts/" + planEditId, undefined, "DELETE");
     closePlanModal();
     loadPlan();
+    toast("Deleted " + title, { action: { label: "Undo", fn: () => undoSeason(title) } });
   } catch (e) { setErr($("plan-modal-error"), e.message); }
 }
 
@@ -2998,8 +3399,8 @@ function goalField(label, id, value, attrs) {
   wrap.appendChild(l);
   const inp = document.createElement("input");
   inp.id = id;
-  inp.value = value == null ? "" : value;
   Object.assign(inp, attrs || {});
+  inp.value = value == null ? "" : value;
   wrap.appendChild(inp);
   return wrap;
 }
@@ -3052,20 +3453,20 @@ function renderGoalEditor() {
     goalSelect("Sport", "gm-sport", G.sport,
       ["", "run", "cycle", "swim", "strength", "rest", "other"])));
   form.appendChild(goalRow(
-    goalField("Start date", "gm-start", G.start_date, { placeholder: "YYYY-MM-DD" }),
-    goalField("Target date", "gm-date", G.target_date, { placeholder: "YYYY-MM-DD" })));
+    goalField("Start date", "gm-start", G.start_date, { type: "date" }),
+    goalField("Target date", "gm-date", G.target_date, { type: "date" })));
   form.appendChild(goalRow(
     goalField("Distance (km)", "gm-dist", G.target_distance_km,
       { type: "number", step: "any", min: "0" }),
     goalField("Target time", "gm-time", G.target_time, { placeholder: "3:45:00" })));
 
   const bh = document.createElement("div");
-  bh.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:8px";
+  bh.className = "block-head-row";
   const bt = document.createElement("b");
   bt.textContent = "Blocks & weeks";
   bh.appendChild(bt);
   const addBlock = document.createElement("button");
-  addBlock.className = "secondary";
+  addBlock.className = "secondary sm";
   addBlock.textContent = "+ block";
   addBlock.addEventListener("click", () => {
     goalDraft.blocks.push({ name: "", weeks: [] });
@@ -3074,11 +3475,11 @@ function renderGoalEditor() {
   bh.appendChild(addBlock);
   if (goalEditId != null) {
     const delGoal = document.createElement("button");
-    delGoal.className = "secondary";
-    delGoal.style.cssText = "margin-left:auto;border-color:var(--err);color:var(--err)";
+    delGoal.className = "danger sm";
     delGoal.textContent = "Delete goal";
     delGoal.addEventListener("click", async () => {
-      if (!window.confirm("Delete this goal and its blocks? Planned workouts are detached.")) return;
+      // No confirm dialog: the delete snapshots the season, so the toast offers Undo.
+      const name = (goalDraft.goal && goalDraft.goal.title) || "Goal";
       try {
         await api("/training/anchor/" + goalEditId, undefined, "DELETE");
         goalEditId = null;
@@ -3086,6 +3487,15 @@ function renderGoalEditor() {
         await loadAnchor(fmt(planWeekStart));
         renderGoalEditor();
         loadPlan();
+        toast("Deleted " + name + " (planned workouts were detached)", {
+          action: { label: "Undo", fn: async () => {
+            await undoSeason(name);
+            if (!$("goal-modal").classList.contains("hidden")) {
+              await loadAnchor(fmt(planWeekStart));
+              renderGoalEditor();
+            }
+          } },
+        });
       } catch (e) { setErr($("goal-modal-error"), e.message); }
     });
     bh.appendChild(delGoal);
@@ -3101,8 +3511,8 @@ function blockField(label, key, block, attrs, onChange) {
   l.textContent = label;
   wrap.appendChild(l);
   const inp = document.createElement("input");
-  inp.value = block[key] == null ? "" : block[key];
   Object.assign(inp, attrs || {});
+  inp.value = block[key] == null ? "" : block[key];
   inp.addEventListener("input", () => { block[key] = inp.value; });
   if (onChange) inp.addEventListener("change", onChange);
   wrap.appendChild(inp);
@@ -3138,8 +3548,7 @@ function blockEditor(block, bi) {
   title.textContent = "Block " + (bi + 1) + (block.name ? " · " + block.name : "");
   head.appendChild(title);
   const del = document.createElement("button");
-  del.className = "secondary";
-  del.style.cssText = "border-color:var(--err);color:var(--err)";
+  del.className = "danger sm";
   del.textContent = "Remove";
   del.addEventListener("click", () => {
     goalDraft.blocks.splice(bi, 1);
@@ -3152,14 +3561,14 @@ function blockEditor(block, bi) {
     blockField("Name", "name", block, { placeholder: "Base" }),
     blockField("Focus", "focus", block, { placeholder: "aerobic" })));
   card.appendChild(goalRow(
-    blockField("Start", "start_date", block, { placeholder: "YYYY-MM-DD" }, () => fitWeeks(block)),
-    blockField("End", "end_date", block, { placeholder: "YYYY-MM-DD" }, () => fitWeeks(block))));
+    blockField("Start", "start_date", block, { type: "date" }, () => fitWeeks(block)),
+    blockField("End", "end_date", block, { type: "date" }, () => fitWeeks(block))));
   card.appendChild(goalRow(
     blockField("Target weekly km", "target_weekly_km", block, { type: "number", step: "any", min: "0", placeholder: "50" })));
 
   const dated = block.start_date && block.end_date && block.end_date >= block.start_date;
   const wh = document.createElement("div");
-  wh.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:8px";
+  wh.className = "block-head-row";
   const wl = document.createElement("b");
   wl.textContent = dated
     ? "Weeks (" + weekSpan(block) + " calendar weeks)"
@@ -3272,10 +3681,83 @@ async function saveGoal() {
     await loadAnchor(fmt(planWeekStart));
     startGoalEdit(goalEditId);
     loadPlan();
+    toast("Goal saved", { type: "ok" });
   } catch (e) { setErr($("goal-modal-error"), e.message); }
 }
 
-const TODAY_CARDS = { acwr: {}, runacwr: {} };
+// -- Today: workload cards -------------------------------------------------
+// Both ACWR cards (overall and running-only) are one component driven by this
+// config: where to fetch, which series field to plot, and the component tiles.
+function rollingAvg(vals, win = 7) {
+  const out = [];
+  for (let i = 0; i < vals.length; i++) {
+    let s = 0, n = 0;
+    for (let j = Math.max(0, i - win + 1); j <= i; j++) { s += vals[j]; n++; }
+    out.push(n ? s / n : vals[i]);
+  }
+  return out;
+}
+
+function num(v, dp) {
+  return (v == null || isNaN(v)) ? "—" : Number(v).toFixed(dp);
+}
+
+function gaitColor(drift) {
+  if (drift < -1.5) return "#ef4444";
+  if (drift < -1.0) return "#f59e0b";
+  if (drift > 0.6) return "#3b82f6";
+  return "#22c55e";
+}
+
+const ACWR_COLORS = { "Sweet Spot":"#22c55e", Elevated:"#f59e0b", Danger:"#ef4444", Detraining:"#3b82f6" };
+const ACWR_ZONES = [
+  { y0: 0, y1: 0.8, label: "Detraining", color: "#3b82f6", fill: "rgba(59,130,246,.08)" },
+  { y0: 0.8, y1: 1.3, label: "Sweet spot", color: "#22c55e", fill: "rgba(34,197,94,.08)" },
+  { y0: 1.3, y1: 1.5, label: "Elevated", color: "#f59e0b", fill: "rgba(245,158,11,.08)" },
+  { y0: 1.5, y1: null, label: "Danger", color: "#ef4444", fill: "rgba(239,68,68,.08)" },
+];
+const ACWR_RANGES = [["30d", 30], ["90d", 90], ["1y", 365], ["All", 0]];
+
+const ACWR_CARDS = {
+  acwr: {
+    url: "/acwr", field: "acwr", chartTitle: "ACWR",
+    tiles: (t) => [
+      ["Acute load (7d EMA)", num(t.acute_load, 1), "short-term fatigue"],
+      ["Chronic load (28d EMA)", num(t.chronic_load, 1), "long-term adaptation"],
+      ["Today's training load", num(t.daily_load, 1), "sum of activity loads"],
+    ],
+  },
+  runacwr: {
+    url: "/run-acwr", field: "run_acwr", chartTitle: "Running ACWR",
+    tiles: (t, days) => {
+      const out = [
+        ["Acute running (7d EMA)", num(t.run_acute_km, 1), "km/day, running only"],
+        ["Chronic running (28d EMA)", num(t.run_chronic_km, 1), "km/day, running only"],
+        ["Today's running", num(t.run_km, 1), "km, running only"],
+      ];
+      const gait = days.slice().reverse().find((d) => d.run_cadence_drift != null);
+      if (gait) {
+        const drift = Number(gait.run_cadence_drift);
+        out.push(
+          ["Cadence (spm)", num(gait.run_cadence, 0), "latest run · " + (gait.calendar_date || "")],
+          ["Contact (ms)", num(gait.run_gct_ms, 0), "latest run"],
+          ["Form drift", (drift > 0 ? "+" : "") + drift.toFixed(2), gait.gait_category, gaitColor(drift)],
+        );
+      }
+      return out;
+    },
+  },
+};
+
+// Per-card state: loaded series, selected range, and whether the chart still
+// needs drawing (a collapsed card defers Plotly until it is opened).
+const TODAY_CARDS = {};
+
+function acwrRange(key) {
+  let v = null;
+  try { v = localStorage.getItem("acwr_range_" + key); } catch (e) { /* storage blocked */ }
+  return ACWR_RANGES.some(([, d]) => String(d) === v) ? Number(v) : 90;
+}
 
 function setTodayHead(key, text, color) {
   const el = document.getElementById(key + "-headval");
@@ -3290,13 +3772,11 @@ function todayCardOpen(key) {
   return card ? card.classList.contains("open") : false;
 }
 
-function renderTodayChart(key, chart, days, render) {
-  TODAY_CARDS[key] = { chart, days, render, pending: false };
-  if (todayCardOpen(key)) {
-    render(chart, days);
-  } else {
-    TODAY_CARDS[key].pending = true;
-  }
+function skel(w, h, inline) {
+  const s = document.createElement("span");
+  s.className = "skel" + (inline ? " inline" : "");
+  s.style.width = w; s.style.height = h;
+  return s;
 }
 
 let accordionsWired = false;
@@ -3321,62 +3801,49 @@ function wireTodayAccordions() {
       card.classList.toggle("open", opening);
       head.setAttribute("aria-expanded", opening ? "true" : "false");
       localStorage.setItem("td_card_" + key, opening ? "1" : "0");
-      if (opening) {
-        const td = TODAY_CARDS[key];
-        if (td && td.pending) { td.render(td.chart, td.days); td.pending = false; }
-      }
+      const st = TODAY_CARDS[key];
+      if (opening && st && st.pending) renderAcwrChart(key);
     });
   });
 }
 
-function rollingAvg(vals, win = 7) {
-  const out = [];
-  for (let i = 0; i < vals.length; i++) {
-    let s = 0, n = 0;
-    for (let j = Math.max(0, i - win + 1); j <= i; j++) { s += vals[j]; n++; }
-    out.push(n ? s / n : vals[i]);
+async function loadAcwrCard(key) {
+  const cfg = ACWR_CARDS[key];
+  const box = $(key + "-summary");
+  const chart = $(key + "-chart");
+  const hint = $(key + "-hint");
+  const toolbar = $(key + "-toolbar");
+  // Skeletons while loading (only on the first load — a refresh keeps the old
+  // numbers on screen instead of flashing).
+  if (!TODAY_CARDS[key]) {
+    $(key + "-headval").replaceChildren(skel("58px", "30px", true));
+    box.replaceChildren(skel("40%", "56px"), skel("100%", "64px"));
+    box.firstChild.style.marginBottom = "14px";
   }
-  return out;
-}
-
-function num(v, dp) {
-  return (v == null || isNaN(v)) ? "—" : Number(v).toFixed(dp);
-}
-
-function gaitColor(drift) {
-  if (drift < -1.5) return "#ef4444";
-  if (drift < -1.0) return "#f59e0b";
-  if (drift > 0.6) return "#3b82f6";
-  return "#22c55e";
-}
-
-const ACWR_COLORS = { "Sweet Spot":"#22c55e", Elevated:"#f59e0b", Danger:"#ef4444", Detraining:"#3b82f6" };
-
-async function loadACWR() {
-  const box = $("acwr-summary");
-  const chart = $("acwr-chart");
-  box.innerHTML = "";
-  setErr($("acwr-hint"), "");
+  hint.classList.add("hidden");
   try {
-    const data = await api("/acwr", undefined, "GET");
+    const data = await api(cfg.url, undefined, "GET");
     const days = data.days || [];
     const today = data.today;
+    box.innerHTML = "";
     if (!today) {
-      setTodayHead("acwr", "–", "");
-      $("acwr-hint").classList.remove("hidden");
+      setTodayHead(key, "–", "");
+      hint.classList.remove("hidden");
+      toolbar.classList.add("hidden");
       chart.innerHTML = "";
+      TODAY_CARDS[key] = { days: [], pending: false };
       return;
     }
-    $("acwr-hint").classList.add("hidden");
-
+    const value = Number(today[cfg.field]).toFixed(2);
     const color = ACWR_COLORS[today.category] || "#fff";
-    setTodayHead("acwr", Number(today.acwr).toFixed(2), color);
+    setTodayHead(key, value, color);
+
     const row = document.createElement("div");
     row.className = "metric-score-row";
     const score = document.createElement("div");
     score.className = "metric-score";
     score.style.color = color;
-    score.textContent = Number(today.acwr).toFixed(2);
+    score.textContent = value;
     const right = document.createElement("div");
     const cat = document.createElement("div");
     cat.className = "metric-cat";
@@ -3384,19 +3851,14 @@ async function loadACWR() {
     cat.textContent = today.category;
     const meta = document.createElement("div");
     meta.className = "metric-meta";
-    meta.textContent = "as of " + today.calendar_date;
+    meta.textContent = "as of " + fmtDay(parseISO(today.calendar_date));
     right.appendChild(cat); right.appendChild(meta);
     row.appendChild(score); row.appendChild(right);
     box.appendChild(row);
 
     const grid = document.createElement("div");
     grid.className = "metric-grid";
-    const comps = [
-      ["Acute load (7d EMA)", today.acute_load != null ? Number(today.acute_load).toFixed(1) : "—", "short-term fatigue"],
-      ["Chronic load (28d EMA)", today.chronic_load != null ? Number(today.chronic_load).toFixed(1) : "—", "long-term adaptation"],
-      ["Today's training load", today.daily_load != null ? Number(today.daily_load).toFixed(1) : "—", "sum of activity loads"],
-    ];
-    for (const [label, value, sub] of comps) {
+    for (const [label, val, sub, tileColor] of cfg.tiles(today, days)) {
       const c = document.createElement("div");
       c.className = "metric-comp";
       const l = document.createElement("div");
@@ -3404,7 +3866,8 @@ async function loadACWR() {
       l.textContent = label;
       const v = document.createElement("div");
       v.className = "r-value";
-      v.textContent = value;
+      v.textContent = val;
+      if (tileColor) v.style.color = tileColor;
       const s = document.createElement("div");
       s.className = "r-sub";
       s.textContent = sub;
@@ -3412,175 +3875,100 @@ async function loadACWR() {
       grid.appendChild(c);
     }
     box.appendChild(grid);
-    renderTodayChart("acwr", chart, days, renderAcwrChart);
+
+    TODAY_CARDS[key] = { days, range: acwrRange(key), pending: true };
+    renderRangeToolbar(key);
+    if (todayCardOpen(key)) renderAcwrChart(key);
   } catch (e) {
+    setTodayHead(key, "–", "");
     box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
   }
 }
 
-function renderAcwrChart(el, days) {
-  const pts = (days || []).filter((d) => d.acwr != null);
-  if (!pts.length) { el.innerHTML = ""; return; }
-  const maxV = Math.max.apply(null, pts.map((d) => Number(d.acwr)));
-  const ymax = Math.max(2.0, Math.ceil((maxV * 1.15) * 10) / 10);
+function renderRangeToolbar(key) {
+  const bar = $(key + "-toolbar");
+  const st = TODAY_CARDS[key];
+  bar.innerHTML = "";
+  const seg = document.createElement("div");
+  seg.className = "seg";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "Chart range");
+  for (const [label, daysBack] of ACWR_RANGES) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.classList.toggle("active", st.range === daysBack);
+    b.addEventListener("click", () => {
+      st.range = daysBack;
+      try { localStorage.setItem("acwr_range_" + key, String(daysBack)); } catch (e) { /* ignore */ }
+      renderRangeToolbar(key);
+      renderAcwrChart(key);
+    });
+    seg.appendChild(b);
+  }
+  bar.appendChild(seg);
+  bar.classList.remove("hidden");
+}
+
+// Daily ratio as dots coloured by zone, a 7-day rolling average as the line,
+// and the four zones as shaded bands labelled on the right edge.
+function renderAcwrChart(key) {
+  const cfg = ACWR_CARDS[key];
+  const st = TODAY_CARDS[key];
+  const el = $(key + "-chart");
+  st.pending = false;
+  const all = (st.days || []).filter((d) => d[cfg.field] != null);
+  if (!all.length) { el.innerHTML = ""; return; }
+  // Average over the full series first, then slice, so the line is correct at
+  // the left edge of a short range.
+  const avg = rollingAvg(all.map((d) => Number(d[cfg.field])), 7);
+  let start = 0;
+  if (st.range) {
+    const cutoff = parseISO(all[all.length - 1].calendar_date);
+    cutoff.setDate(cutoff.getDate() - st.range);
+    const c = fmt(cutoff);
+    start = all.findIndex((d) => d.calendar_date > c);
+    if (start < 0) start = 0;
+  }
+  const pts = all.slice(start);
   const dates = pts.map((d) => d.calendar_date);
-  const raw = pts.map((d) => d.acwr);
-  const zones = [
-    { y0: 0, y1: 0.8, color: "rgba(59,130,246,.08)" },
-    { y0: 0.8, y1: 1.3, color: "rgba(34,197,94,.08)" },
-    { y0: 1.3, y1: 1.5, color: "rgba(245,158,11,.08)" },
-    { y0: 1.5, y1: ymax, color: "rgba(239,68,68,.08)" },
-  ];
-  Plotly.newPlot(el, [
-    {
-      x: dates, y: rollingAvg(raw, 7), mode: "lines",
-      line: { color: "#e7edf3", width: 2.5, shape: "spline", smoothing: 0.8 },
-      hoverinfo: "skip",
-    },
-    {
-      x: dates, y: raw, mode: "markers", type: "scatter",
-      marker: { color: pts.map((d) => ACWR_COLORS[d.category] || "#8b98a5"),
-                size: 4, opacity: 0.8, line: { width: 0 } },
-      hovertemplate: "%{x}<br>%{y}<extra></extra>",
-    },
-  ], {
-    title: { text: "ACWR · 7-day trend", font: { size: 13 } },
-    paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(0,0,0,0)",
-    font: { color: "#e7edf3" },
+  const raw = pts.map((d) => Number(d[cfg.field]));
+  const maxV = Math.max.apply(null, raw);
+  const ymax = Math.max(2.0, Math.ceil((maxV * 1.15) * 10) / 10);
+  const zones = ACWR_ZONES.map((z) => Object.assign({}, z, { y1: z.y1 == null ? ymax : z.y1 }));
+  const layout = themedChartLayout({
+    title: { text: cfg.chartTitle + " · daily (dots) and 7-day average (line)", font: { size: 13 } },
     hovermode: "x",
-    xaxis: { gridcolor: "#2a323d", zeroline: false, showline: false, ticks: "outside", tickcolor: "#2a323d" },
-    yaxis: { gridcolor: "#2a323d", range: [0, ymax], zeroline: false,
-             showline: false, ticks: "outside", tickcolor: "#2a323d",
-             title: { text: "acute / chronic", font: { size: 11 } } },
-    shapes: zones.map((z) => ({ type: "rect", xref: "paper", x0: 0, x1: 1,
-      y0: z.y0, y1: z.y1, fillcolor: z.color, line: { width: 0 } })),
-    margin: { l: 40, r: 16, t: 30, b: 30 },
     showlegend: false,
-  }, { responsive: true });
-}
-
-async function loadRunACWR() {
-  const box = $("runacwr-summary");
-  const chart = $("runacwr-chart");
-  box.innerHTML = "";
-  setErr($("runacwr-hint"), "");
-  try {
-    const data = await api("/run-acwr", undefined, "GET");
-    const days = data.days || [];
-    const today = data.today;
-    if (!today) {
-      setTodayHead("runacwr", "–", "");
-      $("runacwr-hint").classList.remove("hidden");
-      chart.innerHTML = "";
-      return;
-    }
-    $("runacwr-hint").classList.add("hidden");
-
-    const color = ACWR_COLORS[today.category] || "#fff";
-    setTodayHead("runacwr", Number(today.run_acwr).toFixed(2), color);
-    const row = document.createElement("div");
-    row.className = "metric-score-row";
-    const score = document.createElement("div");
-    score.className = "metric-score";
-    score.style.color = color;
-    score.textContent = Number(today.run_acwr).toFixed(2);
-    const right = document.createElement("div");
-    const cat = document.createElement("div");
-    cat.className = "metric-cat";
-    cat.style.color = color;
-    cat.textContent = today.category;
-    const meta = document.createElement("div");
-    meta.className = "metric-meta";
-    meta.textContent = "as of " + today.calendar_date;
-    right.appendChild(cat); right.appendChild(meta);
-    row.appendChild(score); row.appendChild(right);
-    box.appendChild(row);
-
-    const grid = document.createElement("div");
-    grid.className = "metric-grid";
-    const comps = [
-      ["Acute running (7d EMA)", num(today.run_acute_km, 1), "km/day, running only"],
-      ["Chronic running (28d EMA)", num(today.run_chronic_km, 1), "km/day, running only"],
-      ["Today's running", num(today.run_km, 1), "km, running only"],
-    ];
-    const gait = (days || []).slice().reverse().find((d) => d.run_cadence_drift != null);
-    if (gait) {
-      const drift = Number(gait.run_cadence_drift);
-      comps.push(
-        ["Cadence (spm)", num(gait.run_cadence, 0), "latest run · " + (gait.calendar_date || "")],
-        ["Contact (ms)", num(gait.run_gct_ms, 0), "latest run"],
-      );
-      comps.push(["Form drift", (drift > 0 ? "+" : "") + drift.toFixed(2), gait.gait_category, gaitColor(drift)]);
-    }
-    for (const [label, value, sub, color] of comps) {
-      const c = document.createElement("div");
-      c.className = "metric-comp";
-      const l = document.createElement("div");
-      l.className = "r-label";
-      l.textContent = label;
-      const v = document.createElement("div");
-      v.className = "r-value";
-      v.textContent = value;
-      if (color) v.style.color = color;
-      const s = document.createElement("div");
-      s.className = "r-sub";
-      s.textContent = sub;
-      c.appendChild(l); c.appendChild(v); c.appendChild(s);
-      grid.appendChild(c);
-    }
-    box.appendChild(grid);
-    renderTodayChart("runacwr", chart, days, renderRunAcwrChart);
-  } catch (e) {
-    box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
-  }
-}
-
-function renderRunAcwrChart(el, days) {
-  const pts = (days || []).filter((d) => d.run_acwr != null);
-  if (!pts.length) { el.innerHTML = ""; return; }
-  const maxV = Math.max.apply(null, pts.map((d) => Number(d.run_acwr)));
-  const ymax = Math.max(2.0, Math.ceil((maxV * 1.15) * 10) / 10);
-  const dates = pts.map((d) => d.calendar_date);
-  const raw = pts.map((d) => d.run_acwr);
-  const zones = [
-    { y0: 0, y1: 0.8, color: "rgba(59,130,246,.08)" },
-    { y0: 0.8, y1: 1.3, color: "rgba(34,197,94,.08)" },
-    { y0: 1.3, y1: 1.5, color: "rgba(245,158,11,.08)" },
-    { y0: 1.5, y1: ymax, color: "rgba(239,68,68,.08)" },
-  ];
-  Plotly.newPlot(el, [
+    margin: { l: 44, r: 16, t: 34, b: 30 },
+    yaxis: { range: [0, ymax], title: { text: "acute / chronic", font: { size: 11 } } },
+    shapes: zones.map((z) => ({ type: "rect", xref: "paper", x0: 0, x1: 1,
+      y0: z.y0, y1: z.y1, fillcolor: z.fill, line: { width: 0 }, layer: "below" })),
+    annotations: zones.map((z) => ({ xref: "paper", x: 1, xanchor: "right", yref: "y",
+      y: (z.y0 + Math.min(z.y1, z.y0 + 0.5)) / 2, text: z.label, showarrow: false,
+      font: { size: 10, color: z.color }, bgcolor: "rgba(23,29,36,.85)", borderpad: 2 })),
+  });
+  Plotly.react(el, [
     {
-      x: dates, y: rollingAvg(raw, 7), mode: "lines",
+      x: dates, y: avg.slice(start), mode: "lines", name: "7-day avg",
       line: { color: "#e7edf3", width: 2.5, shape: "spline", smoothing: 0.8 },
-      hoverinfo: "skip",
+      hovertemplate: "7-day avg %{y:.2f}<extra></extra>",
     },
     {
-      x: dates, y: raw, mode: "markers", type: "scatter",
+      x: dates, y: raw, mode: "markers", type: "scatter", name: "daily",
       marker: { color: pts.map((d) => ACWR_COLORS[d.category] || "#8b98a5"),
-                size: 4, opacity: 0.8, line: { width: 0 } },
-      hovertemplate: "%{x}<br>%{y}<extra></extra>",
+                size: 5, opacity: 0.85, line: { width: 0 } },
+      hovertemplate: "%{x}<br>%{y:.2f}<extra></extra>",
     },
-  ], {
-    title: { text: "Running ACWR · 7-day trend", font: { size: 13 } },
-    paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(0,0,0,0)",
-    font: { color: "#e7edf3" },
-    xaxis: { gridcolor: "#2a323d", zeroline: false, showline: false, ticks: "outside", tickcolor: "#2a323d" },
-    yaxis: { gridcolor: "#2a323d", range: [0, ymax], zeroline: false,
-             showline: false, ticks: "outside", tickcolor: "#2a323d",
-             title: { text: "acute / chronic", font: { size: 11 } } },
-    shapes: zones.map((z) => ({ type: "rect", xref: "paper", x0: 0, x1: 1,
-      y0: z.y0, y1: z.y1, fillcolor: z.color, line: { width: 0 } })),
-    margin: { l: 40, r: 16, t: 30, b: 30 },
-    showlegend: false,
-  }, { responsive: true });
+  ], layout, { responsive: true, displaylogo: false,
+               modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d"] });
 }
 
 function loadToday() {
   wireTodayAccordions();
-  loadACWR();
-  loadRunACWR();
+  loadBriefing();
+  loadAcwrCard("acwr");
+  loadAcwrCard("runacwr");
 }
 
 const DATA_TYPES = [
@@ -3631,21 +4019,6 @@ async function loadConfig() {
       grid.appendChild(label);
     }
     box.appendChild(grid);
-  } catch (e) { setErr($("cfg-error"), e.message); }
-}
-
-async function saveConfig() {
-  setErr($("cfg-error"), "");
-  const excluded = Array.from(document.querySelectorAll("#cfg-excluded input:checked"))
-    .map((cb) => cb.value);
-  try {
-    await api("/auth/config", {
-      home_city: $("cfg-home-city").value,
-      home_country: $("cfg-home-country").value,
-      excluded_data_types: excluded,
-      reasoning_effort: $("cfg-reasoning").value,
-      training_principles: $("cfg-principles").value,
-    }, "PUT");
   } catch (e) { setErr($("cfg-error"), e.message); }
 }
 
@@ -3721,6 +4094,7 @@ async function saveTextModal() {
   $(cfg.hidden).value = value;
   renderTextSettingSummaries();
   closeTextModal();
+  toast(cfg.title + " saved", { type: "ok" });
 }
 
 function renderTextSettingSummaries() {
@@ -3755,37 +4129,61 @@ async function loadAutoSync() {
 }
 
 async function saveAutoSync() {
-  $("cfg-autosync").disabled = true;
+  const cb = $("cfg-autosync");
+  cb.disabled = true;
   try {
-    await api("/auth/config", { auto_sync: $("cfg-autosync").checked }, "PUT");
-    $("autosync-state").textContent = $("cfg-autosync").checked
-      ? "Saved — your account will sync automatically on the schedule."
-      : "Saved — auto-sync is off; your account only syncs when you press “Sync now”.";
+    await api("/auth/config", { auto_sync: cb.checked }, "PUT");
+    flashSaved($("autosync-saved"));
+    $("autosync-state").textContent = cb.checked
+      ? "Your account will sync automatically on the schedule."
+      : "";
   } catch (e) {
-    $("autosync-state").textContent = "couldn't save: " + e.message;
-    $("cfg-autosync").checked = !$("cfg-autosync").checked;
-  } finally { $("cfg-autosync").disabled = false; }
-}
-
-function _isDateStr(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s + "T00:00:00").getTime());
+    flashSaved($("autosync-saved"), e.message);
+    cb.checked = !cb.checked;
+  } finally { cb.disabled = false; }
 }
 
 async function saveStartDate() {
-  $("cfg-sync-start").disabled = true;
-  const v = $("cfg-sync-start").value.trim();
+  const input = $("cfg-sync-start");
+  const v = input.value.trim();   // a date input yields "" or YYYY-MM-DD
+  input.disabled = true;
   try {
-    if (v && !_isDateStr(v)) {
-      $("sync-start-state").textContent = "Enter a date as YYYY-MM-DD (e.g. 2025-01-01) or leave it blank.";
-      return;
-    }
     await api("/auth/config", { sync_start_date: v }, "PUT");
+    flashSaved($("sync-start-saved"));
     $("sync-start-state").textContent = v
-      ? "Saved — the next sync will backfill from " + v + "."
-      : "Saved — backfill window unchanged; a sync will pick it up.";
+      ? "The next sync will backfill from " + fmtDay(parseISO(v), true) + "."
+      : "";
   } catch (e) {
-    $("sync-start-state").textContent = "couldn't save: " + e.message;
-  } finally { $("cfg-sync-start").disabled = false; }
+    flashSaved($("sync-start-saved"), e.message);
+  } finally { input.disabled = false; }
+}
+
+// Preferences save as soon as a field changes (text fields on blur/Enter), each
+// with its own "Saved ✓" — there is no separate Save button.
+async function saveConfigField(key, value, fieldId) {
+  const el = document.querySelector('[data-saved-for="' + fieldId + '"]');
+  try {
+    await api("/auth/config", { [key]: value }, "PUT");
+    flashSaved(el);
+  } catch (e) { flashSaved(el, e.message); }
+}
+
+function wireConfigAutosave() {
+  const text = (id, key) => {
+    const el = $(id);
+    el.addEventListener("change", () => saveConfigField(key, el.value, id));
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter") el.blur(); });
+  };
+  text("cfg-home-city", "home_city");
+  text("cfg-home-country", "home_country");
+  $("cfg-reasoning").addEventListener("change", () =>
+    saveConfigField("reasoning_effort", $("cfg-reasoning").value, "cfg-reasoning"));
+  // The checkbox grid is rebuilt on every load, so listen on its container.
+  $("cfg-excluded").addEventListener("change", () => {
+    const excluded = Array.from(document.querySelectorAll("#cfg-excluded input:checked"))
+      .map((cb) => cb.value);
+    saveConfigField("excluded_data_types", excluded, "cfg-excluded");
+  });
 }
 
 async function enterApp() {
@@ -3794,11 +4192,10 @@ async function enterApp() {
   $("logout").classList.remove("hidden");
   $("bind-pending").classList.toggle("hidden", !!me.confirmed);
   $("llm-missing").classList.toggle("hidden", !!me.llm_configured);
-  showApp();
-  switchAppTab("chat");
   $("chat").innerHTML = "";
+  showApp();
+  switchAppTab(tabFromHash());
   loadHistory();
-  loadAutoSync();
   refreshStatus();
 }
 
@@ -3809,7 +4206,9 @@ function logout() {
 
 $("btn-login").addEventListener("click", loginFlow);
 $("btn-register").addEventListener("click", registerFlow);
-$("btn-ask").addEventListener("click", ask);
+$("btn-ask").addEventListener("click", () => {
+  if (asking) { if (askAbort) askAbort.abort(); } else ask();
+});
 $("btn-new-chat").addEventListener("click", async () => {
   try { await api("/ask/clear", {}); } catch (e) {}
   $("chat").innerHTML = "";
@@ -3818,27 +4217,24 @@ $("btn-new-chat").addEventListener("click", async () => {
 });
 $("btn-compact").addEventListener("click", async () => {
   const btn = $("btn-compact");
-  btn.disabled = true;
+  setBusy(btn, "Compacting…");
   try {
     const data = await api("/ask/compact", {});
     if (data.tokens === 0) {
-      addMsg("assistant", "Nothing to compact — the conversation is already empty.");
+      toast("Nothing to compact — the conversation is already empty.");
     } else if (data.unchanged) {
-      addMsg("assistant", "The conversation could not be compacted (no summary produced); keeping it as-is.");
+      toast("The conversation could not be compacted (no summary produced); keeping it as-is.", { type: "err" });
     } else {
       // The stored transcript is now a compact summary; show a notice instead of
       // the raw summary text so the chat reads cleanly.
       $("chat").innerHTML = "";
-      const note = document.createElement("div");
-      note.className = "muted";
-      note.textContent = "Conversation compacted into a summary to cut the context size. Continue the conversation as normal.";
-      $("chat").appendChild(note);
+      chatNote("Conversation compacted into a summary to cut the context size. Continue as normal.");
     }
     updateTokens(data.tokens);
   } catch (e) {
-    addMsg("assistant", "Error compacting: " + e.message);
+    toast("Error compacting: " + e.message, { type: "err" });
   } finally {
-    btn.disabled = false;
+    clearBusy(btn);
   }
 });
 $("btn-sync").addEventListener("click", triggerSync);
@@ -3847,18 +4243,21 @@ $("logout").addEventListener("click", logout);
 $("tab-login").addEventListener("click", () => switchTab("login"));
 $("tab-register").addEventListener("click", () => switchTab("register"));
 for (const b of document.querySelectorAll("#app-tabs button")) {
-  b.addEventListener("click", () => switchAppTab(b.dataset.tab));
-}
-for (const b of document.querySelectorAll("#settings-tabs button")) {
+  // Tabs navigate via the hash; hashchange does the switch (and back/forward work).
   b.addEventListener("click", () => {
-    switchSettingsSubTab(b.dataset.subtab);
-    if (b.dataset.subtab === "config") loadConfig();
-    if (b.dataset.subtab === "sync") loadAutoSync();
+    if (tabFromHash() === b.dataset.tab && location.hash) switchAppTab(b.dataset.tab);
+    else location.hash = b.dataset.tab;
   });
+}
+window.addEventListener("hashchange", () => {
+  if ($("app").style.display !== "none") switchAppTab(tabFromHash());
+});
+for (const b of document.querySelectorAll("#settings-tabs button")) {
+  b.addEventListener("click", () => switchSettingsSubTab(b.dataset.subtab));
 }
 $("cfg-autosync").addEventListener("change", saveAutoSync);
 $("cfg-sync-start").addEventListener("change", saveStartDate);
-$("btn-save-config").addEventListener("click", saveConfig);
+wireConfigAutosave();
 $("open-principles").addEventListener("click", () => openTextModal("principles"));
 $("open-memory").addEventListener("click", () => openTextModal("memory"));
 $("tm-save").addEventListener("click", saveTextModal);
@@ -3892,12 +4291,12 @@ $("goal-undo").addEventListener("click", async () => {
     await loadAnchor(fmt(planWeekStart));
     renderGoalEditor();
     loadPlan();
+    toast("Last save undone", { type: "ok" });
   } catch (e) { setErr($("goal-modal-error"), e.message); }
 });
 $("goal-modal").addEventListener("click", (e) => { if (e.target === $("goal-modal")) closeGoalModal(); });
 $("goal-drawer-close").addEventListener("click", closeGoalDrawer);
 $("goal-drawer").addEventListener("click", (e) => { if (e.target.closest("[data-gd-close]")) closeGoalDrawer(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeGoalDrawer(); });
 $("question").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -3907,16 +4306,15 @@ $("question").addEventListener("keydown", (e) => {
 $("question").addEventListener("input", autoResizeQuestion);
 wirePromptChips();
 wirePasswordToggles();
+new MutationObserver(syncChatEmpty).observe($("chat"), { childList: true });
+syncChatEmpty();
+// Escape closes the topmost overlay only.
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    if (!$("text-modal").classList.contains("hidden")) {
-      closeTextModal();
-    } else if (!$("plan-modal").classList.contains("hidden")) {
-      closePlanModal();
-    } else if (!$("goal-modal").classList.contains("hidden")) {
-      closeGoalModal();
-    }
-  }
+  if (e.key !== "Escape") return;
+  if (!$("text-modal").classList.contains("hidden")) closeTextModal();
+  else if (!$("plan-modal").classList.contains("hidden")) closePlanModal();
+  else if (!$("goal-modal").classList.contains("hidden")) closeGoalModal();
+  else closeGoalDrawer();
 });
 $("login-email").addEventListener("keydown", (e) => { if (e.key === "Enter") loginFlow(); });
 $("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") loginFlow(); });
@@ -3924,11 +4322,15 @@ $("reg-password").addEventListener("keydown", (e) => { if (e.key === "Enter") re
 $("reg-garmin-password").addEventListener("keydown", (e) => { if (e.key === "Enter") registerFlow(); });
 $("reg-mfa-code").addEventListener("keydown", (e) => { if (e.key === "Enter") registerFlow(); });
 
-if (token) {
-  enterApp().catch(() => { token = ""; localStorage.removeItem("garmin_token"); showAuth(); });
-} else {
-  showAuth();
-}
+// The CDN scripts are deferred and run after this inline script, so boot only
+// once they have executed (DOMContentLoaded fires after deferred scripts).
+document.addEventListener("DOMContentLoaded", () => {
+  if (token) {
+    enterApp().catch(() => { token = ""; localStorage.removeItem("garmin_token"); showAuth(); });
+  } else {
+    showAuth();
+  }
+});
 </script>
 </body>
 </html>
