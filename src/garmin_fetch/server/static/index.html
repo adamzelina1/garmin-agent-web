@@ -35,7 +35,7 @@
          background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
   .wrap { max-width: 1240px; margin: 0 auto; padding: 16px; width:100%;
           flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
-  header { display:flex; align-items:center; gap:24px; min-height:52px;
+  header { display:flex; align-items:center; gap:32px; min-height:58px;
            padding:0 16px; background:var(--panel); border-bottom:1px solid var(--border); }
   header h1 { font-size:18px; margin:0; flex:none; }
   header .hdr-right { margin-left:auto; display:flex; align-items:center; gap:12px; }
@@ -47,6 +47,10 @@
   .utabs button:hover:not(:disabled) { color:var(--text); filter:none; }
   .utabs button:active:not(:disabled) { transform:none; }
   .utabs button.active { color:var(--text); border-bottom-color:var(--accent); }
+  /* The main app nav is the primary navigation, so it reads larger than the
+     Settings sub-tabs that share the style. */
+  header .utabs { gap:30px; }
+  header .utabs button { font-size:16px; padding:0 4px; letter-spacing:-.005em; }
   #settings-tabs { align-self:auto; height:38px; margin-top:4px; border-bottom:1px solid var(--line); }
   button.danger { background:transparent; border:1px solid var(--err); color:var(--err); }
   button.danger:hover:not(:disabled) { background:rgba(239,68,68,.1); filter:none; }
