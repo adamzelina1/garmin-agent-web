@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import re
 from argparse import ArgumentParser
 from contextlib import contextmanager
@@ -37,6 +38,7 @@ from decimal import Decimal
 from typing import Any, Callable, Iterable, Protocol
 
 import psycopg
+import psycopg.rows
 
 from .config import load_config
 from .parser import TYPE_COLUMNS
@@ -128,14 +130,17 @@ _TABLE_NOTES: dict[str, str] = {
         "weather"
     ),
     "activity_detail_series": (
-        "one row per intra-activity tick (activity_id + tick): HR, cadence, "
-        "power, speed, elevation, cumulative distance, respiration. Prefer "
-        "aggregate/interval queries; a metric may be NULL on every tick if the "
-        "device didn't record it"
+        "one row per sample (every ~2-10 s) of an activity (activity_id + tick): "
+        "elapsed_s, HR, cadence, power, speed, elevation, cumulative distance. "
+        "For ONE activity use get_activity_detail instead. Query this table only "
+        "to chart a session or compare sessions, and always bucket by time "
+        "(GROUP BY FLOOR(elapsed_s / 60)) — never select raw samples. A metric "
+        "is NULL on every sample when the device didn't record it"
     ),
     "activity_splits": (
-        "one row per split/lap (activity_id + split_number): distance, duration, "
-        "pace, start time, HR/power/cadence, elevation gain (work vs rest)"
+        "one row per lap (activity_id + split_number): auto-laps (usually 1 km) "
+        "or manual lap presses, with distance, duration, pace, start offset, "
+        "HR/power/cadence and elevation gain"
     ),
     "hr_zones": (
         "configured HR zone boundaries (zone1..zone5 min/max) + training method, "
@@ -235,7 +240,8 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
     },
     "activity_detail_series": {
         "distance_m": "cumulative metres",
-        "ts_ms": "epoch ms",
+        "ts_ms": "epoch ms (wall-clock); use elapsed_s for time within the activity",
+        "elapsed_s": "seconds since the activity's first sample — bucket by this",
         "speed_kmh": "km/h",
         "power_w": "watts",
         "cadence": "steps/min PER LEG for running (total both-feet = 2x); rpm for cycling; NULL if not recorded",
@@ -248,7 +254,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "pace_sec_per_km": "seconds/km (lower = faster)",
         "avg_cadence": "steps/min PER LEG for running (total = 2x); rpm for cycling",
         "max_cadence": "same unit as avg_cadence",
-        "split_type": "'distance' (work) or 'rest'",
+        "split_type": "Garmin lap intensity: 'interval' (running laps), 'distance' (other active laps), 'rest', or 'split' (untyped)",
     },
     "race_predictions": {
         "time_5k_min": "minutes",
@@ -360,13 +366,16 @@ Query rules:
 4. Date-like columns (`calendar_date`, `start_date`, `start_time_local`, ...) are
    TEXT (`'YYYY-MM-DD'` / `'HH:MM'`). Cast with `::date` before `DATE_TRUNC` /
    `EXTRACT`, or compare them as strings.
-5. Query freely: probing, correcting and follow-up queries are cheap and safe —
+5. Measurements are `DOUBLE PRECISION`: cast before rounding
+   (`ROUND(AVG(heart_rate)::numeric, 1)`).
+6. Query freely: probing, correcting and follow-up queries are cheap and safe —
    accuracy matters more than the number of tool calls.
 
 # Tools
 
 - `get_day_summary` for one day; `get_metric_trend` for a core metric over time;
-  `get_recent_activities` for a list of activities. Otherwise write SQL with `run_sql`.
+  `get_recent_activities` for a list of activities; `get_activity_detail` for
+  how one session went. Otherwise write SQL with `run_sql`.
 - `chart` when the user asks for a chart. On `OK: <spec>`, embed the spec
   verbatim in `<chart> ... </chart>` with one descriptive sentence; never paste
   the data.
@@ -663,6 +672,80 @@ def _build_chart_figure(
 
 
 
+#: The activity_summaries columns ``_format_activity`` reads.
+_ACTIVITY_COLUMNS = (
+    "activity_id, activity_name, activity_type, start_date, start_time_local, "
+    "duration_hours, distance_km, avg_hr, max_hr, pace_min_km, avg_speed_kmh, "
+    "avg_cadence, avg_power_w, training_load, elevation_gain_m, weather_temp_c, is_pr"
+)
+
+#: Most time buckets ``activity_detail`` returns (the bucket widens to fit).
+_MAX_BUCKETS = 200
+
+
+def _is_running(activity_type: str | None) -> bool:
+    return "run" in (activity_type or "").lower()
+
+
+def _round(value: Any, digits: int = 0) -> Any:
+    if value is None:
+        return None
+    return round(float(value), digits) if digits else round(float(value))
+
+
+def _fmt_duration(seconds: Any) -> str | None:
+    """``H:MM:SS`` (or ``M:SS`` under an hour)."""
+    if seconds is None:
+        return None
+    total = int(round(float(seconds)))
+    h, rest = divmod(total, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_pace(min_per_km: Any) -> str | None:
+    """Decimal min/km -> ``M:SS /km``."""
+    if not min_per_km or min_per_km <= 0:
+        return None
+    total = int(round(float(min_per_km) * 60))
+    return f"{total // 60}:{total % 60:02d} /km"
+
+
+def _fmt_cadence(per_leg: Any, running: bool) -> str | None:
+    """Stored cadence (per leg for running) as the number to quote."""
+    if not per_leg:
+        return None
+    return f"{round(per_leg * 2)} spm" if running else f"{round(per_leg)} rpm"
+
+
+def _format_activity(r: dict[str, Any]) -> dict[str, Any]:
+    """One activity_summaries row with pace, duration and cadence ready to quote."""
+    running = _is_running(r["activity_type"])
+    pace = r["pace_min_km"]
+    if pace is None and r["avg_speed_kmh"]:
+        pace = 60.0 / r["avg_speed_kmh"]
+    duration = r["duration_hours"]
+    return {
+        "activity_id": r["activity_id"],
+        "activity_name": r["activity_name"],
+        "activity_type": r["activity_type"],
+        "start_date": r["start_date"],
+        "start_time": r["start_time_local"],
+        "duration": _fmt_duration(duration * 3600) if duration else None,
+        "distance_km": _round(r["distance_km"], 2) if r["distance_km"] else None,
+        "pace": _fmt_pace(pace) if running else None,
+        "speed_kmh": _round(r["avg_speed_kmh"], 1) if r["avg_speed_kmh"] and not running else None,
+        "cadence": _fmt_cadence(r["avg_cadence"], running),
+        "avg_hr": _round(r["avg_hr"]),
+        "max_hr": _round(r["max_hr"]),
+        "avg_power_w": _round(r["avg_power_w"]),
+        "training_load": _round(r["training_load"]),
+        "elevation_gain_m": _round(r["elevation_gain_m"]),
+        "weather_temp_c": r["weather_temp_c"],
+        "is_pr": bool(r["is_pr"]),
+    }
+
+
 class QueryError(Exception):
     """A read-only query was rejected by the Postgres driver."""
 
@@ -911,12 +994,7 @@ class ReadOnlyDB:
             date_start, date_end = date_end, date_start
         start = date_start or (date.today() - timedelta(days=days)).isoformat()
         params: list[Any] = [start]
-        sql = (
-            "SELECT activity_id, activity_name, activity_type, start_date, start_time_local, "
-            "duration_hours, distance_km, avg_hr, max_hr, pace_min_km, avg_speed_kmh, "
-            "avg_cadence, avg_power_w, training_load, elevation_gain_m, weather_temp_c, is_pr "
-            "FROM activity_summaries WHERE start_date >= %s "
-        )
+        sql = f"SELECT {_ACTIVITY_COLUMNS} FROM activity_summaries WHERE start_date >= %s "
         if date_end:
             sql += "AND start_date <= %s "
             params.append(date_end)
@@ -925,61 +1003,96 @@ class ReadOnlyDB:
             params.append(f"%{sport.strip()}%")
         sql += "ORDER BY start_date DESC, start_time_local DESC NULLS LAST LIMIT %s"
         params.append(limit)
-
         with self._connect() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
+        return [_format_activity(r) for r in rows]
 
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            dur = r["duration_hours"]
-            dur_fmt = None
-            if dur is not None and dur > 0:
-                h = int(dur)
-                m = int(round((dur - h) * 60))
-                dur_fmt = f"{h}h {m}m" if h else f"{m}m"
-
-            pace_val = r["pace_min_km"]
-            if pace_val is None and r["avg_speed_kmh"] and r["avg_speed_kmh"] > 0:
-                pace_val = 60.0 / r["avg_speed_kmh"]
-            pace_fmt = None
-            if pace_val is not None and pace_val > 0:
-                p_m = int(pace_val)
-                p_s = int(round((pace_val - p_m) * 60))
-                if p_s >= 60:
-                    p_m += 1
-                    p_s = 0
-                pace_fmt = f"{p_m}:{p_s:02d} /km"
-
-            cad = r["avg_cadence"]
-            cad_total = None
-            cad_unit = "rpm"
-            act_type = (r["activity_type"] or "").lower()
-            if cad is not None:
-                if "run" in act_type:
-                    cad_total = round(cad * 2)
-                    cad_unit = "total spm (both feet)"
-                else:
-                    cad_total = round(cad)
-                    cad_unit = "rpm"
-
-            out.append({
-                "activity_id": r["activity_id"],
-                "activity_name": r["activity_name"],
-                "activity_type": r["activity_type"],
-                "start_date": r["start_date"],
-                "duration": dur_fmt,
-                "distance_km": round(r["distance_km"], 2) if r["distance_km"] else None,
-                "pace": pace_fmt,
-                "cadence": f"{cad_total} {cad_unit}" if cad_total else None,
-                "avg_hr": round(r["avg_hr"]) if r["avg_hr"] else None,
-                "max_hr": round(r["max_hr"]) if r["max_hr"] else None,
-                "avg_power_w": round(r["avg_power_w"]) if r["avg_power_w"] else None,
-                "training_load": round(r["training_load"]) if r["training_load"] else None,
-                "elevation_gain_m": round(r["elevation_gain_m"]) if r["elevation_gain_m"] else None,
-                "weather_temp_c": r["weather_temp_c"],
-                "is_pr": bool(r["is_pr"]),
-            })
-        return out
+    def activity_detail(
+        self, activity_id: int | None = None, bucket_s: int = 60
+    ) -> dict[str, Any]:
+        """One activity in one call: its summary, its laps, and its time series
+        averaged into ``bucket_s``-second buckets of elapsed time (widened so
+        there are at most ``_MAX_BUCKETS``). ``activity_id=None`` is the most
+        recent activity."""
+        with self._connect() as conn:
+            if activity_id is None:
+                row = conn.execute(
+                    f"SELECT {_ACTIVITY_COLUMNS} FROM activity_summaries "
+                    "ORDER BY start_date DESC, start_time_local DESC NULLS LAST LIMIT 1"
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f"SELECT {_ACTIVITY_COLUMNS} FROM activity_summaries "
+                    "WHERE activity_id = %s",
+                    (int(activity_id),),
+                ).fetchone()
+            if row is None:
+                raise ValueError(f"activity {activity_id} not found")
+            aid = row["activity_id"]
+            span = conn.execute(
+                "SELECT MAX(elapsed_s) AS span FROM activity_detail_series "
+                "WHERE activity_id = %s",
+                (aid,),
+            ).fetchone()["span"] or 0
+            bucket = max(5, int(bucket_s), math.ceil(span / _MAX_BUCKETS))
+            series = conn.execute(
+                "SELECT FLOOR(elapsed_s / %s) * %s AS t, AVG(heart_rate) AS hr, "
+                "MAX(heart_rate) AS hr_max, AVG(speed_kmh) AS speed_kmh, "
+                "AVG(cadence) AS cadence, AVG(power_w) AS power_w, "
+                "AVG(elevation_m) AS elevation_m, MAX(distance_m) AS distance_m "
+                "FROM activity_detail_series "
+                "WHERE activity_id = %s AND elapsed_s IS NOT NULL "
+                "GROUP BY 1 ORDER BY 1",
+                (bucket, bucket, aid),
+            ).fetchall()
+            laps = conn.execute(
+                "SELECT split_number, split_type, start_time_s, duration_s, "
+                "distance_m, pace_sec_per_km, avg_hr, max_hr, avg_power, "
+                "avg_cadence, elevation_gain_m FROM activity_splits "
+                "WHERE activity_id = %s ORDER BY split_number",
+                (aid,),
+            ).fetchall()
+        running = _is_running(row["activity_type"])
+        points = [
+            {
+                "t": _fmt_duration(r["t"]),
+                "hr": _round(r["hr"]),
+                "hr_max": _round(r["hr_max"]),
+                "pace": _fmt_pace(60.0 / r["speed_kmh"]) if running and r["speed_kmh"] else None,
+                "speed_kmh": None if running else _round(r["speed_kmh"], 1),
+                "cadence": _fmt_cadence(r["cadence"], running),
+                "power_w": _round(r["power_w"]),
+                "elevation_m": _round(r["elevation_m"], 1),
+                "km": _round((r["distance_m"] or 0) / 1000.0, 2) if r["distance_m"] else None,
+            }
+            for r in series
+        ]
+        # Columnar and without all-NULL metrics: a ~200-row series stays small.
+        columns = [c for c in (points[0] if points else {}) if any(p[c] is not None for p in points)]
+        return {
+            "activity": _format_activity(row),
+            "laps": [
+                {
+                    "lap": lap["split_number"] + 1,
+                    "type": lap["split_type"],
+                    "start": _fmt_duration(lap["start_time_s"]),
+                    "duration": _fmt_duration(lap["duration_s"]),
+                    "km": _round((lap["distance_m"] or 0) / 1000.0, 2) if lap["distance_m"] else None,
+                    "pace": _fmt_pace(lap["pace_sec_per_km"] / 60.0) if running and lap["pace_sec_per_km"] else None,
+                    "avg_hr": _round(lap["avg_hr"]),
+                    "max_hr": _round(lap["max_hr"]),
+                    "cadence": _fmt_cadence(lap["avg_cadence"], running),
+                    "power_w": _round(lap["avg_power"]),
+                    "elevation_gain_m": _round(lap["elevation_gain_m"]),
+                }
+                for lap in laps
+            ],
+            "series": {
+                "bucket_s": bucket,
+                "columns": columns,
+                "rows": [[p[c] for c in columns] for p in points],
+            },
+        }
 
 
     def run_sql(self, sql: str) -> dict[str, Any]:
@@ -1003,12 +1116,15 @@ class ReadOnlyDB:
                 f"({', '.join(_ALLOWED_TABLES)})"
             )
         with self._connect() as conn:
+            # Tuple rows: a dict row would merge same-named columns
+            # (``SELECT AVG(a), AVG(b)`` -> one ``avg``).
+            cur = conn.cursor(row_factory=psycopg.rows.tuple_row)
             try:
-                cur = conn.execute(statement)
+                cur.execute(statement)
             except psycopg.Error as exc:
                 raise QueryError(f"{exc} | statement: {statement!r}") from exc
             columns = [d[0] for d in (cur.description or [])]
-            rows = [list(row.values()) for row in cur.fetchmany(_MAX_ROWS + 1)]
+            rows = cur.fetchmany(_MAX_ROWS + 1)
         truncated = len(rows) > _MAX_ROWS
         rows = rows[:_MAX_ROWS]
         return {
@@ -1460,6 +1576,18 @@ def _register_tools(
         ``limit`` caps the rows (default 10, max 50).
         """
         return db.recent_activities(sport, days, limit, date_start, date_end)
+
+    @tool("Analyzing the session…")
+    def get_activity_detail(activity_id: int | None = None, bucket_s: int = 60) -> Any:
+        """Return one activity in full: its summary, its laps (auto-laps or
+        manual lap presses, with pace/HR/cadence/power each) and its time
+        series averaged into ``bucket_s``-second buckets of elapsed time
+        (default 60; widened to at most 200 buckets). Omit ``activity_id`` for
+        the most recent activity. Use it for any question about how a single
+        session went — intervals, pacing, HR drift, fade — and use a smaller
+        ``bucket_s`` (e.g. 15) to resolve short efforts.
+        """
+        return db.activity_detail(activity_id, bucket_s)
 
     @tool("Validating chart…")
     def chart(spec: str) -> Any:

@@ -862,9 +862,11 @@ def parse_activity_detail_series(payload: dict[str, Any]) -> list[dict[str, Any]
     """Project the details payload into one wide per-tick row per data point.
 
     Each row carries the fields the activity recorded (heart rate, cadence,
-    power, speed, elevation, cumulative distance, lat/lon); metrics the sport
-    didn't record are left out (NULL at insert). A ``tick`` column gives the
-    0-based index within the activity so ordering survives aggregation.
+    power, speed, elevation, cumulative distance); metrics the sport didn't
+    record are left out (NULL at insert). A ``tick`` column gives the 0-based
+    index within the activity so ordering survives aggregation, and
+    ``elapsed_s`` the seconds since the first timestamped tick, so a session
+    can be bucketed by time without window functions.
     """
     columns = _series_index(payload)
     cadence_idx, cadence_scale = _pick_cadence(payload.get("metricDescriptors") or [])
@@ -893,6 +895,11 @@ def parse_activity_detail_series(payload: dict[str, Any]) -> list[dict[str, Any]
                     projected[col_name] = float(v)
         if len(projected) > 1:
             rows.append(projected)
+    t0 = next((r["ts_ms"] for r in rows if "ts_ms" in r), None)
+    if t0 is not None:
+        for r in rows:
+            if "ts_ms" in r:
+                r["elapsed_s"] = round((r["ts_ms"] - t0) / 1000.0, 1)
     return rows
 
 
@@ -988,25 +995,27 @@ def parse_activity_splits(payload: dict[str, Any]) -> list[dict[str, Any]]:
             row["duration_s"] = round(duration, 1)
         if distance and duration:
             row["pace_sec_per_km"] = round(duration / (distance / 1000.0), 1)
-        for src, col in (
-            ("averageHR", "avg_hr"),
-            ("avgHr", "avg_hr"),
-            ("maxHR", "max_hr"),
-            ("maxHr", "max_hr"),
-            ("averagePower", "avg_power"),
-            ("avgPower", "avg_power"),
-            ("maxPower", "max_power"),
-            ("averageRunCadence", "avg_cadence"),
-            ("averageBikeCadence", "avg_cadence"),
-            ("avgCadence", "avg_cadence"),
-            ("maxRunCadence", "max_cadence"),
-            ("maxBikeCadence", "max_cadence"),
-            ("maxCadence", "max_cadence"),
-            ("elevationGain", "elevation_gain_m"),
+        # Garmin's lap run cadence is both feet; halve it so running cadence
+        # is per leg in every table (as in the summary and the series).
+        for src, col, scale in (
+            ("averageHR", "avg_hr", 1.0),
+            ("avgHr", "avg_hr", 1.0),
+            ("maxHR", "max_hr", 1.0),
+            ("maxHr", "max_hr", 1.0),
+            ("averagePower", "avg_power", 1.0),
+            ("avgPower", "avg_power", 1.0),
+            ("maxPower", "max_power", 1.0),
+            ("averageRunCadence", "avg_cadence", 0.5),
+            ("averageBikeCadence", "avg_cadence", 1.0),
+            ("avgCadence", "avg_cadence", 1.0),
+            ("maxRunCadence", "max_cadence", 0.5),
+            ("maxBikeCadence", "max_cadence", 1.0),
+            ("maxCadence", "max_cadence", 1.0),
+            ("elevationGain", "elevation_gain_m", 1.0),
         ):
             value = _num(item.get(src))
             if value is not None:
-                row[col] = value
+                row[col] = value * scale
         elapsed = _num(item.get("elapsedDuration"))
         offset += elapsed if elapsed is not None else (duration or 0.0)
         rows.append(row)

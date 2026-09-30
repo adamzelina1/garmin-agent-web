@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS activity_detail_series (
     activity_id BIGINT NOT NULL,
     tick BIGINT NOT NULL,
     ts_ms DOUBLE PRECISION,
+    elapsed_s DOUBLE PRECISION,
     heart_rate DOUBLE PRECISION,
     cadence DOUBLE PRECISION,
     power_w DOUBLE PRECISION,
@@ -1161,7 +1162,7 @@ class Database:
         self.conn.commit()
 
     _ACTIVITY_SERIES_COLUMNS = (
-        "tick", "ts_ms", "heart_rate", "cadence", "power_w", "speed_kmh",
+        "tick", "ts_ms", "elapsed_s", "heart_rate", "cadence", "power_w", "speed_kmh",
         "elevation_m", "distance_m", "respiration_rate", "accumulated_power_w",
     )
 
