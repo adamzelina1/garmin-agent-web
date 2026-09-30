@@ -38,7 +38,8 @@
   button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   button.secondary { background:var(--panel2); border:1px solid var(--border); color:var(--text); }
   button:disabled { opacity:.55; cursor:default; }
-  #login-view button, #register-view button { width:100%; padding:10px; font-weight:600; }
+  #login-view button:not(.pwd-toggle), #register-view button:not(.pwd-toggle) {
+          width:100%; padding:10px; font-weight:600; }
   .spin { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,.35);
           border-top-color:#fff; border-radius:50%; margin-right:7px; vertical-align:-2px;
           animation:spin .7s linear infinite; }
