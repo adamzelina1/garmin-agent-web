@@ -6,7 +6,7 @@ import time
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable
 
-from garminconnect import Garmin
+from garminconnect import Garmin, GarminConnectConnectionError
 
 from .config import load_config
 from .datatypes import DataType, DEFAULT_TYPES, DATA_TYPES, resolve_types
@@ -412,6 +412,42 @@ class DataFetcher:
                 logger.info("Backfilled splits for activity %s", activity_id)
         return fetched
 
+    def has_day_data(self, day: date) -> bool:
+        """Whether the account recorded anything on ``day`` (one daily-summary call).
+
+        Pre-history days come back with ``includesWellnessData`` false and no
+        steps; Garmin may also answer an empty body or a 404. Any other error
+        (rate limit, network) propagates so a failed probe is never mistaken
+        for an empty day.
+        """
+        self._ensure_logged_in()
+        self._pace()
+        try:
+            payload = self.client.get_user_summary(day.isoformat())
+        except GarminConnectConnectionError as exc:
+            if "No data received" in str(exc) or "404" in str(exc):
+                return False
+            raise
+        return isinstance(payload, dict) and bool(
+            payload.get("includesWellnessData")
+            or payload.get("includesActivityData")
+            or payload.get("totalSteps")
+        )
+
+    def oldest_activity_date(self) -> date | None:
+        """Local start date of the account's first activity (two API calls)."""
+        self._ensure_logged_in()
+        self._pace()
+        total = self.client.count_activities()
+        if not total:
+            return None
+        self._pace()
+        items = self.client.get_activities(start=int(total) - 1, limit=1)
+        if not isinstance(items, list) or not items:
+            return None
+        started = str(items[0].get("startTimeLocal") or "")[:10]
+        return date.fromisoformat(started) if started else None
+
     def fetch_range(
         self, data_type: DataType, start: date, end: date, db: Database,
         refetch: set[str] | None = None,
@@ -758,6 +794,86 @@ def _resolve_start_date(
     if max_stored:
         return date.fromisoformat(max_stored) + timedelta(days=1)
     return date.today()
+
+
+#: Day offsets checked back from a probe point: a week, every other day, so a
+#: few days off the wrist don't read as "no history". Stops at the first hit.
+_PROBE_WINDOW = (0, 2, 4, 6)
+
+
+def detect_history_start(
+    fetcher: DataFetcher, today: date | None = None, *, max_years: int = 20,
+) -> date | None:
+    """Earliest day of the account's Garmin history, found by probing the API.
+
+    Anchors on the first activity (cheap and exact), then gallops back from
+    the earliest known-good day in doubling steps, probing one daily summary
+    per point. A probe that finds a week of nothing is not trusted on its own:
+    two points further back are checked too, so a months-long break in wearing
+    the watch is skipped rather than taken as the start. Once the gap is
+    confirmed, a binary search narrows the boundary to a week and a day-by-day
+    scan pins the first day. Roughly 30-60 Garmin calls for years of history.
+    Returns None when the account has no data at all.
+    """
+    today = today or date.today()
+    floor = today - timedelta(days=365 * max_years)
+
+    def window_hit(point: date) -> date | None:
+        for offset in _PROBE_WINDOW:
+            day = point - timedelta(days=offset)
+            if day < floor:
+                break
+            if fetcher.has_day_data(day):
+                return day
+        return None
+
+    # Earliest day known to hold data: the first activity, else the most
+    # recent data found galloping back from today.
+    known = fetcher.oldest_activity_date()
+    if known is None:
+        point, step = today, 7
+        while point >= floor and known is None:
+            known = window_hit(point)
+            point -= timedelta(days=step)
+            step *= 2
+        if known is None:
+            return None
+
+    step = 30
+    while True:
+        gap = max(known - timedelta(days=step), floor)
+        hit = window_hit(gap)
+        if hit is None:
+            # Confirm the gap further back before treating it as the start.
+            for mult in (2, 4):
+                far = known - timedelta(days=step * mult)
+                if far < floor:
+                    break
+                hit = window_hit(far)
+                if hit:
+                    break
+            if hit is None:
+                break
+        if hit >= known:  # pinned against the floor
+            return known
+        known = hit
+        step *= 2
+
+    # Boundary is in (gap, known]: binary search down to a week, then scan.
+    lo, hi = gap, known
+    while (hi - lo).days > 2 * len(_PROBE_WINDOW):
+        mid = lo + timedelta(days=(hi - lo).days // 2)
+        hit = window_hit(mid)
+        if hit and hit > lo:
+            hi = hit
+        else:
+            lo = mid
+    day = lo + timedelta(days=1)
+    while day < hi:
+        if fetcher.has_day_data(day):
+            return day
+        day += timedelta(days=1)
+    return hi
 
 
 # --- Backward-compatible heart-rate helpers ---------------------------------

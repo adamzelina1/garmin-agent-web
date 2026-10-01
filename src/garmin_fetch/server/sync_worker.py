@@ -25,7 +25,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from garminconnect import GarminConnectAuthenticationError
 
 from ..db import Database
-from ..fetcher import DataFetcher, refresh_weather_forecast, sync_data
+from ..fetcher import (
+    DataFetcher, detect_history_start, refresh_weather_forecast, sync_data,
+)
 
 from .auth import UserStore, now_iso
 from .crypto import Encryptor
@@ -131,14 +133,7 @@ class SyncManager:
             logger.info("skipping sync for user %s (rate-limited)", user_id)
             return None
 
-        garmin_password = self.encryptor.decrypt(user["garmin_cred_enc"])
-        token_string = (
-            self.encryptor.decrypt(user["tokens_enc"]) if user.get("tokens_enc") else ""
-        )
-        fetcher = DataFetcher(
-            user["garmin_email"], garmin_password, tokens_path=token_string,
-            sleep_sec=self.cfg.get("fetch_sleep_sec", 0.0),
-        )
+        fetcher, token_string = self._fetcher_for(user)
         db = Database.from_url(self.cfg["db_url"], user_id=user_id)
         sync_cfg = dict(self.cfg)
         if user.get("excluded_data_types"):
@@ -152,14 +147,7 @@ class SyncManager:
                 config=sync_cfg, db=db, fetcher=fetcher,
                 full_reparse=force_reparse,
             )
-            fresh_tokens = (
-                fetcher.get_token_string() if fetcher.is_authenticated() else ""
-            )
-            if fresh_tokens and fresh_tokens != token_string:
-                self.store.set_garmin_creds(
-                    user_id, user["garmin_cred_enc"],
-                    self.encryptor.encrypt(fresh_tokens),
-                )
+            self._save_tokens(user, fetcher, token_string)
             self.store.confirm(user_id)  # Garmin bind now known-good
             self.store.set_sync_status(
                 user_id,
@@ -170,7 +158,6 @@ class SyncManager:
             )
             logger.info("synced user %s: %s", user_id, counts)
             self._refresh_weather(user_id, user)
-            self._refine_start(user_id, current_start=user.get("sync_start_date"))
             self._autocomplete_plan(user_id)
             return counts
         except GarminConnectAuthenticationError as exc:
@@ -189,6 +176,65 @@ class SyncManager:
             return None
         finally:
             db.close()
+
+    def _fetcher_for(self, user: dict[str, Any]) -> tuple[DataFetcher, str]:
+        """A Garmin client for the account plus the token string it started with."""
+        garmin_password = self.encryptor.decrypt(user["garmin_cred_enc"])
+        token_string = (
+            self.encryptor.decrypt(user["tokens_enc"]) if user.get("tokens_enc") else ""
+        )
+        fetcher = DataFetcher(
+            user["garmin_email"], garmin_password, tokens_path=token_string,
+            sleep_sec=self.cfg.get("fetch_sleep_sec", 0.0),
+        )
+        return fetcher, token_string
+
+    def _save_tokens(
+        self, user: dict[str, Any], fetcher: DataFetcher, token_string: str
+    ) -> None:
+        fresh_tokens = fetcher.get_token_string() if fetcher.is_authenticated() else ""
+        if fresh_tokens and fresh_tokens != token_string:
+            self.store.set_garmin_creds(
+                user["id"], user["garmin_cred_enc"],
+                self.encryptor.encrypt(fresh_tokens),
+            )
+
+    def detect_start(self, user_id: int) -> str | None:
+        """Probe Garmin for the first day of the account's history (YYYY-MM-DD).
+
+        Runs in the caller's thread (a few dozen paced Garmin calls) and holds
+        the account's sync slot meanwhile, so a sync can't log in alongside it.
+        Returns None when the account has no data. Raises ``RuntimeError``
+        when a sync is in flight or the account is backed off; a Garmin failure
+        backs the account off like a failed sync and propagates.
+        """
+        user = self.store.get(user_id)
+        if not user:
+            raise RuntimeError("unknown account")
+        if self._backoff_active(user):
+            raise RuntimeError(
+                "Garmin is rate-limiting this account; try again after "
+                f"{user['rate_limit_until']}"
+            )
+        with self._lock:
+            if user_id in self._running or user_id in self._queued:
+                raise RuntimeError("a sync is running; try again when it finishes")
+            self._running.add(user_id)
+        try:
+            fetcher, token_string = self._fetcher_for(user)
+            try:
+                found = detect_history_start(fetcher)
+            except GarminConnectAuthenticationError:
+                raise
+            except Exception as exc:
+                self._record_failure(user_id, exc)
+                raise
+            self._save_tokens(user, fetcher, token_string)
+            logger.info("detected history start for user %s: %s", user_id, found)
+            return found.isoformat() if found else None
+        finally:
+            with self._lock:
+                self._running.discard(user_id)
 
     def _backoff_active(self, user: dict[str, Any]) -> bool:
         until = _parse_iso(user.get("rate_limit_until"))
@@ -242,38 +288,6 @@ class SyncManager:
                 "autocompleted %d workout(s) for user %s",
                 result["completed"], user_id,
             )
-
-    def _refine_start(self, user_id: int, current_start: str | None) -> None:
-        """Auto-refine the account's start date after a successful sync.
-
-        Determines the first day that is followed by sustained good data (a
-        sparse first day is confirmed as the start by the days after it), then
-        deletes the raw + projected daily rows before the refined date and
-        persists it as the account's ``sync_start_date`` so future backfills
-        skip the junk prefix. The start is never moved earlier than the user's
-        own configured choice, and a lone sparse day (with good data after it)
-        is kept, not trimmed. Best-effort: a failure only logs a warning and is
-        re-evaluated on the next sync.
-        """
-        from ..db import refine_user_start
-
-        try:
-            result = refine_user_start(
-                self.cfg["db_url"], user_id, current_start=current_start
-            )
-        except Exception as exc:  # noqa: BLE001 - refine must never break a sync
-            logger.warning(
-                "start-date refine failed for user %s: %s", user_id, exc
-            )
-            return
-        if not result:
-            return
-        recommended, pruned = result
-        self.store.set_config(user_id, sync_start_date=recommended)
-        logger.info(
-            "refined start date for user %s to %s (pruned %d row(s))",
-            user_id, recommended, pruned,
-        )
 
     def _record_failure(self, user_id: int, exc: Exception) -> None:
         user = self.store.get(user_id) or {}

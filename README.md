@@ -285,6 +285,11 @@ different number from cycling FTP (`cycling_ftp_watts`).
 Changing these takes effect retroactively on the next sync: dates before the
 start date are deleted, and newly-excluded types have their raw rows removed
 and their exclusive `daily_metrics` columns NULLed (shared columns kept).
+"Detect from Garmin" next to the start date (`POST /sync/detect-start`) finds
+the first day of the account's history: it anchors on the oldest activity, then
+gallops back probing daily summaries (each probe point checks a week, and an
+empty one is confirmed by two points further back so a break in wearing the
+watch isn't taken as the start), then binary-searches the boundary to the day.
 
 The legacy single-user CLI (`garmin-fetch` / `garmin-ask`) can still read
 `GARMIN_EMAIL` / `GARMIN_PASSWORD` / `GARMIN_TOKENS_PATH` and LLM settings from

@@ -783,7 +783,10 @@
           <label for="cfg-sync-start">Sync start date <span class="muted">(optional —
             backfills your Garmin history from this date on the next sync; blank keeps the
             current window)</span><span class="save-state" id="sync-start-saved"></span></label>
-          <input id="cfg-sync-start" type="date" class="date-input">
+          <div class="toolbar" style="margin-top:6px">
+            <input id="cfg-sync-start" type="date" class="date-input">
+            <button id="btn-detect-start" class="secondary" title="Probe Garmin for the first day your account has data (a few dozen paced requests)">Detect from Garmin</button>
+          </div>
           <div class="save-note" id="sync-start-state"></div>
           <div class="banner warn" style="margin-top:12px">Garmin rate-limits unofficial
             clients and can suspend accounts that hammer it. Syncs are spaced and auto-back-off on
@@ -4162,6 +4165,27 @@ async function saveStartDate() {
   } finally { input.disabled = false; }
 }
 
+// Ask the server to probe Garmin for the first day of history, then save it
+// like a hand-picked date so the next sync backfills from there.
+async function detectStartDate() {
+  const btn = $("btn-detect-start");
+  btn.disabled = true;
+  $("sync-start-state").textContent = "Looking for the start of your Garmin history… this can take a minute.";
+  try {
+    const r = await api("/sync/detect-start");
+    if (!r.start_date) {
+      $("sync-start-state").textContent = "Garmin has no data for this account yet.";
+      return;
+    }
+    $("cfg-sync-start").value = r.start_date;
+    await saveStartDate();
+    $("sync-start-state").textContent = "Your Garmin history starts " + fmtDay(parseISO(r.start_date), true)
+      + " — the next sync will backfill from there.";
+  } catch (e) {
+    $("sync-start-state").textContent = "Couldn't detect a start date: " + e.message;
+  } finally { btn.disabled = false; }
+}
+
 // Preferences save as soon as a field changes (text fields on blur/Enter), each
 // with its own "Saved ✓" — there is no separate Save button.
 async function saveConfigField(key, value, fieldId) {
@@ -4261,6 +4285,7 @@ for (const b of document.querySelectorAll("#settings-tabs button")) {
 }
 $("cfg-autosync").addEventListener("change", saveAutoSync);
 $("cfg-sync-start").addEventListener("change", saveStartDate);
+$("btn-detect-start").addEventListener("click", detectStartDate);
 wireConfigAutosave();
 $("open-principles").addEventListener("click", () => openTextModal("principles"));
 $("open-memory").addEventListener("click", () => openTextModal("memory"));

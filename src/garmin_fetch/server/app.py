@@ -9,6 +9,7 @@ API:
 - ``GET  /auth/me``         — current user (JWT)
 - ``POST /sync``            — enqueue the caller's own sync (JWT)
 - ``GET  /sync/status``     — sync status for the caller (JWT)
+- ``POST /sync/detect-start`` — probe Garmin for the caller's first day of history (JWT)
 - ``POST /cron/sync``       — daemon-only: enqueue every active user
 - ``GET  /acwr``            — acute-to-chronic workload ratio (JWT)
 - ``GET  /training/workouts``   — the caller's planned workouts (JWT, optional range)
@@ -431,6 +432,26 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             "queued": sync.enqueue(user["id"], force_reparse=True),
             "running": sync.is_running(user["id"]),
         }
+
+    @app.post("/sync/detect-start")
+    def detect_sync_start(
+        request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """Probe Garmin for the first day of the caller's history.
+
+        Only reports the date; the client saves it as ``sync_start_date``.
+        Blocks for the probe (tens of paced Garmin calls).
+        """
+        sync: SyncManager = request.app.state.sync
+        try:
+            found = sync.detect_start(user["id"])
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - surface Garmin failures
+            raise HTTPException(
+                502, f"couldn't reach Garmin: {type(exc).__name__}: {exc}"[:300]
+            ) from exc
+        return {"start_date": found}
 
     @app.get("/sync/status")
     def sync_status(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
