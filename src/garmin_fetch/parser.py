@@ -295,10 +295,12 @@ def _first_bucket(mapping: Any) -> dict[str, Any] | None:
 
 def parse_training_status(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    # VO2Max appears only when data exists for the day.
+    # Garmin's own carry of the last estimate (dated), which it drops 30 days
+    # after that estimate; the type is forward-filled past that cutoff.
     vo2 = _get(payload, "mostRecentVO2Max", "generic", default={})
     out.update(_leaf(vo2, [
         ("vo2max", "vo2MaxPreciseValue"),
+        ("vo2max_date", "calendarDate"),
     ]))
     # Load balance / status are keyed by device id (unknown at parse time).
     load = _first_bucket(_get(
@@ -360,13 +362,28 @@ def parse_sweat_loss(payload: dict[str, Any]) -> dict[str, Any]:
     ])
 
 
-def parse_weight(payload: dict[str, Any]) -> dict[str, Any]:
+def _weigh_in(
+    payload: dict[str, Any], pairs: list[tuple[str, str]]
+) -> dict[str, Any]:
+    """The day's weigh-in: Garmin reports masses in grams -> stored as kg.
+
+    Only a real weigh-in yields a row (no daily average fallback), tagged with
+    ``weight_date`` so the forward-filled value always says when it was
+    measured.
+    """
     entry = _first_entry(payload.get("dateWeightList"))
-    if entry is None:
-        entry = payload.get("totalAverage") or {}
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or _num(entry.get("weight")) is None:
         return {}
-    return _leaf(entry, [
+    out = _leaf(entry, pairs)
+    for column in ("weight_kg", "bone_mass_kg", "muscle_mass_kg"):
+        if (grams := _num(out.get(column))) is not None:
+            out[column] = round(grams / 1000, 2)
+    out["weight_date"] = entry.get("calendarDate") or payload.get("calendarDate")
+    return out
+
+
+def parse_weight(payload: dict[str, Any]) -> dict[str, Any]:
+    return _weigh_in(payload, [
         ("weight_kg", "weight"),
         ("bmi", "bmi"),
         ("body_fat_pct", "bodyFat"),
@@ -374,12 +391,7 @@ def parse_weight(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_body_composition(payload: dict[str, Any]) -> dict[str, Any]:
-    entry = _first_entry(payload.get("dateWeightList"))
-    if entry is None:
-        entry = payload.get("totalAverage") or {}
-    if not isinstance(entry, dict):
-        return {}
-    return _leaf(entry, [
+    return _weigh_in(payload, [
         ("weight_kg", "weight"),
         ("bmi", "bmi"),
         ("body_fat_pct", "bodyFat"),
@@ -533,16 +545,16 @@ TYPE_COLUMNS: dict[str, set[str]] = {
         "weekly_moderate", "weekly_vigorous", "weekly_total", "day_of_goal_met",
     },
     "training_status": {
-        "vo2max", "training_balance_feedback",
+        "vo2max", "vo2max_date", "training_balance_feedback",
         "weekly_training_load", "training_status_feedback",
     },
     "lactate_threshold": {
         "lactate_threshold_hr", "lactate_threshold_speed_kmh", "running_ftp_watts",
     },
     "sweat_loss": {"sweat_loss_ml"},
-    "weight": {"weight_kg", "bmi", "body_fat_pct"},
+    "weight": {"weight_kg", "bmi", "body_fat_pct", "weight_date"},
     "body_composition": {
-        "weight_kg", "bmi", "body_fat_pct", "body_water_pct", "bone_mass_kg",
+        "weight_kg", "bmi", "body_fat_pct", "weight_date", "body_water_pct", "bone_mass_kg",
         "muscle_mass_kg", "physique_rating", "visceral_fat", "metabolic_age",
     },
     "blood_pressure": {"systolic_bp", "diastolic_bp", "pulse_bpm"},
@@ -556,9 +568,14 @@ TYPE_COLUMNS: dict[str, set[str]] = {
 
 
 #: Types whose stored values persist until superseded (sparse, e.g. lactate
-#: threshold only updates when a session recalculates it). Days with no data
-#: keep the last known value instead of going NULL.
-_FFILL_TYPES = frozenset({"lactate_threshold"})
+#: threshold and cycling FTP only update when a session recalculates them,
+#: weight only on a weigh-in, VO2max only on a qualifying run). Days with no
+#: data keep the last known value instead of going NULL; ``weight_date`` and
+#: ``vo2max_date`` carry along so a carried value shows its age.
+_FFILL_TYPES = frozenset({
+    "lactate_threshold", "cycling_ftp", "weight", "body_composition",
+    "training_status",
+})
 
 
 def _forward_fill(parsed: dict[str, Any], carry: dict[str, Any]) -> dict[str, Any]:
