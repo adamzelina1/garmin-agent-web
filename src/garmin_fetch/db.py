@@ -660,6 +660,16 @@ class Database:
             )
         }
 
+    def stored_types(self) -> set[str]:
+        """Every data type with at least one stored raw row."""
+        (uid,) = self._uid()
+        return {
+            row["data_type"]
+            for row in self._execute(
+                "SELECT DISTINCT data_type FROM metrics WHERE user_id = ?", (uid,)
+            )
+        }
+
     def stored_fetches(self, data_type: str) -> dict[str, str]:
         """Map each stored calendar date to its fetched_at timestamp."""
         (uid,) = self._uid()

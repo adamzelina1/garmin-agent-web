@@ -683,6 +683,9 @@ def sync_data(
 
             enabled = {t.name for t in selected_types}
             excluded = [n for n in DAILY_TYPES if n not in enabled]
+            # Raw rows of types no longer in the registry (e.g. a retired
+            # fetcher) are never synced again, so they're pruned the same way.
+            excluded += sorted(db.stored_types() - set(DAILY_TYPES))
             if configured_start:
                 pruned = db.prune_dates_before(configured_start.isoformat())
                 if pruned:
@@ -954,8 +957,10 @@ def main() -> None:
             build_activity_summaries,
             build_activity_weather,
             build_daily_rows,
+            build_devices,
             build_gear,
             build_hr_zones,
+            build_power_zones,
             build_race_predictions,
         )
 
@@ -1000,6 +1005,10 @@ def main() -> None:
                 counts.update(build_race_predictions(db))
             if want_profile or not names:
                 counts.update(build_gear(db))
+            if want_profile or not names:
+                counts.update(build_power_zones(db))
+            if want_profile or not names:
+                counts.update(build_devices(db))
             counts.update(build_daily_rows(db, day_names or None, force=force))
             from .derived import build_derived
             counts.update(build_derived(db))
