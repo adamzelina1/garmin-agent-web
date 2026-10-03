@@ -792,7 +792,9 @@ class ReadOnlyDB:
 
     ``excluded_types`` is the account's disabled daily data types (a comma list
     string or an iterable): ``daily_metrics`` columns that no *enabled* type can
-    write are hidden, so the agent never pays tokens for metrics it has no data for.
+    write are hidden from the schema and day summaries and rejected in SQL, so
+    the agent never sees metrics the account turned off (even before the next
+    sync prunes their stored values).
     """
 
     def __init__(
@@ -806,10 +808,24 @@ class ReadOnlyDB:
         self.user_id = user_id
         if isinstance(excluded_types, str):
             excluded_types = excluded_types.split(",")
-        self._excluded = {s.strip() for s in excluded_types if s.strip()}
+        excluded = {s.strip() for s in excluded_types if s.strip()}
+        # Mirrors ``db.prune_excluded_types``: a column survives while any
+        # enabled type still writes it.
+        enabled = set().union(
+            *(cols for name, cols in TYPE_COLUMNS.items() if name not in excluded)
+        )
+        self._excluded_columns: frozenset[str] = frozenset(
+            set().union(*(TYPE_COLUMNS.get(name, set()) for name in excluded)) - enabled
+        )
         self._pool: Any = None
         self._table_names: list[str] | None = None
         self._forbidden: re.Pattern | None = None
+        self._excluded_re: re.Pattern | None = None
+        if self._excluded_columns:
+            alternatives = "|".join(
+                sorted(map(re.escape, self._excluded_columns), key=len, reverse=True)
+            )
+            self._excluded_re = re.compile(rf"\b(?:{alternatives})\b", re.IGNORECASE)
 
     @contextmanager
     def _connect(self) -> Any:
@@ -870,13 +886,7 @@ class ReadOnlyDB:
             ]
         if table != "daily_metrics":
             return cols
-        # Drop day-metric columns only disabled data types write (mirrors
-        # ``db.prune_excluded_types``); system columns no type claims are kept.
-        claimed = set().union(*TYPE_COLUMNS.values())
-        enabled = set().union(
-            *(cols_ for name, cols_ in TYPE_COLUMNS.items() if name not in self._excluded)
-        )
-        return [c for c in cols if c["name"] not in claimed or c["name"] in enabled]
+        return [c for c in cols if c["name"] not in self._excluded_columns]
 
     def data_span(self) -> tuple[date | None, date | None]:
         """(first, last) date with any stored data, or ``(None, None)``.
@@ -935,7 +945,9 @@ class ReadOnlyDB:
             metrics = {
                 k: _jsonable(v)
                 for k, v in dict(row).items()
-                if v is not None and k not in ("user_id", "calendar_date", "fetched_at")
+                if v is not None
+                and k not in ("user_id", "calendar_date", "fetched_at")
+                and k not in self._excluded_columns
             }
         return {
             "calendar_date": day,
@@ -1145,6 +1157,12 @@ class ReadOnlyDB:
             raise ValueError(
                 "statement references a table outside the allowed set "
                 f"({', '.join(_ALLOWED_TABLES)})"
+            )
+        excluded = self._excluded_re and self._excluded_re.search(statement)
+        if excluded:
+            raise ValueError(
+                f"column {excluded.group(0)} belongs to a data type this account "
+                "has disabled; it holds no data"
             )
         with self._connect() as conn:
             # Tuple rows: a dict row would merge same-named columns
