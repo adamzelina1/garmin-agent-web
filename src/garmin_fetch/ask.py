@@ -88,6 +88,13 @@ _WRITE_WORDS = re.compile(
 
 _MAX_ROWS = 500
 
+#: A ``daily_metrics`` column counts as empty for an account (hidden like a
+#: disabled type's columns) when under this share of its days hold a value AND
+#: it has fewer than ``_SPARSE_MAX_VALUES`` values — so a handful of monthly
+#: weigh-ins still stays visible once enough of them accumulate.
+_SPARSE_MAX_SHARE = 0.01
+_SPARSE_MAX_VALUES = 10
+
 #: Tables the agent may see and query. Everything else (raw ``metrics``,
 #: ``activities``, ``user_profile``, ``sync_state``) stays invisible to the
 #: model — and, at the database level, unreadable by the agent's SELECT-only
@@ -792,9 +799,10 @@ class ReadOnlyDB:
 
     ``excluded_types`` is the account's disabled daily data types (a comma list
     string or an iterable): ``daily_metrics`` columns that no *enabled* type can
-    write are hidden from the schema and day summaries and rejected in SQL, so
-    the agent never sees metrics the account turned off (even before the next
-    sync prunes their stored values).
+    write — plus columns that are (almost) empty for this account — are hidden
+    from the schema and day summaries and rejected in SQL, so the agent never
+    sees metrics the account turned off (even before the next sync prunes their
+    stored values) or that its devices don't record.
     """
 
     def __init__(
@@ -820,12 +828,8 @@ class ReadOnlyDB:
         self._pool: Any = None
         self._table_names: list[str] | None = None
         self._forbidden: re.Pattern | None = None
-        self._excluded_re: re.Pattern | None = None
-        if self._excluded_columns:
-            alternatives = "|".join(
-                sorted(map(re.escape, self._excluded_columns), key=len, reverse=True)
-            )
-            self._excluded_re = re.compile(rf"\b(?:{alternatives})\b", re.IGNORECASE)
+        self._hidden: frozenset[str] | None = None
+        self._hidden_re: re.Pattern | None = None
 
     @contextmanager
     def _connect(self) -> Any:
@@ -846,6 +850,46 @@ class ReadOnlyDB:
                     "SELECT set_config('app.user_id', %s, true)", (str(self.user_id),)
                 )
             yield conn
+
+    def _hidden_columns(self) -> frozenset[str]:
+        """``daily_metrics`` columns the agent must not see for this account.
+
+        The disabled types' columns plus every column that is (almost) empty
+        for this account (see ``_SPARSE_MAX_SHARE``): the table is shared, so
+        it carries columns other accounts' devices create. One counting query
+        per handle; the regex ``run_sql`` checks is built alongside.
+        """
+        if self._hidden is None:
+            hidden = set(self._excluded_columns)
+            with self._connect() as conn:
+                names = [
+                    r["column_name"] for r in conn.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'daily_metrics' AND column_name NOT IN "
+                        "('user_id', 'calendar_date', 'fetched_at')"
+                    ).fetchall()
+                ]
+                counts = conn.execute(
+                    "SELECT count(*) AS n, "
+                    + ", ".join(f'count("{c}") AS "{c}"' for c in names)
+                    + " FROM daily_metrics"
+                ).fetchone() if names else {"n": 0}
+            total = counts["n"]
+            if total:
+                hidden |= {
+                    c for c in names
+                    if counts[c] < _SPARSE_MAX_VALUES
+                    and counts[c] < total * _SPARSE_MAX_SHARE
+                }
+            self._hidden = frozenset(hidden)
+            if hidden:
+                alternatives = "|".join(
+                    sorted(map(re.escape, hidden), key=len, reverse=True)
+                )
+                self._hidden_re = re.compile(
+                    rf"\b(?:{alternatives})\b", re.IGNORECASE
+                )
+        return self._hidden
 
     def _all_tables(self) -> list[str]:
         """Every public table name (listed once per handle)."""
@@ -886,7 +930,8 @@ class ReadOnlyDB:
             ]
         if table != "daily_metrics":
             return cols
-        return [c for c in cols if c["name"] not in self._excluded_columns]
+        hidden = self._hidden_columns()
+        return [c for c in cols if c["name"] not in hidden]
 
     def data_span(self) -> tuple[date | None, date | None]:
         """(first, last) date with any stored data, or ``(None, None)``.
@@ -947,7 +992,7 @@ class ReadOnlyDB:
                 for k, v in dict(row).items()
                 if v is not None
                 and k not in ("user_id", "calendar_date", "fetched_at")
-                and k not in self._excluded_columns
+                and k not in self._hidden_columns()
             }
         return {
             "calendar_date": day,
@@ -1158,11 +1203,12 @@ class ReadOnlyDB:
                 "statement references a table outside the allowed set "
                 f"({', '.join(_ALLOWED_TABLES)})"
             )
-        excluded = self._excluded_re and self._excluded_re.search(statement)
-        if excluded:
+        self._hidden_columns()
+        hidden = self._hidden_re and self._hidden_re.search(statement)
+        if hidden:
             raise ValueError(
-                f"column {excluded.group(0)} belongs to a data type this account "
-                "has disabled; it holds no data"
+                f"column {hidden.group(0)} holds no usable data for this account "
+                "(its data type is disabled or it is almost never recorded)"
             )
         with self._connect() as conn:
             # Tuple rows: a dict row would merge same-named columns
