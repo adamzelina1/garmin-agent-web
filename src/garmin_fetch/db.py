@@ -213,7 +213,6 @@ CREATE TABLE IF NOT EXISTS gear (
     name TEXT,
     total_distance_km DOUBLE PRECISION,
     activity_count BIGINT,
-    last_activity_date TEXT,
     retired BOOLEAN,
     fetched_at TEXT,
     PRIMARY KEY (user_id, gear_uuid)
@@ -1238,13 +1237,13 @@ class Database:
                 """
                 INSERT INTO gear (
                     user_id, gear_uuid, gear_type, name, total_distance_km,
-                    activity_count, last_activity_date, retired, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    activity_count, retired, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uid, row.get("gear_uuid"), row.get("gear_type"),
                     row.get("name"), row.get("total_distance_km"),
-                    row.get("activity_count"), row.get("last_activity_date"),
+                    row.get("activity_count"),
                     row.get("retired"), row.get("fetched_at"),
                 ),
             )

@@ -120,7 +120,7 @@ def parse_sleep(payload: dict[str, Any]) -> dict[str, Any]:
         if h is not None:
             out[name] = h
     out.update(_leaf(dto, [
-        ("average_respiration", "averageRespirationValue"),
+        ("respiration_sleep_avg", "averageRespirationValue"),
         ("awake_count", "awakeCount"),
         ("avg_sleep_stress", "avgSleepStress"),
     ]))
@@ -158,11 +158,20 @@ def parse_hrv(payload: dict[str, Any]) -> dict[str, Any]:
     ])
 
 
+def _drop_negative(out: dict[str, Any], *columns: str) -> dict[str, Any]:
+    """Drop Garmin's negative "not enough data" sentinels (e.g. stress -1)."""
+    for column in columns:
+        value = out.get(column)
+        if isinstance(value, (int, float)) and value < 0:
+            del out[column]
+    return out
+
+
 def parse_stress(payload: dict[str, Any]) -> dict[str, Any]:
-    return _leaf(payload, [
+    return _drop_negative(_leaf(payload, [
         ("avg_stress", "avgStressLevel"),
         ("max_stress", "maxStressLevel"),
-    ])
+    ]), "avg_stress", "max_stress")
 
 
 def parse_respiration(payload: dict[str, Any]) -> dict[str, Any]:
@@ -218,13 +227,16 @@ def parse_daily_summary(payload: dict[str, Any]) -> dict[str, Any]:
         ("body_battery_lowest", "bodyBatteryLowestValue"),
         ("body_battery_most_recent", "bodyBatteryMostRecentValue"),
         ("body_battery_at_wake", "bodyBatteryAtWakeTime"),
-        ("average_spo2", "averageSpo2"),
-        ("lowest_spo2", "lowestSpo2"),
-        ("latest_spo2", "latestSpo2"),
-        ("highest_respiration", "highestRespirationValue"),
-        ("lowest_respiration", "lowestRespirationValue"),
-        ("avg_waking_respiration", "avgWakingRespirationValue"),
+        # Same metrics as the spo2/respiration types, under their names, so
+        # either source fills one column.
+        ("spo2_avg", "averageSpo2"),
+        ("spo2_lowest", "lowestSpo2"),
+        ("spo2_latest", "latestSpo2"),
+        ("respiration_highest", "highestRespirationValue"),
+        ("respiration_lowest", "lowestRespirationValue"),
+        ("respiration_waking_avg", "avgWakingRespirationValue"),
     ])
+    _drop_negative(out, "avg_stress", "max_stress")
     # Activity intensity buckets arrive in seconds; project into hours.
     for src, name in (
         ("highlyActiveSeconds", "highly_active_hours"),
@@ -442,35 +454,41 @@ def parse_hill_score(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def parse_running_tolerance(payload: dict[str, Any]) -> dict[str, Any]:
+def _range_entry(payload: Any) -> dict[str, Any] | None:
+    """The day's entry from a range endpoint, or None when Garmin sent none.
+
+    The fetcher wraps a non-dict response as ``{"value": <response>}``, so a
+    ``value`` key holds the entry list; only a payload without one is itself
+    the entry (never the wrapper, whose ``value`` would read as a reading).
+    """
     if isinstance(payload, list):
-        payload = {"value": payload}
-    entry = _first_entry(payload.get("value"))
-    if entry is None:
-        entry = _first_entry(payload)
+        return _first_entry(payload)
+    if not isinstance(payload, dict):
+        return None
+    if "value" in payload and not isinstance(payload["value"], (int, float)):
+        return _first_entry(payload["value"])
+    return payload
+
+
+def parse_running_tolerance(payload: dict[str, Any]) -> dict[str, Any]:
+    entry = _range_entry(payload)
     if entry is None:
         return {}
-    return _leaf(entry, [
-        ("running_tolerance", "runningTolerance"),
-        ("running_tolerance_value", "value"),
-    ])
+    out = _leaf(entry, [("running_tolerance", "runningTolerance")])
+    if (value := _num(entry.get("value"))) is not None:
+        out["running_tolerance_value"] = value
+    return out
 
 
 def parse_cycling_ftp(payload: dict[str, Any]) -> dict[str, Any]:
     """Cycling functional threshold power (watts) from the FTP endpoint."""
-    if isinstance(payload, list):
-        payload = {"value": payload}
-    entry = _first_entry(payload.get("value"))
-    if entry is None:
-        entry = _first_entry(payload)
+    entry = _range_entry(payload)
     if entry is None:
         return {}
-    out = _leaf(entry, [
-        ("cycling_ftp_watts", "ftp"),
-        ("cycling_ftp_watts", "functionalThresholdPower"),
-        ("cycling_ftp_watts", "value"),
-    ])
-    return out
+    for key in ("ftp", "functionalThresholdPower", "value"):
+        if (watts := _num(entry.get(key))) is not None:
+            return {"cycling_ftp_watts": watts}
+    return {}
 
 
 #: Registry: data-type name -> extractor.
@@ -509,7 +527,7 @@ TYPE_COLUMNS: dict[str, set[str]] = {
     "sleep": {
         "sleep_time_hours", "nap_time_hours", "deep_sleep_hours",
         "light_sleep_hours", "rem_sleep_hours", "awake_sleep_hours",
-        "unmeasurable_sleep_hours", "average_respiration", "awake_count",
+        "unmeasurable_sleep_hours", "respiration_sleep_avg", "awake_count",
         "avg_sleep_stress", "sleep_start_local", "sleep_end_local",
         "resting_hr", "hrv_status", "body_battery_change",
         "restless_moments_count", "sleep_score", "sleep_score_qualifier",
@@ -533,8 +551,8 @@ TYPE_COLUMNS: dict[str, set[str]] = {
         "vigorous_intensity_minutes",
         "body_battery_charged", "body_battery_drained", "body_battery_highest",
         "body_battery_lowest", "body_battery_most_recent",
-        "body_battery_at_wake", "average_spo2", "lowest_spo2", "latest_spo2",
-        "highest_respiration", "lowest_respiration", "avg_waking_respiration",
+        "body_battery_at_wake", "spo2_avg", "spo2_lowest", "spo2_latest",
+        "respiration_highest", "respiration_lowest", "respiration_waking_avg",
         "highly_active_hours", "active_hours", "sedentary_hours",
     },
     "body_battery": {"body_battery_net_change"},
@@ -903,6 +921,8 @@ def parse_activity_detail_series(payload: dict[str, Any]) -> list[dict[str, Any]
                 continue
             v = metrics[idx]
             if isinstance(v, (int, float)) and v == v:  # reject NaN only
+                if col_name == "heart_rate" and v <= 0:
+                    continue  # strap dropout, not a reading
                 if col_name == "cadence":
                     projected[col_name] = float(v) * cadence_scale
                 elif col_name == "speed_kmh":
@@ -1257,7 +1277,7 @@ def build_race_predictions(db: Any) -> dict[str, int]:
 #
 # Garmin gear (bikes, shoes, ...) is a current "what's in your garage" snapshot,
 # like hr_zones: one entry per item with its cumulative stats (distance ridden,
-# max speed, activity count, last use). Stored raw in ``user_profile``
+# max speed, activity count). Stored raw in ``user_profile``
 # (profile_type='gear') and projected below into one ``gear`` row per item,
 # replacing the whole table each sync (no history).
 
@@ -1284,10 +1304,10 @@ def parse_gear(payload: Any) -> list[dict[str, Any]]:
 
     The gear list may come back as a bare list or wrapped (e.g.
     ``{"gearList": [...]}``). Only a minimal, high-signal set is kept per item:
-    type, name, cumulative distance, activity count, last use and retired
+    type, name, cumulative distance, activity count and retired
     status. ``name`` is the user's nickname (``displayName``) when set,
     otherwise the real product name (``customMakeModel``, e.g. "novablast 5").
-    Cumulative stats (total distance, activity count, last activity date)
+    Cumulative stats (total distance, activity count)
     arrive per item from the stats endpoint merged into the same dict.
     Distance is meters -> km.
     """
@@ -1312,9 +1332,6 @@ def parse_gear(payload: Any) -> list[dict[str, Any]]:
             "gear_type": _gear_value(item, "gearTypeName", "typeKey", "type", "gearType"),
             "name": _gear_value(item, "displayName", "nickname")
             or _gear_value(item, "customMakeModel", "customModel", "model"),
-            "last_activity_date": _iso_date(
-                _gear_value(item, "lastActivityDate", "lastUsedDate")
-            ),
         }
         distance_m = _gear_value(item, "totalDistance", "totalDistanceMeters", "distance")
         if isinstance(distance_m, (int, float)):
@@ -1380,7 +1397,8 @@ def parse_devices(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "device_id": device_id,
-                "model_name": item.get("modelName"),
+                "model_name": item.get("modelName")
+                or item.get("deviceTypeSimpleName"),
                 "display_name": item.get("displayName") or item.get("deviceName"),
             }
         )

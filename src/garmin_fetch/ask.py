@@ -112,8 +112,8 @@ _ALLOWED_TABLES = (
 _DERIVED_TREND_METRICS = ("acwr", "run_acwr", "run_cadence_drift")
 _DAILY_TREND_METRICS = (
     "sleep_score", "sleep_time_hours", "resting_hr", "hrv_last_night_avg",
-    "vo2max", "total_steps", "total_distance_m", "stress_avg",
-    "body_battery_max", "body_battery_min", "weight_kg", "sweat_loss_ml",
+    "vo2max", "total_steps", "total_distance_m", "avg_stress",
+    "body_battery_highest", "body_battery_lowest", "weight_kg", "sweat_loss_ml",
 )
 
 #: Data-driven schema annotations: table-level overviews and per-column
@@ -158,7 +158,7 @@ _TABLE_NOTES: dict[str, str] = {
         "sport; current snapshot"
     ),
     "race_predictions": "single current-fitness snapshot of 5k/10k/half/marathon finish times",
-    "gear": "one row per equipment item (type, name, cumulative distance, activity count, last use, retired); current snapshot",
+    "gear": "one row per equipment item (type, name, cumulative distance, activity count, retired); current snapshot",
     "devices": "one row per Garmin device (model name); current snapshot",
     "derived_metrics": (
         "one row per (calendar_date, metric); daily derived scores recomputed "
@@ -213,12 +213,19 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "sleep_end_local": "wall-clock HH:MM",
         "sleep_score": "0-100",
         "hrv_last_night_avg": "HRV score (ms)",
-        "vo2max": "precise VO2max estimate; Garmin's most-recent value, already populated daily",
+        "vo2max": "precise VO2max estimate, forward-filled from the last one (see vo2max_date)",
+        "vo2max_date": "date of the estimate vo2max is carried from",
+        "weight_kg": "kg, forward-filled from the last weigh-in (see weight_date)",
+        "weight_date": "date of the weigh-in weight_kg/bmi/body_fat_pct come from",
+        "body_battery_change": "Body Battery charged DURING SLEEP (the night ending this day)",
+        "body_battery_net_change": "net Body Battery change over the WHOLE day",
+        "avg_stress": "0-100; NULL when Garmin had too little data",
+        "day_of_goal_met": "weekday the weekly intensity-minutes goal was reached (e.g. 'Tue'), NULL if not yet",
         "resting_hr": "bpm; no 7-day avg stored — compute rolling averages yourself",
         "lactate_threshold_hr": "bpm, forward-filled",
         "lactate_threshold_speed_kmh": "km/h, forward-filled",
         "running_ftp_watts": "running FTP (watts), forward-filled",
-        "cycling_ftp_watts": "cycling FTP (watts); absent without a power meter",
+        "cycling_ftp_watts": "cycling FTP (watts), forward-filled; absent without a power meter",
         "sweat_loss_ml": "estimated sweat loss (ml)",
     },
     "activity_summaries": {
@@ -226,7 +233,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "distance_km": "km",
         "duration_hours": "hours",
         "elapsed_hours": "hours",
-        "moving_hours": "hours",
+        "moving_hours": "hours; 0 for indoor activities without GPS — use duration_hours there",
         "avg_hr": "bpm",
         "max_hr": "bpm",
         "pace_min_km": "running min/km (decimal, 5.5 = 5:30); NULL for non-running",
@@ -239,7 +246,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "max_cadence": "same unit as avg_cadence (per-leg spm running / rpm cycling)",
         "vo2max": "the activity's own VO2max estimate",
         "weather_temp_c": "degC",
-        "weather_apparent_c": "degC",
+        "weather_apparent_c": "feels-like degC; Garmin often just repeats weather_temp_c",
         "weather_humidity": "0-100",
         "weather_wind_kmh": "km/h",
         "weather_description": "e.g. 'Fair'; NULL for indoor/weatherless",
@@ -359,7 +366,7 @@ returning raw numbers.
 {overview}
 
 Common columns (write SQL with these directly; call `table_schema` for any other):
-- **daily_metrics**: `calendar_date`, `resting_hr` (bpm), `hrv_last_night_avg` (ms), `sleep_score` (0-100), `sleep_time_hours`, `vo2max`, `total_steps`, `total_distance_m` (METRES), `body_battery_max/min`, `stress_avg`, `weight_kg`
+- **daily_metrics**: `calendar_date`, `resting_hr` (bpm), `hrv_last_night_avg` (ms), `sleep_score` (0-100), `sleep_time_hours`, `vo2max`, `total_steps`, `total_distance_m` (METRES), `body_battery_highest/lowest`, `avg_stress`, `weight_kg`
 - **activity_summaries**: `activity_id`, `activity_name`, `activity_type` (running, cycling, ...), `start_date`, `duration_hours`, `distance_km` (KM), `avg_hr`, `max_hr`, `pace_min_km` (decimal min/km; 5.5 = 5:30), `avg_cadence` (PER LEG), `avg_power_w`, `training_load`, `elevation_gain_m`, `weather_temp_c`
 - **derived_metrics**: `calendar_date`, `metric` ('acwr', 'run_acwr', 'run_cadence_drift'), `value`, `qualifier`
 - **weather_forecast**: `calendar_date`, `temp_max_c`, `temp_min_c`, `precip_mm`, `wind_max_kmh`, `condition_code`
@@ -1403,9 +1410,7 @@ _COLUMN_NAME_DOCS: tuple[tuple[str, str], ...] = (
     ("spo2_latest", "blood-oxygen saturation (%)"),
     ("spo2_lowest", "blood-oxygen saturation (%)"),
     ("spo2_last_7d_avg", "7-day average blood-oxygen saturation (%)"),
-    ("weight_kg", "body weight (kg), carried forward from the last weigh-in"),
-    ("weight_date", "date of the weigh-in weight_kg/bmi/body_fat_pct come from"),
-    ("vo2max_date", "date of the VO2max estimate vo2max is carried from"),
+    ("weight_kg", "body weight (kg)"),
     ("bmi", "body mass index"),
     ("body_fat_pct", "body-fat percentage"),
     ("total_distance_m", "distance (metres)"),
