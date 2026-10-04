@@ -42,20 +42,49 @@ class TrainingWorkoutStore:
         date_start: str | None = None,
         date_end: str | None = None,
     ) -> list[dict[str, Any]]:
-        """All workouts, optionally bounded by inclusive planned_date range."""
+        """All workouts, optionally bounded by inclusive planned_date range.
+
+        A workout linked to a synced activity also carries ``actual``: that
+        activity's headline numbers, for the calendar's planned-vs-actual line.
+        """
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
-            sql = "SELECT * FROM training_workout WHERE user_id = %s"
+            sql = (
+                "SELECT w.*, a.distance_km AS act_distance_km, "
+                "a.duration_hours AS act_duration_hours, "
+                "a.pace_min_km AS act_pace_min_km, a.avg_hr AS act_avg_hr, "
+                "a.avg_power_w AS act_avg_power_w "
+                "FROM training_workout w LEFT JOIN activity_summaries a "
+                "ON a.user_id = w.user_id "
+                "AND a.activity_id = w.completed_activity_id "
+                "WHERE w.user_id = %s"
+            )
             params: list[Any] = [user_id]
             if date_start:
-                sql += " AND planned_date >= %s"
+                sql += " AND w.planned_date >= %s"
                 params.append(date_start)
             if date_end:
-                sql += " AND planned_date <= %s"
+                sql += " AND w.planned_date <= %s"
                 params.append(date_end)
-            sql += " ORDER BY planned_date, id"
+            sql += " ORDER BY w.planned_date, w.id"
             rows = conn.execute(sql, params).fetchall()
-        return [_workout_row(r) for r in rows]
+        out = []
+        for r in rows:
+            d = _workout_row(r)
+            if r["completed_activity_id"] is not None and (
+                r["act_distance_km"] is not None
+                or r["act_duration_hours"] is not None
+            ):
+                hours = r["act_duration_hours"]
+                d["actual"] = {
+                    "distance_km": r["act_distance_km"],
+                    "duration_min": round(hours * 60) if hours is not None else None,
+                    "pace_min_km": r["act_pace_min_km"],
+                    "avg_hr": r["act_avg_hr"],
+                    "avg_power_w": r["act_avg_power_w"],
+                }
+            out.append(d)
+        return out
 
     def create(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
         with self._pool.connection() as conn:
