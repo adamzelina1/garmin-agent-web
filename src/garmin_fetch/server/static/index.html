@@ -471,11 +471,21 @@
   .plan-card.done .pc-type { color:var(--ok); }
   .plan-card.done .pc-title { color:#9fb8aa; text-decoration:line-through; text-decoration-color:rgba(34,197,94,.6); }
   .plan-card.done .pc-meta { color:var(--muted); opacity:.85; }
-  .plan-card .pc-actual { margin-top:2px; }
-  .plan-card .pc-actual-label { font-size:10px; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
-                                color:var(--ok); margin-right:7px; }
-  .plan-card .pc-diff { margin-left:7px; font-size:10.5px; font-weight:600; color:var(--muted); white-space:nowrap; }
-  .plan-card .pc-diff.off { color:#f59e0b; }
+  .plan-compare { margin-top:14px; }
+  .pcmp-title { font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+                color:var(--muted); margin:0 0 6px 2px; }
+  .pcmp-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:10px; }
+  .pcmp-day { display:flex; flex-direction:column; gap:6px; min-width:0; }
+  .pcmp-item { background:var(--surface-1); border-radius:8px; border-left:3px solid var(--muted);
+               padding:7px 9px; font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .pcmp-head { display:flex; justify-content:space-between; align-items:baseline; gap:6px; margin-bottom:3px;
+               font-size:10px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; }
+  .pcmp-diff { font-size:13px; letter-spacing:0; text-transform:none; color:var(--ok); white-space:nowrap; }
+  .pcmp-diff.off { color:#f59e0b; }
+  .pcmp-line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; line-height:1.55; }
+  .pcmp-line .pcmp-planned { opacity:.75; }
+  .pcmp-line b { font-weight:600; color:#c6d0da; }
+  .pcmp-line em { font-style:normal; font-size:.82em; opacity:.7; margin-left:3px; }
   .plan-card.done:hover { background:rgba(34,197,94,.10); }
   .plan-card.dragging { opacity:.5; }
   .plan-day.drag-over { border-color:var(--accent); box-shadow:0 0 0 1px rgba(59,130,246,.45); }
@@ -755,6 +765,10 @@
         </div>
         <div class="banner err hidden" id="plan-error"></div>
         <div class="plan-week" id="plan-week"></div>
+        <div class="plan-compare hidden" id="plan-compare">
+          <div class="pcmp-title">Planned → actual</div>
+          <div class="pcmp-grid" id="plan-compare-grid"></div>
+        </div>
         <div class="plan-list hidden" id="plan-list"></div>
       </div>
     </div>
@@ -1015,6 +1029,8 @@ function showAuth() {
   planLoadSeq++;   // drop any plan load still in flight for the old user
   $("chat").innerHTML = "";
   $("plan-week").innerHTML = "";
+  $("plan-compare-grid").innerHTML = "";
+  $("plan-compare").classList.add("hidden");
   for (const k of Object.keys(TODAY_CARDS)) delete TODAY_CARDS[k];
   planGoals = []; planWorkouts = []; planActivities = []; planActiveBlocks = [];
   planSelectedGoalId = null;
@@ -1909,6 +1925,7 @@ function applyPlanView() {
   $("plan-view-week").classList.toggle("active", !list);
   $("plan-view-list").classList.toggle("active", list);
   $("plan-week").classList.toggle("hidden", list);
+  $("plan-compare").classList.toggle("hidden", list || !planCompareHas);
   $("plan-list").classList.toggle("hidden", !list);
   localStorage.setItem("plan_view", planView);
 }
@@ -2829,6 +2846,7 @@ function renderPlan(workouts) {
     installDayDrop(day);
     grid.appendChild(day);
   }
+  renderPlanCompare(workouts);
   updatePlanWeekLabel();
 }
 
@@ -2990,53 +3008,89 @@ function workoutTipNode(w) {
   return wrap;
 }
 
-// "Actual" line for a workout linked to a synced activity: the activity's
-// distance/duration, plus pace/power only when the plan targeted them, and
-// avg HR. A ▲/▼ % compares actual to planned volume (distance, else duration).
-function workoutActualNode(w) {
+// Planned-vs-actual strip under the week grid: one column per day, aligned
+// with the day cards, listing each workout linked to a synced activity. Kept
+// out of the cards so they stay readable. The headline % compares actual to
+// planned volume (distance, else duration); pace/power rows appear only when
+// the plan targeted them.
+let planCompareHas = false;
+
+function compareLine(planned, actual, unit) {
+  if (actual == null || actual === "") return null;
+  const row = document.createElement("div");
+  row.className = "pcmp-line";
+  const p = document.createElement("span");
+  p.className = "pcmp-planned";
+  p.textContent = planned != null && planned !== "" ? planned + " → " : "";
+  const b = document.createElement("b");
+  b.textContent = actual;
+  const u = document.createElement("em");
+  u.textContent = unit;
+  row.appendChild(p); row.appendChild(b); row.appendChild(u);
+  return row;
+}
+
+function workoutCompareNode(w) {
   const a = w.actual;
   if (!a || w.activity_type === "rest") return null;
-  const parts = [];
-  if (a.distance_km != null && Number(a.distance_km) > 0) {
-    parts.push({ v: Number(a.distance_km).toFixed(1), u: "km" });
-  }
-  if (a.duration_min != null && Number(a.duration_min) > 0) {
-    parts.push({ v: String(a.duration_min), u: "min" });
-  }
-  if (w.target_pace_min_km != null) {
-    const pace = fmtPace(a.pace_min_km);
-    if (pace) {
-      const sp = pace.lastIndexOf(" ");
-      parts.push({ v: pace.slice(0, sp), u: pace.slice(sp + 1), title: "Average pace" });
-    }
-  }
-  if (a.avg_hr != null) parts.push({ v: String(Math.round(a.avg_hr)), u: "bpm", title: "Average heart rate" });
-  if (w.target_power_w != null && a.avg_power_w != null) {
-    parts.push({ v: String(Math.round(a.avg_power_w)), u: "W", title: "Average power" });
-  }
-  if (!parts.length) return null;
-  const row = document.createElement("div");
-  row.className = "pc-meta pc-actual";
-  const label = document.createElement("span");
-  label.className = "pc-actual-label";
-  label.textContent = "actual";
-  row.appendChild(label);
-  for (const part of parts) row.appendChild(metricNode(part));
-  let planned = null, done = null;
-  if (Number(w.distance_km) > 0 && Number(a.distance_km) > 0) {
-    planned = Number(w.distance_km); done = Number(a.distance_km);
-  } else if (Number(w.duration_min) > 0 && Number(a.duration_min) > 0) {
-    planned = Number(w.duration_min); done = Number(a.duration_min);
-  }
-  if (planned) {
-    const pct = Math.round((done / planned - 1) * 100);
+  const box = document.createElement("div");
+  box.className = "pcmp-item";
+  box.style.borderLeftColor = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
+  const pDist = Number(w.distance_km) > 0 ? Number(w.distance_km) : null;
+  const aDist = Number(a.distance_km) > 0 ? Number(a.distance_km) : null;
+  const pDur = Number(w.duration_min) > 0 ? Number(w.duration_min) : null;
+  const aDur = Number(a.duration_min) > 0 ? Number(a.duration_min) : null;
+  let pct = null;
+  if (pDist && aDist) pct = Math.round((aDist / pDist - 1) * 100);
+  else if (pDur && aDur) pct = Math.round((aDur / pDur - 1) * 100);
+  const head = document.createElement("div");
+  head.className = "pcmp-head";
+  const type = document.createElement("span");
+  type.textContent = w.activity_type;
+  head.appendChild(type);
+  if (pct != null) {
     const diff = document.createElement("span");
-    diff.className = "pc-diff" + (Math.abs(pct) > 10 ? " off" : "");
-    diff.textContent = pct === 0 ? "=" : (pct > 0 ? "▲" : "▼") + Math.abs(pct) + "%";
-    diff.title = "Actual vs planned " + (Number(w.distance_km) > 0 ? "distance" : "duration");
-    row.appendChild(diff);
+    diff.className = "pcmp-diff" + (Math.abs(pct) > 10 ? " off" : "");
+    diff.textContent = pct === 0 ? "on plan" : (pct > 0 ? "+" : "−") + Math.abs(pct) + "%";
+    diff.title = "Actual vs planned " + (pDist && aDist ? "distance" : "duration");
+    head.appendChild(diff);
   }
-  return row;
+  box.appendChild(head);
+  const lines = [
+    compareLine(pDist, aDist != null ? aDist.toFixed(1) : null, "km"),
+    compareLine(pDur, aDur, "min"),
+  ];
+  if (w.target_pace_min_km != null) {
+    const pp = fmtPace(w.target_pace_min_km), ap = fmtPace(a.pace_min_km);
+    if (ap) lines.push(compareLine(pp ? pp.split(" ")[0] : null, ap.split(" ")[0], "/km"));
+  }
+  if (w.target_power_w != null && a.avg_power_w != null) {
+    lines.push(compareLine(Number(w.target_power_w), Math.round(a.avg_power_w), "W"));
+  }
+  if (a.avg_hr != null) lines.push(compareLine(null, Math.round(a.avg_hr), "bpm"));
+  for (const l of lines) if (l) box.appendChild(l);
+  return box;
+}
+
+function renderPlanCompare(workouts) {
+  const wrap = $("plan-compare");
+  const grid = $("plan-compare-grid");
+  grid.innerHTML = "";
+  planCompareHas = false;
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(planWeekStart);
+    d.setDate(d.getDate() + i);
+    const iso = fmt(d);
+    const cell = document.createElement("div");
+    cell.className = "pcmp-day";
+    for (const w of workouts) {
+      if (w.planned_date !== iso) continue;
+      const node = workoutCompareNode(w);
+      if (node) { cell.appendChild(node); planCompareHas = true; }
+    }
+    grid.appendChild(cell);
+  }
+  wrap.classList.toggle("hidden", !planCompareHas || planView === "list");
 }
 
 function workoutCard(w) {
@@ -3081,8 +3135,6 @@ function workoutCard(w) {
   }
   for (const part of metrics) m.appendChild(metricNode(part));
   card.appendChild(head); card.appendChild(title); card.appendChild(m);
-  const actual = workoutActualNode(w);
-  if (actual) card.appendChild(actual);
   card.addEventListener("click", () => openPlanModal(w, w.planned_date));
   card.draggable = true;
   card.style.cursor = "grab";
