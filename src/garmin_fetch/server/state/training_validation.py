@@ -32,6 +32,10 @@ PLAN_STATUSES = ("planned", "completed", "partial", "skipped")
 #: recovery); the flat duration/distance/targets remain the workout summary.
 STEP_KINDS = ("warmup", "steady", "work", "recovery", "cooldown", "rest")
 
+#: Activity types that may be saved without structured steps (every other
+#: workout must carry at least one).
+STEPLESS_TYPES = ("rest",)
+
 #: Hard backstops so a runaway edit can't bloat a single workout row.
 _MAX_STEPS = 50
 _MAX_STEP_TEXT = 80
@@ -162,6 +166,15 @@ def _normalize_steps(value: Any) -> str | None:
     return json.dumps(steps, ensure_ascii=False) if steps else None
 
 
+def _require_steps(activity_type: Any, steps: Any) -> None:
+    """Raise ``ValueError`` unless a non-rest workout has at least one step."""
+    if activity_type not in STEPLESS_TYPES and not _parse_steps(steps):
+        raise ValueError(
+            f"a {activity_type} workout needs at least one step "
+            "(only rest days may have none)"
+        )
+
+
 def _normalize_workout(
     data: dict[str, Any], *, partial: bool = False
 ) -> dict[str, Any]:
@@ -229,6 +242,8 @@ def _normalize_workout(
             if value in (None, ""):
                 continue
             fields[key] = _normalize_status(value)
+    if not partial:
+        _require_steps(fields["activity_type"], fields.get("steps"))
     return fields
 
 
@@ -253,6 +268,20 @@ def _parse_steps(raw: Any) -> list[dict[str, Any]]:
     return raw if isinstance(raw, list) else []
 
 
+def _fallback_steps(row: Any) -> list[dict[str, Any]]:
+    """One steady step spanning the workout, for rows saved before steps were
+    required. Read-only: nothing is written back until the workout is next
+    edited. Empty for rest days or when there is no duration to span."""
+    minutes = row.get("duration_min")
+    if row.get("activity_type") in STEPLESS_TYPES or not minutes or minutes <= 0:
+        return []
+    step: dict[str, Any] = {"kind": "steady", "duration_sec": int(minutes) * 60}
+    for key in ("intensity", "target_pace_min_km", "target_hr_zone", "target_power_w"):
+        if row.get(key) not in (None, ""):
+            step[key] = row[key]
+    return [step]
+
+
 def _workout_row(row: Any) -> dict[str, Any]:
     """Shape one DB row into the JSON the API/agent/tab all consume.
 
@@ -275,7 +304,7 @@ def _workout_row(row: Any) -> dict[str, Any]:
         "target_pace_min_km": row.get("target_pace_min_km"),
         "target_hr_zone": row.get("target_hr_zone"),
         "target_power_w": row.get("target_power_w"),
-        "steps": _parse_steps(row.get("steps")),
+        "steps": _parse_steps(row.get("steps")) or _fallback_steps(row),
         "status": status,
         "completed": status in ("completed", "partial"),
         "completed_activity_id": row["completed_activity_id"],

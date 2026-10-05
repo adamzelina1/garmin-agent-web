@@ -925,7 +925,7 @@
         </div>
       </div>
       <div class="steps-head">
-        <label style="margin:0">Structured steps <span class="muted">(optional)</span></label>
+        <label style="margin:0">Structured steps <span class="muted">(at least 1; optional for rest)</span></label>
         <button type="button" id="pm-add-step" class="secondary">+ Add step</button>
       </div>
       <div id="pm-steps"></div>
@@ -3304,8 +3304,8 @@ function updateWorkoutPhaseBadge() {
 // ---- Structured-workout step editor ----------------------------------------
 // Each `.step-row` is one interval; `collectSteps` reads the rows back into the
 // API's step shape (duration in seconds, targets optional) and `updateStepsTotal`
-// keeps the running total in sync. Steps are only written when the user opens
-// the editor, so a plain workout never carries an empty array.
+// keeps the running total in sync. Every workout except a rest day needs at
+// least one step (enforced server-side too), so a new workout starts with one.
 
 function stepInput(row, cls, type, placeholder, value) {
   const input = document.createElement("input");
@@ -3421,6 +3421,7 @@ function openPlanModal(workout, date) {
     ? (workout.status || (workout.completed ? "completed" : "planned"))
     : "planned";
   renderStepEditor(workout ? workout.steps : null);
+  if (!workout) addStepRow({ kind: "steady" });
   updateWorkoutPhaseBadge();
   $("pm-delete").classList.toggle("hidden", !workout);
   $("plan-modal-title").textContent = workout ? "Edit workout" : "Add workout";
@@ -3449,6 +3450,10 @@ async function savePlan() {
     status: $("pm-status").value,
   };
   if (!body.planned_date) { setErr($("plan-modal-error"), "pick a date"); return; }
+  if (body.activity_type !== "rest" && !body.steps.length) {
+    setErr($("plan-modal-error"), "add at least one step with a duration");
+    return;
+  }
   try {
     // PATCH on edit: only the fields above change, so the link and any field
     // the form does not carry are preserved server-side.

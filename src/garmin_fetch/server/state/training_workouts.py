@@ -11,6 +11,7 @@ from .training_validation import (
     _build_set,
     _normalize_workout,
     _opt_int,
+    _require_steps,
     _workout_row,
 )
 
@@ -143,6 +144,11 @@ class TrainingWorkoutStore:
                 "WHERE user_id = %s AND id = %s RETURNING *",
                 (*params, user_id, workout_id),
             ).fetchone()
+            # Only a patch touching steps/type is checked, so moving or
+            # completing an older step-less workout still works. Raising here
+            # rolls the UPDATE back with the transaction.
+            if row and ("steps" in fields or "activity_type" in fields):
+                _require_steps(row["activity_type"], row["steps"])
         return _workout_row(row) if row else None
 
     def _delete(self, conn: Any, user_id: int, workout_id: int) -> bool:

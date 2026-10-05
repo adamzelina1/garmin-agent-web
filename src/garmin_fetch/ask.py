@@ -302,9 +302,9 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "target_hr_zone": "prescribed HR zone/target, free text (e.g. 'Z2' or '140-150')",
         "target_power_w": "prescribed power in watts (int)",
         "steps": (
-            "ordered JSON array of the session's segments, present whenever a "
-            "workout has more than one (warm-up/work/recovery/cool-down, "
-            "intervals, strides, ...); stored as "
+            "ordered JSON array of the session's segments (warm-up/work/"
+            "recovery/cool-down, intervals, strides, ...); at least one for "
+            "every non-rest workout, though older rows may be NULL; stored as "
             "{kind: warmup/steady/work/recovery/cooldown/rest, duration_sec, "
             "repeat?, label?, intensity?, target_pace_min_km?, target_hr_zone?, "
             "target_power_w?}; label is a short segment name (no duration/rep). "
@@ -1848,9 +1848,9 @@ def _register_tools(
             (easy/moderate/hard/race_pace), target_pace_min_km (decimal min/km,
             5.5 = 5:30), target_hr_zone, target_power_w, status
             (planned/completed/partial/skipped), optional goal_id override
-            (workouts attach to the active block/goal by date). Add ``steps``
-            whenever a session has more than one segment (warm-up/cool-down,
-            intervals, strides, progressive runs): an ordered list of {kind
+            (workouts attach to the active block/goal by date). ``steps`` is
+            REQUIRED on every new workout except rest days (at least one; a
+            single steady step for a plain run): an ordered list of {kind
             (warmup/steady/work/recovery/cooldown/rest), duration
             ('15m'/'90s'/'1:30'), repeat?, label? (1-2 words, never digits or
             times), intensity?, target_pace_min_km?, target_hr_zone?,
