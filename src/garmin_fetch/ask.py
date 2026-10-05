@@ -304,7 +304,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "steps": (
             "ordered JSON array of the session's segments (warm-up/work/"
             "recovery/cool-down, intervals, strides, ...); at least one for "
-            "every non-rest workout, though older rows may be NULL; stored as "
+            "every non-rest workout (NULL only on rest days); stored as "
             "{kind: warmup/steady/work/recovery/cooldown/rest, duration_sec, "
             "repeat?, label?, intensity?, target_pace_min_km?, target_hr_zone?, "
             "target_power_w?}; label is a short segment name (no duration/rep). "
