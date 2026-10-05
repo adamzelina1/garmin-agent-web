@@ -2939,7 +2939,7 @@ function fmtTotalMin(sec) {
 }
 
 function stepName(s) {
-  const meta = STEP_KIND_MAP[s.kind] || STEP_KIND_MAP.steady;
+  const meta = STEP_KIND_MAP[s.kind];
   return (s.repeat && s.repeat > 1 ? s.repeat + "× " : "") + (s.label || meta.label);
 }
 
@@ -2965,7 +2965,7 @@ function stepsBlockNode(steps, className) {
   const rows = document.createElement("div");
   rows.className = "steps-list-rows";
   for (const s of steps) {
-    const meta = STEP_KIND_MAP[s.kind] || STEP_KIND_MAP.steady;
+    const meta = STEP_KIND_MAP[s.kind];
     const row = document.createElement("div");
     row.className = "step-line";
     const dot = document.createElement("span");
@@ -3332,7 +3332,7 @@ function addStepRow(step) {
     o.value = value; o.textContent = label;
     kind.appendChild(o);
   }
-  kind.value = STEP_KIND_MAP[s.kind] ? s.kind : "steady";
+  kind.value = s.kind || "steady";
   kind.addEventListener("change", updateStepsTotal);
   row.appendChild(kind);
 
@@ -3417,9 +3417,7 @@ function openPlanModal(workout, date) {
   $("pm-pace").value = workout && workout.target_pace_min_km != null ? workout.target_pace_min_km : "";
   $("pm-hrzone").value = workout ? (workout.target_hr_zone || "") : "";
   $("pm-power").value = workout && workout.target_power_w != null ? workout.target_power_w : "";
-  $("pm-status").value = workout
-    ? (workout.status || (workout.completed ? "completed" : "planned"))
-    : "planned";
+  $("pm-status").value = workout ? workout.status : "planned";
   renderStepEditor(workout ? workout.steps : null);
   if (!workout) addStepRow({ kind: "steady" });
   updateWorkoutPhaseBadge();

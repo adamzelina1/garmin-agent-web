@@ -256,16 +256,10 @@ def _normalize_status(value: Any) -> str:
 
 
 
-def _parse_steps(raw: Any) -> list[dict[str, Any]]:
-    """Decode the stored ``steps`` JSON column into a list (never raises)."""
-    if not raw:
-        return []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
-            return []
-    return raw if isinstance(raw, list) else []
+def _parse_steps(raw: str | None) -> list[dict[str, Any]]:
+    """Decode the stored ``steps`` JSON column (canonical, from
+    :func:`_normalize_steps`) into a list."""
+    return json.loads(raw) if raw else []
 
 
 def _workout_row(row: Any) -> dict[str, Any]:
@@ -275,9 +269,7 @@ def _workout_row(row: Any) -> dict[str, Any]:
     ``completed`` is derived from it for the UI/legacy callers, so the two can
     never disagree.
     """
-    status = row.get("status")
-    if status not in PLAN_STATUSES:
-        status = "planned"
+    status = row["status"]
     d = {
         "id": row["id"],
         "planned_date": row["planned_date"],
