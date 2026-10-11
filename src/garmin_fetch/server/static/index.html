@@ -737,6 +737,22 @@
           <div id="runacwr-chart"></div>
         </div>
       </div>
+
+      <div class="card td-card" data-load="zonepace">
+        <button class="td-head" aria-expanded="false">
+          <span class="td-chev">▸</span>
+          <span class="td-ttl">
+            <span class="td-t">Pace by HR Zone</span>
+            <span class="td-sub">Learned from your recent runs · used to estimate planned run distance</span>
+          </span>
+          <span class="td-val"><span id="zonepace-headval">–</span><span class="td-val-unit">Z2 /km</span></span>
+        </button>
+        <div class="td-details hidden">
+          <div class="banner warn hidden" id="zonepace-hint">No zone paces yet. They appear after a sync
+            once Garmin has a lactate threshold and running HR zones for you.</div>
+          <div id="zonepace-summary"></div>
+        </div>
+      </div>
       </div>
     </div>
 
@@ -891,11 +907,11 @@
       <textarea id="pm-description" rows="3" placeholder="Warm-up, main set, cool-down…"></textarea>
       <div class="row">
         <div>
-          <label>Duration (min)</label>
+          <label title="Computed from the steps when the workout has any">Duration (min) · from steps</label>
           <input type="number" id="pm-duration" min="0" placeholder="30">
         </div>
         <div>
-          <label>Distance (km)</label>
+          <label title="Runs: leave empty to fill in the estimate from each step's pace or HR-zone pace">Distance (km)</label>
           <input type="number" id="pm-distance" min="0" step="any" placeholder="5.0">
         </div>
       </div>
@@ -4087,6 +4103,66 @@ function loadToday() {
   loadBriefing();
   loadAcwrCard("acwr");
   loadAcwrCard("runacwr");
+  loadZonePaceCard();
+}
+
+// -- Today: learned pace per HR zone ----------------------------------------
+const ZONE_COLORS = ["#94a3b8", "#3b82f6", "#22c55e", "#f59e0b", "#ef4444"];
+
+async function loadZonePaceCard() {
+  const box = $("zonepace-summary");
+  const hint = $("zonepace-hint");
+  hint.classList.add("hidden");
+  try {
+    const data = await api("/zone-paces", undefined, "GET");
+    const p = data.paces;
+    box.innerHTML = "";
+    if (!p || !p.zones) {
+      setTodayHead("zonepace", "–", "");
+      hint.classList.remove("hidden");
+      return;
+    }
+    const pace = (v) => (fmtPace(v) || "—").replace(" /km", "");
+    setTodayHead("zonepace", p.zones["2"] ? pace(p.zones["2"].pace_min_km) : "–", ZONE_COLORS[1]);
+
+    const grid = document.createElement("div");
+    grid.className = "metric-grid";
+    for (let z = 1; z <= 5; z++) {
+      const info = p.zones[String(z)];
+      if (!info) continue;
+      const lo = info.hr_min, hi = info.hr_max;
+      const bpm = lo != null && hi != null ? lo + "–" + hi
+        : hi != null ? "< " + (hi + 1) : lo != null ? "≥ " + lo : "";
+      const c = document.createElement("div");
+      c.className = "metric-comp";
+      c.style.borderLeft = "3px solid " + ZONE_COLORS[z - 1];
+      const l = document.createElement("div");
+      l.className = "r-label";
+      l.textContent = "Zone " + z + (bpm ? " · " + bpm + " bpm" : "");
+      const v = document.createElement("div");
+      v.className = "r-value";
+      v.textContent = pace(info.pace_min_km) + " /km";
+      const s = document.createElement("div");
+      s.className = "r-sub";
+      s.textContent = "± " + Math.round(info.sd_s) + " s · "
+        + (info.minutes ? info.minutes + " min of running" : "no data yet, Friel default");
+      c.appendChild(l); c.appendChild(v); c.appendChild(s);
+      grid.appendChild(c);
+    }
+    box.appendChild(grid);
+
+    const meta = document.createElement("div");
+    meta.className = "metric-meta";
+    meta.style.marginTop = "10px";
+    meta.textContent = "Threshold pace " + (fmtPace(p.lt_pace) || "—")
+      + " · learned minute by minute from runs ≤ " + data.max_temp_c + " °C, recent runs weigh most ("
+      + data.half_life_days + "-day half-life) · zones with little data lean on Friel's "
+      + "threshold-pace ratios · as of " + fmtDay(parseISO(p.as_of));
+    box.appendChild(meta);
+  } catch (e) {
+    setTodayHead("zonepace", "–", "");
+    box.innerHTML = '<div class="banner err">' + escapeHtml(e.message) + "</div>";
+  }
 }
 
 const DATA_TYPES = [

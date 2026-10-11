@@ -5,13 +5,14 @@ facade."""
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from ...db import open_pg_pool
 from .training_workouts import TrainingWorkoutStore
 from .training_anchor import TrainingAnchorStore
 from .training_agenda import build_agenda
+from .training_rules import _first_monday
 
 
 #: ``user_state`` key holding the one season undo snapshot. Reusing the existing
@@ -142,7 +143,40 @@ class TrainingStore:
                 or result.get("workouts", {}).get("deleted")
             ):
                 _write_snapshot(conn, user_id, before)
+        # Read after commit: every week the edit touched, with its target vs
+        # the now-scheduled volume, so the caller sees a missed weekly target
+        # immediately instead of summing workouts itself.
+        dates = list(result.get("workouts", {}).pop("dates", []))
+        dates += [
+            w["week_start"] for b in blocks if isinstance(b, dict)
+            for w in (b.get("weeks") or []) if isinstance(w, dict) and w.get("week_start")
+        ]
+        weeks = self._week_coverage(user_id, dates)
+        if weeks:
+            result["weeks"] = weeks
         return result
+
+    def _week_coverage(self, user_id: int, dates: list[str]) -> list[dict[str, Any]]:
+        """Compact per-goal target/scheduled/delta for the weeks of ``dates``."""
+        mondays = {_first_monday(date.fromisoformat(d[:10])).isoformat() for d in dates}
+        if not mondays:
+            return []
+        lo, hi = min(mondays), max(mondays)
+        hi = (date.fromisoformat(hi) + timedelta(days=6)).isoformat()
+        out = []
+        for row in self.anchor.coverage_range(user_id, lo, hi):
+            cov = row["coverage"]
+            if row["week_start"] not in mondays or cov.get("target") is None:
+                continue
+            out.append({
+                "week_start": row["week_start"],
+                "goal_id": row["goal_id"],
+                "unit": cov["unit"],
+                "target": cov["target"],
+                "scheduled": cov["scheduled"],
+                "delta": cov["delta"],
+            })
+        return out
 
     # -- one season-wide snapshot / undo --------------------------------------
 

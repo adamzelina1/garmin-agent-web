@@ -518,6 +518,26 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         scored = [d for d in days if d.get("run_acwr") is not None]
         return {"today": scored[-1] if scored else None, "days": days}
 
+    @app.get("/zone-paces")
+    def zone_paces(request: Request, user: dict = Depends(get_user)) -> dict[str, Any]:
+        """The learned running pace per HR zone (stored in ``derived_metrics``,
+        recomputed each sync). ``paces`` is None until a sync has a lactate
+        threshold and HR zones to work from."""
+        from ..db import PostgresBackend
+        from ..zone_pace import HALF_LIFE_DAYS, MAX_TEMP_C, read_zone_paces
+
+        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
+        conn = backend.connect()
+        try:
+            paces = read_zone_paces(conn)
+        finally:
+            conn.close()
+        return {
+            "paces": paces,
+            "half_life_days": HALF_LIFE_DAYS,
+            "max_temp_c": MAX_TEMP_C,
+        }
+
     # -- training workouts ----------------------------------------------------
 
     @app.get("/training/workouts")

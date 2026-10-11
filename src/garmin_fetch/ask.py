@@ -171,7 +171,10 @@ _TABLE_NOTES: dict[str, str] = {
         "(pace-normalised cadence z-score over the trailing 90d fit — negative = "
         "overstriding / worse mechanics) with run_cadence (spm PER LEG; total "
         "both-feet = 2x) and run_gct_ms, "
-        "qualifier Form Up/Stable/Form Dropping/Breaking Down. Pivot with "
+        "qualifier Form Up/Stable/Form Dropping/Breaking Down. "
+        "'zone_pace_z1'..'zone_pace_z5' (dated today): learned running pace "
+        "per HR zone in decimal min/km, qualifier JSON with sd_s / minutes / "
+        "ratio to lactate-threshold pace. Pivot with "
         "WHERE metric = '<name>' (a day's components share its calendar_date)"
     ),
     "training_workout": (
@@ -296,7 +299,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
     },
     "training_workout": {
         "activity_type": "run/cycle/swim/strength/rest/other",
-        "duration_min": "planned minutes",
+        "duration_min": "planned minutes (computed from steps)",
         "distance_km": "planned km",
         "target_pace_min_km": "prescribed running pace as DECIMAL min/km (5.5 = 5:30)",
         "target_hr_zone": "prescribed HR zone/target, free text (e.g. 'Z2' or '140-150')",
@@ -368,7 +371,7 @@ returning raw numbers.
 Common columns (write SQL with these directly; call `table_schema` for any other):
 - **daily_metrics**: `calendar_date`, `resting_hr` (bpm), `hrv_last_night_avg` (ms), `sleep_score` (0-100), `sleep_time_hours`, `vo2max`, `total_steps`, `total_distance_m` (METRES), `body_battery_highest/lowest`, `avg_stress`, `weight_kg`
 - **activity_summaries**: `activity_id`, `activity_name`, `activity_type` (running, cycling, ...), `start_date`, `duration_hours`, `distance_km` (KM), `avg_hr`, `max_hr`, `pace_min_km` (decimal min/km; 5.5 = 5:30), `avg_cadence` (PER LEG), `avg_power_w`, `training_load`, `elevation_gain_m`, `weather_temp_c`
-- **derived_metrics**: `calendar_date`, `metric` ('acwr', 'run_acwr', 'run_cadence_drift'), `value`, `qualifier`
+- **derived_metrics**: `calendar_date`, `metric` ('acwr', 'run_acwr', 'run_cadence_drift', 'zone_pace_z1'..'z5'), `value`, `qualifier`
 - **weather_forecast**: `calendar_date`, `temp_max_c`, `temp_min_c`, `precip_mm`, `wind_max_kmh`, `condition_code`
 
 Query rules:
@@ -1837,14 +1840,25 @@ def _register_tools(
             ``action="apply"`` makes one ATOMIC edit (all or nothing). ``spec``
             is JSON with a ``"workouts"`` and/or an ``"anchor"`` section, or
             ``{"undo": true}`` to roll back the last destructive edit. The
-            result lists the changed ids, so no follow-up read is needed.
+            result lists the changed ids plus ``weeks``: each touched week's
+            target, ``scheduled`` volume and ``delta`` — so no follow-up read is
+            needed. Before answering, fix every ``warnings`` entry and bring
+            every ``delta`` near 0 by adjusting workouts (never do the week sums
+            yourself).
+
+            ``duration_min`` is computed from the steps' total time — never
+            send it. A run's ``distance_km`` is yours to set, but it is checked
+            against its steps (time / pace; a step with an HR zone uses the
+            learned pace for that zone, listed in the agenda's ``zone_paces``):
+            a mismatch over 10% comes back as a warning. Omit it to have the
+            steps' estimate filled in.
 
             "workouts": a list of entries. An entry with ``id`` is PATCHED (send
             only what changes); one without creates. ``delete_ids`` deletes. To
             move or copy workouts, read them first — never guess ids. Fields:
             planned_date, activity_type (run/cycle/swim/strength/rest/other),
             title, description (ONE short line, <= ~200 chars, about THIS
-            session), duration_min, distance_km, intensity
+            session), distance_km, intensity
             (easy/moderate/hard/race_pace), target_pace_min_km (decimal min/km,
             5.5 = 5:30), target_hr_zone, target_power_w, status
             (planned/completed/partial/skipped), optional goal_id override
@@ -1854,7 +1868,9 @@ def _register_tools(
             (warmup/steady/work/recovery/cooldown/rest), duration
             ('15m'/'90s'/'1:30'), repeat?, label? (1-2 words, never digits or
             times), intensity?, target_pace_min_km?, target_hr_zone?,
-            target_power_w?}.
+            target_power_w?}. Every non-rest step of a RUN needs a
+            target_pace_min_km or a target_hr_zone ('Z2', 'Z1-Z2'): pace for
+            reps/race pace, HR zone for easy/steady running.
 
             "anchor": ``goal_id`` patches that goal (omit to create one; a
             blocks-only spec targets the sole goal); fields title, sport

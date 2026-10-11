@@ -191,4 +191,22 @@ def build_agenda(
     }
     if total > _MAX_WORKOUTS:
         payload["workouts_truncated"] = {"total": total, "shown": _MAX_WORKOUTS}
+    paces = workouts_store.zone_paces(user_id)
+    if paces:
+        payload["zone_paces"] = _zone_pace_summary(paces)
     return payload
+
+
+def _zone_pace_summary(paces: dict[str, Any]) -> dict[str, Any]:
+    """The learned run pace per HR zone, compact for the agent."""
+    zones = {}
+    for z, info in sorted(paces["zones"].items()):
+        lo, hi = info.get("hr_min"), info.get("hr_max")
+        bpm = f"{lo:g}-{hi:g}" if lo and hi else (f"<{hi + 1:g}" if hi else f">={lo:g}" if lo else None)
+        zones[f"Z{z}"] = {"bpm": bpm, "pace_min_km": round(info["pace_min_km"], 2)}
+    return {
+        "as_of": paces["as_of"],
+        "note": "learned easy-conditions pace per HR zone; run distance_km is "
+                "checked against the steps priced with these",
+        "zones": zones,
+    }

@@ -12,6 +12,8 @@ import re
 from datetime import date
 from typing import Any
 
+from ...zone_pace import is_hr_target
+
 
 #: Workout descriptions are meant to be a short one-line summary, but the agent
 #: tends to write paragraphs. The prompt asks it to stay brief; this is the hard
@@ -167,11 +169,27 @@ def _normalize_steps(value: Any) -> str | None:
 
 
 def _require_steps(activity_type: Any, steps: Any) -> None:
-    """Raise ``ValueError`` unless a non-rest workout has at least one step."""
-    if activity_type not in STEPLESS_TYPES and not _parse_steps(steps):
+    """Raise ``ValueError`` unless a non-rest workout has at least one step,
+    and every non-rest step of a run carries a pace or an HR zone (so the
+    run's distance can be computed from its steps)."""
+    parsed = _parse_steps(steps)
+    if activity_type not in STEPLESS_TYPES and not parsed:
         raise ValueError(
             f"a {activity_type} workout needs at least one step "
             "(only rest days may have none)"
+        )
+    if activity_type != "run":
+        return
+    missing = [
+        i for i, step in enumerate(parsed, start=1)
+        if step.get("kind") != "rest"
+        and not step.get("target_pace_min_km")
+        and not is_hr_target(step.get("target_hr_zone"))
+    ]
+    if missing:
+        raise ValueError(
+            f"run step(s) {missing} need a target_pace_min_km or a "
+            "target_hr_zone (e.g. 'Z2'); only 'rest' steps may have neither"
         )
 
 

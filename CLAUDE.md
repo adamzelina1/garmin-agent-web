@@ -33,7 +33,7 @@ An empty result almost always means a wrong/unset `app.user_id`, not an empty DB
 
 ## Architecture
 
-Data flow: Garmin Connect → sync worker → raw JSON in `metrics`/`activities` (source of truth) → `parser.py` → typed projection tables (`daily_metrics`, `activity_summaries`, `activity_detail_series`, `activity_splits`, …) → `derived.py` computes `derived_metrics` (ACWR, run ACWR, cadence drift) once per sync, replaced wholesale. UI and agent read the same derived values.
+Data flow: Garmin Connect → sync worker → raw JSON in `metrics`/`activities` (source of truth) → `parser.py` → typed projection tables (`daily_metrics`, `activity_summaries`, `activity_detail_series`, `activity_splits`, …) → `derived.py` computes `derived_metrics` (ACWR, run ACWR, cadence drift, learned pace per HR zone from `zone_pace.py`) once per sync, replaced wholesale. Planned workouts' `duration_min` is computed from their steps; a run's `distance_km` is checked against a step estimate built from those zone paces (warning in the `apply` result, filled in when missing). UI and agent read the same derived values.
 
 - `db.py` — `Database(url, user_id=...)` is bound to one user; `merge_daily` auto-creates columns on demand; `prune_dates_before` / `prune_excluded_types` apply config changes retroactively on the next config-driven full sync (explicit `--range`/`--type` syncs never prune). `parser.TYPE_COLUMNS` maps each data type to the `daily_metrics` columns it may write.
 - `fetcher.py` — `sync_data(...)`; never prompts for MFA; the `widget+cffi` login strategy is always skipped (falsely reports "MFA required" during Cloudflare/429 windows). Also refreshes the stored weather forecast (`refresh_weather_forecast`); `/weather` only reads the table.
