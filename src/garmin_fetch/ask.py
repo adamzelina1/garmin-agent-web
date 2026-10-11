@@ -1835,7 +1835,11 @@ def _register_tools(
             ``detail=true`` keeps full workout descriptions; ``full=true`` adds
             every block/week of each goal plus the resolved current block (use
             it before a season-wide reshape). ``can_undo`` says whether the last
-            destructive edit can be rolled back.
+            destructive edit can be rolled back. ``warnings`` lists runs and
+            weeks in the current and next week whose distances disagree with
+            what their steps estimate: when present, tell the user and offer to
+            fix them — don't edit the plan unasked. Later weeks aren't checked
+            (the estimate uses today's paces, which improve with fitness).
 
             ``action="apply"`` makes one ATOMIC edit (all or nothing). ``spec``
             is JSON with a ``"workouts"`` and/or an ``"anchor"`` section, or
@@ -1843,8 +1847,9 @@ def _register_tools(
             result lists the changed ids plus ``weeks``: each touched week's
             target, ``scheduled`` volume, ``delta`` and (km weeks) the steps'
             ``estimated`` km — so no follow-up read is needed. Before answering,
-            fix every ``warnings`` entry (a workout or a whole week whose
-            distances disagree with what its steps estimate) and bring every
+            fix every ``warnings`` entry (a workout or a whole week, this week
+            or next, whose distances disagree with what its steps estimate;
+            later weeks are only checked once they come within range) and bring every
             ``delta`` near 0 by adjusting workouts (never do the week sums
             yourself).
 

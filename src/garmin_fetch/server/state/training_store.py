@@ -12,7 +12,7 @@ from ...db import open_pg_pool
 from .training_workouts import TrainingWorkoutStore
 from .training_anchor import TrainingAnchorStore
 from .training_agenda import build_agenda
-from .training_rules import _first_monday
+from .training_rules import _first_monday, check_window, week_estimate_warning
 
 
 #: ``user_state`` key holding the one season undo snapshot. Reusing the existing
@@ -165,10 +165,10 @@ class TrainingStore:
         """Compact per-goal target/scheduled/delta for the weeks of ``dates``.
 
         A km week also carries ``estimated``: its workouts with each run priced
-        from its steps. When that misses the target by more than 5% (and 1 km)
-        a warning is added, since per-workout distances can each pass their own
-        check yet all lean the same way.
+        from its steps; a miss inside :func:`check_window` (this week and next)
+        adds a :func:`week_estimate_warning`.
         """
+        check_lo, check_hi = check_window()
         mondays = {_first_monday(date.fromisoformat(d[:10])).isoformat() for d in dates}
         if not mondays:
             return []
@@ -188,15 +188,17 @@ class TrainingStore:
                 "delta": cov["delta"],
             }
             if cov["unit"] == "km":
-                est, target = row["estimated_km"], float(cov["target"])
-                entry["estimated"] = est
-                if abs(est - target) > max(1.0, 0.05 * target):
-                    warnings.append(
-                        f"week {row['week_start']} (goal {row['goal_id']}): target "
-                        f"{target:g} km, workouts say {cov['scheduled']:g} km but "
-                        f"their steps estimate {est:g} km — lengthen or shorten "
-                        "steps so the estimate meets the target"
+                entry["estimated"] = row["estimated_km"]
+                week_end = (
+                    date.fromisoformat(row["week_start"]) + timedelta(days=6)
+                ).isoformat()
+                warning = None
+                if week_end >= check_lo and row["week_start"] <= check_hi:
+                    warning = week_estimate_warning(
+                        row["week_start"], row["goal_id"], cov, row["estimated_km"]
                     )
+                if warning:
+                    warnings.append(warning)
             out.append(entry)
         return out
 

@@ -184,6 +184,46 @@ def _coverage_entry(
     }
 
 
+def check_window(today: date | None = None) -> tuple[str, str]:
+    """The days the distance warnings cover: today through the end of next
+    week. Estimates use today's zone paces, which go stale as fitness
+    changes, so later weeks are only checked once they come into range."""
+    today = today or date.today()
+    end = _first_monday(today) + timedelta(days=13)
+    return today.isoformat(), end.isoformat()
+
+
+def run_distance_warning(workout: dict[str, Any], estimate_km: float | None) -> str | None:
+    """Warning when a run's distance is more than 10% (and 0.5 km) off what
+    its steps estimate; None when it agrees or can't be checked."""
+    km = workout.get("distance_km")
+    if estimate_km is None or km is None or abs(km - estimate_km) <= max(0.5, 0.1 * estimate_km):
+        return None
+    return (
+        f"workout {workout['id']} ({workout['planned_date']}): distance_km {km:g} "
+        f"but its steps estimate {estimate_km:g} km ({workout.get('duration_min')} "
+        "min at the step paces / HR-zone paces) — fix the steps or the distance"
+    )
+
+
+def week_estimate_warning(
+    week_start: str, goal_id: int, coverage: dict[str, Any], estimate_km: float,
+) -> str | None:
+    """Warning when a km week's step-estimated volume misses its target by
+    more than 5% (and 1 km). Per-workout distances can each pass their own
+    check yet all lean the same way; this catches the sum."""
+    if coverage.get("unit") != "km" or coverage.get("target") is None:
+        return None
+    target = float(coverage["target"])
+    if abs(estimate_km - target) <= max(1.0, 0.05 * target):
+        return None
+    return (
+        f"week {week_start} (goal {goal_id}): target {target:g} km, workouts say "
+        f"{coverage['scheduled']:g} km but their steps estimate {estimate_km:g} km "
+        "— lengthen or shorten steps so the estimate meets the target"
+    )
+
+
 def _activity_matches(plan_type: str, garmin_type: str | None) -> bool:
     """True when a Garmin activity typeKey satisfies a plan ``activity_type``."""
     if plan_type == "other":

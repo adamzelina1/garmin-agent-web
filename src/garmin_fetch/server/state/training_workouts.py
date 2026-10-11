@@ -7,7 +7,16 @@ from typing import Any
 
 from ...db import open_pg_pool
 from ...zone_pace import estimate_run_km, read_zone_paces, steps_minutes
-from .training_rules import _activity_matches, _closest_activity
+from .training_rules import (
+    _activity_matches,
+    _closest_activity,
+    check_window,
+    run_distance_warning,
+)
+
+
+def _in_window(day: str, window: tuple[str, str]) -> bool:
+    return window[0] <= day[:10] <= window[1]
 from .training_validation import (
     _build_set,
     _normalize_workout,
@@ -130,7 +139,8 @@ class TrainingWorkoutStore:
         the steps' total time. A run's ``distance_km`` stays as supplied but is
         checked against the steps' estimate (time / pace, HR-zone steps priced
         at the learned zone pace): more than 10% (and 0.5 km) off adds a
-        warning; a missing distance is filled with the estimate. Returns the
+        warning when the run falls in :func:`check_window` (this week and
+        next); a missing distance is filled with the estimate. Returns the
         (possibly re-read) row."""
         steps = _parse_steps(row["steps"])
         if not steps:
@@ -140,16 +150,10 @@ class TrainingWorkoutStore:
             km = estimate_run_km(steps, read_zone_paces(conn))
             if km is not None and row["distance_km"] is None:
                 totals["distance_km"] = km
-            elif (
-                km is not None and warnings is not None
-                and abs(row["distance_km"] - km) > max(0.5, 0.1 * km)
-            ):
-                warnings.append(
-                    f"workout {row['id']} ({row['planned_date']}): distance_km "
-                    f"{row['distance_km']:g} but its steps estimate {km:g} km "
-                    f"({totals['duration_min']} min at the step paces / HR-zone "
-                    "paces) — fix the steps or the distance"
-                )
+            elif warnings is not None and _in_window(row["planned_date"], check_window()):
+                warning = run_distance_warning({**row, **totals}, km)
+                if warning:
+                    warnings.append(warning)
         changed = {k: v for k, v in totals.items() if row[k] != v}
         if not changed:
             return row
