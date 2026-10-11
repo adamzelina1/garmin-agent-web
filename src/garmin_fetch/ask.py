@@ -1011,6 +1011,16 @@ class ReadOnlyDB:
             "running": _jsonify_rows([dict(r) for r in running]),
         }
 
+    def zone_paces(self) -> dict[str, Any] | None:
+        """The learned run pace per HR zone (see :mod:`.zone_pace`), or None."""
+        from .zone_pace import read_zone_paces
+
+        try:
+            with self._connect() as conn:
+                return read_zone_paces(conn)
+        except psycopg.Error:
+            return None
+
     def trend_metrics(self) -> list[str]:
         """The metrics ``metric_trend`` supports for this account."""
         present = {c["name"] for c in self.columns("daily_metrics")}
@@ -1530,6 +1540,25 @@ def _date_prompt(db: ReadOnlyDB) -> str:
     return text
 
 
+def _zone_pace_prompt(db: ReadOnlyDB) -> str | None:
+    """The user's learned run pace per HR zone, one line, re-read every run so
+    it follows each sync. None until a sync has produced zone paces."""
+    paces = db.zone_paces()
+    if not paces:
+        return None
+    parts = []
+    for z, info in sorted(paces["zones"].items()):
+        lo, hi = info.get("hr_min"), info.get("hr_max")
+        bpm = f"{lo:g}-{hi:g}" if lo and hi else (f"<{hi + 1:g}" if hi else f">={lo:g}" if lo else "")
+        m, s = divmod(round(info["pace_min_km"] * 60), 60)
+        parts.append(f"Z{z} {bpm} bpm ~{m}:{s:02d}/km")
+    return (
+        f"The user's run pace by HR zone (learned from their recent runs, as of "
+        f"{paces['as_of']}): {' · '.join(parts)}. Use these for any pace, time or "
+        "distance reasoning about their running."
+    )
+
+
 def _gemini_thinking_level(effort: str | None) -> str:
     """Map a unified reasoning-effort level to a Gemini thinking level.
 
@@ -1952,7 +1981,8 @@ def build_agent(
             reasoning_effort=reasoning_effort,
         )
     # Instructions (not system prompts): re-evaluated on every run and never
-    # stored in the history, so date/memory/principles are always current.
+    # stored in the history, so date/zone paces/memory/principles are always
+    # current.
     agent = Agent(
         model,
         instructions=_render_system_prompt(
@@ -1960,6 +1990,7 @@ def build_agent(
         ),
     )
     agent.instructions(lambda: _date_prompt(db))
+    agent.instructions(lambda: _zone_pace_prompt(db))
     if memory is not None:
         agent.instructions(lambda: _memory_prompt(memory))
     if principles is not None:
