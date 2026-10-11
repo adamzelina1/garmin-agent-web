@@ -1841,9 +1841,11 @@ def _register_tools(
             is JSON with a ``"workouts"`` and/or an ``"anchor"`` section, or
             ``{"undo": true}`` to roll back the last destructive edit. The
             result lists the changed ids plus ``weeks``: each touched week's
-            target, ``scheduled`` volume and ``delta`` — so no follow-up read is
-            needed. Before answering, fix every ``warnings`` entry and bring
-            every ``delta`` near 0 by adjusting workouts (never do the week sums
+            target, ``scheduled`` volume, ``delta`` and (km weeks) the steps'
+            ``estimated`` km — so no follow-up read is needed. Before answering,
+            fix every ``warnings`` entry (a workout or a whole week whose
+            distances disagree with what its steps estimate) and bring every
+            ``delta`` near 0 by adjusting workouts (never do the week sums
             yourself).
 
             ``duration_min`` is computed from the steps' total time — never

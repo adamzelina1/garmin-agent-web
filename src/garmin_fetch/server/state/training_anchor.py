@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from ...db import open_pg_pool
+from ...zone_pace import estimate_run_km, read_zone_paces
 from .training_validation import (
     _block_row,
     _build_set,
@@ -14,6 +15,7 @@ from .training_validation import (
     _normalize_goal,
     _normalize_week,
     _opt_int,
+    _parse_steps,
     _validate_block_dates,
     _week_row,
 )
@@ -443,16 +445,19 @@ class TrainingAnchorStore:
         Two queries for the whole window, never one per week. Planned counts the
         workouts attributed to the goal (:func:`workout_in_goal`); actual counts
         the synced activities of the goal's sport (:func:`goal_activities`).
+        Planned also carries ``est_km``: the same workouts' km with each run
+        priced from its steps (its stored distance when it can't be priced).
         """
         lo, hi = start.isoformat(), end.isoformat()
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
             workouts = conn.execute(
                 "SELECT planned_date, activity_type, distance_km, duration_min, "
-                "goal_id FROM training_workout WHERE user_id = %s "
+                "goal_id, steps FROM training_workout WHERE user_id = %s "
                 "AND planned_date >= %s AND planned_date <= %s",
                 (user_id, lo, hi),
             ).fetchall()
+            paces = read_zone_paces(conn)
             acts = conn.execute(
                 "SELECT start_date, activity_type, distance_km, duration_hours "
                 "FROM activity_summaries WHERE user_id = %s "
@@ -462,9 +467,14 @@ class TrainingAnchorStore:
         planned: dict[str, dict[str, float]] = {}
         for w in goal_workouts(goal, blocks, workouts):
             ws = _first_monday(date.fromisoformat(w["planned_date"])).isoformat()
-            bucket = planned.setdefault(ws, {"km": 0.0, "min": 0.0})
-            bucket["km"] += float(w["distance_km"] or 0)
+            bucket = planned.setdefault(ws, {"km": 0.0, "min": 0.0, "est_km": 0.0})
+            km = float(w["distance_km"] or 0)
+            bucket["km"] += km
             bucket["min"] += float(w["duration_min"] or 0)
+            est = None
+            if w["activity_type"] == "run":
+                est = estimate_run_km(_parse_steps(w["steps"]), paces)
+            bucket["est_km"] += km if est is None else est
         actual: dict[str, dict[str, float]] = {}
         for a in goal_activities(goal, acts):
             ws = _first_monday(date.fromisoformat(a["start_date"])).isoformat()
@@ -517,6 +527,7 @@ class TrainingAnchorStore:
                     "coverage": _coverage_entry(
                         week or {}, ws, we, p["km"], p["min"], a["km"], a["min"]
                     ),
+                    "estimated_km": round(p.get("est_km", 0.0), 1),
                 })
             cur += timedelta(days=7)
         return rows
@@ -579,6 +590,7 @@ class TrainingAnchorStore:
                         "is_deload": week.get("is_deload"),
                     },
                     "coverage": row["coverage"],
+                    "estimated_km": row["estimated_km"],
                 })
         return out
 

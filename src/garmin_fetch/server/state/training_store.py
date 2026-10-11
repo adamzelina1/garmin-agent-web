@@ -151,13 +151,24 @@ class TrainingStore:
             w["week_start"] for b in blocks if isinstance(b, dict)
             for w in (b.get("weeks") or []) if isinstance(w, dict) and w.get("week_start")
         ]
-        weeks = self._week_coverage(user_id, dates)
+        warnings = result.get("workouts", {}).pop("warnings", [])
+        weeks = self._week_coverage(user_id, dates, warnings)
         if weeks:
             result["weeks"] = weeks
+        if warnings:
+            result["warnings"] = warnings
         return result
 
-    def _week_coverage(self, user_id: int, dates: list[str]) -> list[dict[str, Any]]:
-        """Compact per-goal target/scheduled/delta for the weeks of ``dates``."""
+    def _week_coverage(
+        self, user_id: int, dates: list[str], warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        """Compact per-goal target/scheduled/delta for the weeks of ``dates``.
+
+        A km week also carries ``estimated``: its workouts with each run priced
+        from its steps. When that misses the target by more than 5% (and 1 km)
+        a warning is added, since per-workout distances can each pass their own
+        check yet all lean the same way.
+        """
         mondays = {_first_monday(date.fromisoformat(d[:10])).isoformat() for d in dates}
         if not mondays:
             return []
@@ -168,14 +179,25 @@ class TrainingStore:
             cov = row["coverage"]
             if row["week_start"] not in mondays or cov.get("target") is None:
                 continue
-            out.append({
+            entry = {
                 "week_start": row["week_start"],
                 "goal_id": row["goal_id"],
                 "unit": cov["unit"],
                 "target": cov["target"],
                 "scheduled": cov["scheduled"],
                 "delta": cov["delta"],
-            })
+            }
+            if cov["unit"] == "km":
+                est, target = row["estimated_km"], float(cov["target"])
+                entry["estimated"] = est
+                if abs(est - target) > max(1.0, 0.05 * target):
+                    warnings.append(
+                        f"week {row['week_start']} (goal {row['goal_id']}): target "
+                        f"{target:g} km, workouts say {cov['scheduled']:g} km but "
+                        f"their steps estimate {est:g} km — lengthen or shorten "
+                        "steps so the estimate meets the target"
+                    )
+            out.append(entry)
         return out
 
     # -- one season-wide snapshot / undo --------------------------------------
