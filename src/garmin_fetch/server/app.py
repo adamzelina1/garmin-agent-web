@@ -524,7 +524,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         recomputed each sync). ``paces`` is None until a sync has a lactate
         threshold and HR zones to work from."""
         from ..db import PostgresBackend
-        from ..zone_pace import HALF_LIFE_DAYS, MAX_TEMP_C, read_zone_paces
+        from ..zone_pace import HALF_LIFE_DAYS, read_zone_paces
 
         backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
         conn = backend.connect()
@@ -535,7 +535,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         return {
             "paces": paces,
             "half_life_days": HALF_LIFE_DAYS,
-            "max_temp_c": MAX_TEMP_C,
         }
 
     # -- training workouts ----------------------------------------------------

@@ -4155,8 +4155,8 @@ async function loadZonePaceCard() {
     meta.className = "metric-meta";
     meta.style.marginTop = "10px";
     meta.textContent = "Threshold pace " + (fmtPace(p.lt_pace) || "—")
-      + " · learned minute by minute from runs ≤ " + data.max_temp_c + " °C, recent runs weigh most ("
-      + data.half_life_days + "-day half-life) · zones with little data lean on Friel's "
+      + " · learned minute by minute from your outdoor runs, recent runs weigh most ("
+      + data.half_life_days + "-day half-life, so paces follow the season) · zones with little data lean on Friel's "
       + "threshold-pace ratios · as of " + fmtDay(parseISO(p.as_of));
     box.appendChild(meta);
   } catch (e) {

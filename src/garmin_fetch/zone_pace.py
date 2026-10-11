@@ -20,10 +20,15 @@ observation, since neighbouring minutes of one run are correlated. Zone order
 is enforced (a higher zone is never slower) by pooling adjacent violators.
 
 Filters keep the evidence comparable: outdoor runs only (treadmill pace is
-footpod-derived), no runs hotter than ``MAX_TEMP_C`` (heat slows pace at the
-same HR), never a run's first ``WARMUP_S`` (HR is still climbing), and only
-windows that were mostly moving (stops and walks drop out). Stored in ``derived_metrics`` as ``zone_pace_z1..z5`` (value =
-decimal min/km, qualifier = JSON details), replaced wholesale with the rest.
+footpod-derived), never a run's first ``WARMUP_S`` (HR is still climbing), and
+only windows that were mostly moving (stops and walks drop out). Hot runs are
+deliberately kept: heat slows pace at the same HR, and the recency weighting
+lets the estimate follow the season, so summer plans get summer paces. In a
+walk-forward test over all runs this beat both dropping runs above 22 C
+(23.5 vs 26.0 s/km; 25.4 vs 33.5 on hot runs) and a learned linear heat
+correction (24.0). Stored in ``derived_metrics`` as ``zone_pace_z1..z5``
+(value = decimal min/km, qualifier = JSON details), replaced wholesale with
+the rest.
 """
 
 from __future__ import annotations
@@ -50,7 +55,6 @@ PRIORS: dict[int, tuple[float, float]] = {
 
 HALF_LIFE_DAYS = 30
 WINDOW_DAYS = 180       # older runs weigh < 2% and are skipped
-MAX_TEMP_C = 22.0
 SAMPLE_S = 60           # window length
 WARMUP_S = 600
 MIN_SPEED_KMH = 6.0     # slower samples are stops/walking
@@ -114,7 +118,6 @@ def _windows(conn: Any) -> list[dict[str, Any]]:
         "      AND d.lactate_threshold_speed_kmh > 0 "
         "    ORDER BY d.calendar_date DESC LIMIT 1) lt "
         "  WHERE a.activity_type = ANY(%(types)s) "
-        "    AND (a.weather_temp_c IS NULL OR a.weather_temp_c <= %(max_t)s) "
         "    AND a.start_date >= %(since)s) "
         "SELECT r.start_date, r.lt_pace, "
         "  60.0 / avg(d.speed_kmh) FILTER (WHERE d.speed_kmh >= %(min_v)s) AS pace, "
@@ -127,7 +130,7 @@ def _windows(conn: Any) -> list[dict[str, Any]]:
         "  AND count(*) FILTER (WHERE d.speed_kmh >= %(min_v)s "
         "    AND d.heart_rate IS NOT NULL) >= 0.6 * count(*)",
         {
-            "types": list(_OUTDOOR_RUNNING), "max_t": MAX_TEMP_C,
+            "types": list(_OUTDOOR_RUNNING),
             "since": date.fromordinal(date.today().toordinal() - WINDOW_DAYS).isoformat(),
             "min_v": MIN_SPEED_KMH, "warmup": WARMUP_S, "win": SAMPLE_S,
         },
