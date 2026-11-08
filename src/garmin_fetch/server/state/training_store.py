@@ -12,7 +12,7 @@ from ...db import open_pg_pool
 from .training_workouts import TrainingWorkoutStore
 from .training_anchor import TrainingAnchorStore
 from .training_agenda import build_agenda
-from .training_rules import _first_monday, check_window, week_estimate_warning
+from .training_rules import _first_monday
 
 
 #: ``user_state`` key holding the one season undo snapshot. Reusing the existing
@@ -152,23 +152,15 @@ class TrainingStore:
             for w in (b.get("weeks") or []) if isinstance(w, dict) and w.get("week_start")
         ]
         warnings = result.get("workouts", {}).pop("warnings", [])
-        weeks = self._week_coverage(user_id, dates, warnings)
+        weeks = self._week_coverage(user_id, dates)
         if weeks:
             result["weeks"] = weeks
         if warnings:
             result["warnings"] = warnings
         return result
 
-    def _week_coverage(
-        self, user_id: int, dates: list[str], warnings: list[str],
-    ) -> list[dict[str, Any]]:
-        """Compact per-goal target/scheduled/delta for the weeks of ``dates``.
-
-        A km week also carries ``estimated``: its workouts with each run priced
-        from its steps; a miss inside :func:`check_window` (this week and next)
-        adds a :func:`week_estimate_warning`.
-        """
-        check_lo, check_hi = check_window()
+    def _week_coverage(self, user_id: int, dates: list[str]) -> list[dict[str, Any]]:
+        """Compact per-goal target/scheduled/delta for the weeks of ``dates``."""
         mondays = {_first_monday(date.fromisoformat(d[:10])).isoformat() for d in dates}
         if not mondays:
             return []
@@ -179,27 +171,14 @@ class TrainingStore:
             cov = row["coverage"]
             if row["week_start"] not in mondays or cov.get("target") is None:
                 continue
-            entry = {
+            out.append({
                 "week_start": row["week_start"],
                 "goal_id": row["goal_id"],
                 "unit": cov["unit"],
                 "target": cov["target"],
                 "scheduled": cov["scheduled"],
                 "delta": cov["delta"],
-            }
-            if cov["unit"] == "km":
-                entry["estimated"] = row["estimated_km"]
-                week_end = (
-                    date.fromisoformat(row["week_start"]) + timedelta(days=6)
-                ).isoformat()
-                warning = None
-                if week_end >= check_lo and row["week_start"] <= check_hi:
-                    warning = week_estimate_warning(
-                        row["week_start"], row["goal_id"], cov, row["estimated_km"]
-                    )
-                if warning:
-                    warnings.append(warning)
-            out.append(entry)
+            })
         return out
 
     # -- one season-wide snapshot / undo --------------------------------------

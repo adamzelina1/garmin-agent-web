@@ -206,24 +206,6 @@ def run_distance_warning(workout: dict[str, Any], estimate_km: float | None) -> 
     )
 
 
-def week_estimate_warning(
-    week_start: str, goal_id: int, coverage: dict[str, Any], estimate_km: float,
-) -> str | None:
-    """Warning when a km week's step-estimated volume misses its target by
-    more than 5% (and 1 km). Per-workout distances can each pass their own
-    check yet all lean the same way; this catches the sum."""
-    if coverage.get("unit") != "km" or coverage.get("target") is None:
-        return None
-    target = float(coverage["target"])
-    if abs(estimate_km - target) <= max(1.0, 0.05 * target):
-        return None
-    return (
-        f"week {week_start} (goal {goal_id}): target {target:g} km, workouts say "
-        f"{coverage['scheduled']:g} km but their steps estimate {estimate_km:g} km "
-        "— lengthen or shorten steps so the estimate meets the target"
-    )
-
-
 def _activity_matches(plan_type: str, garmin_type: str | None) -> bool:
     """True when a Garmin activity typeKey satisfies a plan ``activity_type``."""
     if plan_type == "other":

@@ -17,7 +17,6 @@ from .training_rules import (
     goal_activities,
     goal_workouts,
     run_distance_warning,
-    week_estimate_warning,
 )
 
 #: Safety cap on the workouts returned in one agenda.
@@ -202,20 +201,18 @@ def build_agenda(
     paces = workouts_store.zone_paces(user_id)
     if paces:
         payload["zone_paces"] = _zone_pace_summary(paces)
-    warnings = _plan_warnings(planned, targets, paces)
+    warnings = _plan_warnings(planned, paces)
     if warnings:
         payload["warnings"] = warnings
     return payload
 
 
 def _plan_warnings(
-    planned: list[dict[str, Any]], targets: list[dict[str, Any]],
-    paces: dict[str, Any] | None,
+    planned: list[dict[str, Any]], paces: dict[str, Any] | None,
 ) -> list[str]:
-    """The same distance checks ``apply`` runs, over the part of the window
-    inside :func:`check_window` (today through next week): still-planned runs
-    whose distance disagrees with their steps, and unfinished km weeks whose
-    step estimate misses the target."""
+    """The same run-distance check ``apply`` runs, over the part of the
+    window inside :func:`check_window` (today through next week): still-planned
+    runs whose distance disagrees with their steps."""
     lo, hi = check_window()
     out: list[str] = []
     for w in planned:
@@ -226,15 +223,6 @@ def _plan_warnings(
             warning = run_distance_warning(w, estimate_run_km(w["steps"], paces))
             if warning:
                 out.append(warning)
-    for t in targets:
-        week_end = (date.fromisoformat(t["week_start"]) + timedelta(days=6)).isoformat()
-        if week_end < lo or t["week_start"] > hi:
-            continue
-        warning = week_estimate_warning(
-            t["week_start"], t["goal_id"], t["coverage"], t["estimated_km"]
-        )
-        if warning:
-            out.append(warning)
     return out
 
 
