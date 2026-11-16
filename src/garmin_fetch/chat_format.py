@@ -14,6 +14,42 @@ from typing import Any
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
+#: Tool-call markup a model wrote into its reply *text* instead of making a real
+#: call: DeepSeek's DSML tags (``<｜DSML｜invoke …>``, with fullwidth or ASCII
+#: bars, in whatever mangled spacing the model produced) and its older
+#: ``<｜tool▁calls▁begin｜>``-style tokens.
+_LEAK_TAG = re.compile(
+    r"</?[\s|｜]*DSML[\s|｜]*[^<>\n]{0,80}>"
+    r"|<[|｜]+\s*tool[▁_ ](?:calls?|sep|outputs?)[^<>\n]{0,40}>"
+)
+#: A line opening a pseudo tag that carries an attribute (``<memory facts='…``):
+#: how a mangled call starts when the model drops the opening DSML tags.
+_PSEUDO_CALL = re.compile(r"(?m)^[ \t]*<[a-z_][\w.-]*[ \t]+[a-z_]\w*[ \t]*=")
+#: Tags the model is *meant* to write in an answer; never a leaked call.
+_ANSWER_MARKERS = ("<chart", "<plan_table")
+
+
+def strip_leaked_tool_call(text: str) -> tuple[str, bool]:
+    """Remove a tool call the model wrote as text; returns (clean text, found).
+
+    Some models (DeepSeek in particular) occasionally end a reply with the call
+    spelled out — ``<memory facts='{…}'</｜｜DSML｜｜ parameter>…`` — instead of
+    using the function-calling interface. The provider then returns it as plain
+    content: the call never runs and the markup shows up in the answer. Only
+    text containing such markup is touched; everything from the start of the
+    block (its pseudo opening tag when there is one, else the first markup tag)
+    to the last markup tag is cut, and the prose around it is kept.
+    """
+    tags = list(_LEAK_TAG.finditer(text))
+    if not tags:
+        return text, False
+    start, end = tags[0].start(), tags[-1].end()
+    for match in _PSEUDO_CALL.finditer(text, 0, start):
+        if not text[match.start():].lstrip().startswith(_ANSWER_MARKERS):
+            start = match.start()
+    head, tail = text[:start].rstrip(), text[end:].strip()
+    return (f"{head}\n\n{tail}" if head and tail else head or tail), True
+
 
 def messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
     """Map persisted Pydantic AI messages back to Gradio's history format.
@@ -40,7 +76,12 @@ def messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
                 continue
             for part in message.parts:
                 if isinstance(part, TextPart):
-                    history.append({"role": "assistant", "content": part.content})
+                    # Sessions stored before leaked calls were cleaned at save
+                    # time may still hold one.
+                    content, leaked = strip_leaked_tool_call(part.content)
+                    if leaked and not content.strip():
+                        continue
+                    history.append({"role": "assistant", "content": content})
     return history
 
 

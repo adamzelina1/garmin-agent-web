@@ -39,7 +39,9 @@ from typing import Any, Callable, Iterable, Protocol
 
 import psycopg
 import psycopg.rows
+from pydantic_ai import ModelRetry, RunContext
 
+from .chat_format import strip_leaked_tool_call
 from .config import load_config
 from .parser import TYPE_COLUMNS
 
@@ -2022,6 +2024,37 @@ def build_agent(
         agent, db, weather=weather, memory=memory, training=training,
         charts=charts, on_status=on_status,
     )
+
+    @agent.output_validator
+    def _reject_leaked_tool_call(ctx: RunContext[None], output: str) -> str:
+        """Send a reply that spelled a tool call out as text back to the model.
+
+        Such a call never ran (typically a ``memory`` write tacked onto the
+        answer), so the model gets one chance to make it properly. If it leaks
+        again the markup is simply cut — a cosmetic slip must not fail the turn.
+        """
+        if ctx.partial_output or not isinstance(output, str):
+            return output
+        clean, leaked = strip_leaked_tool_call(output)
+        if not leaked:
+            return output
+        if ctx.retry < ctx.max_retries:
+            raise ModelRetry(
+                "Your reply ended with a tool call written out as text (markup "
+                "such as `<memory …>` / DSML tags), so that call was NOT "
+                "executed. If you still want it, make it now through the "
+                "function-calling interface. "
+                + (
+                    "The text before the markup has already been shown to the "
+                    "user: do not repeat it — after the call, finish with one "
+                    "short sentence."
+                    if clean.strip()
+                    else "Then write your reply to the user."
+                )
+                + " Never write tool calls in the reply text."
+            )
+        return clean
+
     return agent
 
 
@@ -2122,19 +2155,35 @@ def _final_answer(result: Any) -> str:
     reply is trivially short and an earlier reply from *this run* is
     substantially longer, prefer that earlier reply.
 
+    A reply that ended with a tool call written out as text (see
+    ``strip_leaked_tool_call``) is a second way to lose the answer: the model
+    is sent back to make the call properly and then finishes with a short
+    confirmation. The prose of that first reply is the answer, unless the model
+    rewrote it at greater length. The leaked markup itself is never returned.
+
     Only the run's own new messages are considered, so a long answer from an
     earlier turn in the resumed history can never be resurrected.
     """
     from pydantic_ai.messages import ModelResponse, TextPart
 
-    final = str(getattr(result, "output", "") or "")
-    texts = [
-        str(part.content)
-        for message in result.new_messages()
-        if isinstance(message, ModelResponse)
-        for part in message.parts
-        if isinstance(part, TextPart) and str(part.content).strip()
-    ]
+    final, _ = strip_leaked_tool_call(str(getattr(result, "output", "") or ""))
+    texts: list[str] = []
+    rescued: list[str] = []
+    for message in result.new_messages():
+        if not isinstance(message, ModelResponse):
+            continue
+        for part in message.parts:
+            if not isinstance(part, TextPart):
+                continue
+            clean, leaked = strip_leaked_tool_call(str(part.content))
+            if clean.strip():
+                texts.append(clean)
+                if leaked:
+                    rescued.append(clean)
+    if rescued:
+        best_rescued = max(rescued, key=len)
+        if len(best_rescued) > len(final.strip()):
+            return best_rescued
     if not texts:
         return final
     best = max(texts, key=len)
@@ -2218,10 +2267,16 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
     User prompts, assistant text and tool-call identities are kept intact; only
     a long ``ToolReturnPart`` is replaced by its head plus a marker, so resumed
     sessions stay light. The model re-queries when it needs the data again.
+
+    A tool call the model wrote out as text is cut from assistant replies too
+    (see ``strip_leaked_tool_call``): left in the history it would be shown
+    again on reload and would teach the model to repeat the mistake.
+
+    Idempotent, so it is also applied to a stored session when it is loaded.
     """
     from dataclasses import replace
 
-    from pydantic_ai.messages import ModelRequest, ToolReturnPart
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolReturnPart
 
     def prune(part: Any) -> Any:
         if not isinstance(part, ToolReturnPart):
@@ -2231,11 +2286,22 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
             return part
         return replace(part, content=content[:_PRUNED_CHARS] + "… [output pruned]")
 
-    return [
-        replace(msg, parts=[prune(p) for p in msg.parts])
-        if isinstance(msg, ModelRequest) else msg
-        for msg in messages
-    ]
+    def unleak(part: Any) -> Any:
+        if not isinstance(part, TextPart):
+            return part
+        clean, leaked = strip_leaked_tool_call(part.content)
+        return replace(part, content=clean) if leaked else part
+
+    def clean_message(msg: Any) -> Any:
+        if isinstance(msg, ModelRequest):
+            return replace(msg, parts=[prune(p) for p in msg.parts])
+        if isinstance(msg, ModelResponse):
+            parts = [unleak(p) for p in msg.parts]
+            if any(new is not old for new, old in zip(parts, msg.parts)):
+                return replace(msg, parts=parts)
+        return msg
+
+    return [clean_message(msg) for msg in messages]
 
 
 def _open_state(cfg: dict[str, str]) -> tuple[ReadOnlyDB, Any, Any, int]:

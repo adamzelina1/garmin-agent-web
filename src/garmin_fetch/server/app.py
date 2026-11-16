@@ -54,7 +54,12 @@ from ..ask import (
     _record_turn,
     compact,
 )
-from ..chat_format import extract_charts, messages_to_history, replace_workout_dumps
+from ..chat_format import (
+    extract_charts,
+    messages_to_history,
+    replace_workout_dumps,
+    strip_leaked_tool_call,
+)
 from ..config import load_config
 from ..db import ensure_schema, open_pg_pool
 from .auth import AuthError, AuthService, UserStore
@@ -905,8 +910,13 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         )
 
     def _turn_history(request: Request, user: dict) -> list[Any] | None:
-        """The stored session a turn resumes from (None for a fresh one)."""
-        return request.app.state.state.get_session_messages(user["id"])
+        """The stored session a turn resumes from (None for a fresh one).
+
+        Re-cleaned on load so a session saved before leaked tool-call markup
+        was stripped doesn't feed that markup back to the model.
+        """
+        messages = request.app.state.state.get_session_messages(user["id"])
+        return _prune_session_messages(messages) if messages else messages
 
     def _finish_turn(
         request: Request,
@@ -997,6 +1007,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                         ToolCallPart,
                     )
 
+                    leak_seen = False
                     async with agent.iter(body.question, message_history=history) as agent_run:
                         async for node in agent_run:
                             if not agent.is_model_request_node(node):
@@ -1015,8 +1026,15 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                                 has_tool_calls = any(
                                     isinstance(part, ToolCallPart) for part in stream.response.parts
                                 )
-                            if buffered and not has_tool_calls:
-                                await queue.put(("delta", {"text": "".join(buffered)}))
+                            if buffered and not has_tool_calls and not leak_seen:
+                                # A tool call the model spelled out as text is
+                                # cut before it reaches the bubble. The agent
+                                # then sends the model back to make the call for
+                                # real; whatever it says after that arrives with
+                                # ``done``, so no further text is streamed.
+                                text, leak_seen = strip_leaked_tool_call("".join(buffered))
+                                if text.strip():
+                                    await queue.put(("delta", {"text": text}))
 
                         if agent_run.result is None:
                             raise RuntimeError("agent run finished without a result")
