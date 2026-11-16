@@ -27,4 +27,8 @@ END
 GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO ${APP_USER}, ${RO_USER};
 GRANT USAGE ON SCHEMA public TO ${APP_USER}, ${RO_USER};
 GRANT CREATE ON SCHEMA public TO ${APP_USER};
+-- RLS keys off the app.user_id setting: only the app role may call
+-- set_config(), so a query run as the read-only agent cannot switch accounts.
+REVOKE EXECUTE ON FUNCTION pg_catalog.set_config(text, text, boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_catalog.set_config(text, text, boolean) TO ${APP_USER};
 EOSQL

@@ -7,8 +7,10 @@ superuser DSN:
 
 - ``garmin_app``      — owns the tables, performs syncs + auth writes. Subject
                         to RLS (enforced via ``FORCE ROW LEVEL SECURITY``).
-- ``garmin_readonly`` — SELECT-only on the five agent-facing tables, used by
-                        the LLM agent. RLS scopes it per ``app.user_id``.
+- ``garmin_readonly`` — SELECT-only on the agent-facing tables, used by the
+                        LLM agent. RLS scopes it per ``app.user_id``, and it
+                        has no EXECUTE on ``set_config`` so a query cannot
+                        change that setting.
 
 ``ensure_roles()`` is idempotent and safe to run at every server start.
 """
@@ -19,6 +21,8 @@ import re
 
 APP_ROLE = "garmin_app"
 READONLY_ROLE = "garmin_readonly"
+
+_SET_CONFIG = "pg_catalog.set_config(text, text, boolean)"
 
 
 def _dsn_credentials(dsn: str) -> tuple[str | None, str | None]:
@@ -74,32 +78,27 @@ def ensure_roles(admin_url: str, app_url: str, readonly_url: str) -> None:
             )
         conn.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}, {READONLY_ROLE}")
         conn.execute(f"GRANT CREATE ON SCHEMA public TO {APP_ROLE}")
-        _ensure_user_config_columns(conn)
+        # RLS keys off the ``app.user_id`` setting, so whoever can call
+        # set_config() can switch accounts — even from inside a SELECT. Only
+        # the app role keeps that right; the agent role binds its user with
+        # ``SET LOCAL`` (a utility command no query can issue).
+        conn.execute(f"REVOKE EXECUTE ON FUNCTION {_SET_CONFIG} FROM PUBLIC")
+        conn.execute(f"GRANT EXECUTE ON FUNCTION {_SET_CONFIG} TO {APP_ROLE}")
 
 
-def _ensure_user_config_columns(conn: Any) -> None:
-    """Idempotently add per-user config columns to the ``users`` table.
+def agent_role_can_switch_user(readonly_url: str) -> bool:
+    """Whether the role behind ``readonly_url`` may still call ``set_config``.
 
-    New installs get them from ``db.py`` DDL; this keeps existing databases
-    in sync without a migration framework. Each column is an optional override
-    (NULL = fall back to the server-level .env value).
+    True means a query run as the agent could rewrite ``app.user_id`` and read
+    another account's rows, i.e. ``ensure_roles`` has not been applied to this
+    database yet.
     """
-    for column, column_type in (
-        ("home_lat", "TEXT"),
-        ("home_lon", "TEXT"),
-        ("home_city", "TEXT"),
-        ("home_country", "TEXT"),
-        ("excluded_data_types", "TEXT"),
-        ("sync_start_date", "TEXT"),
-        ("reasoning_effort", "TEXT"),
-        ("auto_sync", "BOOLEAN NOT NULL DEFAULT FALSE"),
-    ):
-        # Skip silently until the table exists (fresh volumes create it later).
-        exists = conn.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name = 'users'"
-        ).fetchone()
-        if not exists:
-            continue
-        conn.execute(
-            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} {column_type}"
+    import psycopg
+
+    with psycopg.connect(readonly_url) as conn:
+        return bool(
+            conn.execute(
+                "SELECT has_function_privilege(current_user, %s, 'EXECUTE')",
+                (_SET_CONFIG,),
+            ).fetchone()[0]
         )

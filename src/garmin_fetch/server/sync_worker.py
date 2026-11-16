@@ -6,9 +6,9 @@ user's job is deduplicated (only one queued/running at a time).
 
 Phase 4 hardening lives here too: per-account rate limiting with exponential
 backoff on the worker. Because the Garmin API is informal and tos-risky, any
-sync failure backs the account off before it is retried (``sync_fail_count``
-grows, ``rate_limit_until`` moves out) so a flapping account can't hammer the
-endpoint. Credentials/tokens are decrypted only inside the worker, never
+sync failure — a rejected login included — backs the account off before it is
+retried (``sync_fail_count`` grows, ``rate_limit_until`` moves out) so a
+flapping account can't hammer the endpoint. Credentials/tokens are decrypted only inside the worker, never
 logged.
 """
 
@@ -161,15 +161,11 @@ class SyncManager:
             self._autocomplete_plan(user_id)
             return counts
         except GarminConnectAuthenticationError as exc:
-            # Wrong Garmin credentials: a clear error, and no point hammering
-            # with exponential backoff — retry on the normal cron cadence.
-            logger.warning("invalid Garmin credentials for user %s: %s", user_id, exc)
-            self.store.set_sync_status(
-                user_id,
-                error=f"invalid Garmin credentials: {exc}"[:500],
-                fail_count=int(user.get("sync_fail_count") or 0) + 1,
-                rate_limit_until=None,
-            )
+            # Garmin rejected the stored credentials. Retrying the same
+            # password every cron tick risks locking the Garmin account, so it
+            # backs off like any other failure; re-linking the account
+            # (``AuthService.relink_garmin``) clears the backoff at once.
+            self._record_failure(user_id, exc, credentials=True)
             return None
         except Exception as exc:  # noqa: BLE001 - one account must not kill others
             self._record_failure(user_id, exc)
@@ -289,7 +285,15 @@ class SyncManager:
                 result["completed"], user_id,
             )
 
-    def _record_failure(self, user_id: int, exc: Exception) -> None:
+    def _record_failure(
+        self, user_id: int, exc: Exception, *, credentials: bool = False
+    ) -> None:
+        """Store the failure and push the account's next attempt out.
+
+        ``credentials`` marks a rejected Garmin login: it gets its own message
+        (the fix is the user's, under Settings) and skips the ban heuristics,
+        which would otherwise read a login URL in the error as an IP ban.
+        """
         user = self.store.get(user_id) or {}
         count = int(user.get("sync_fail_count") or 0)
         msg = f"{type(exc).__name__}: {exc}"
@@ -297,11 +301,17 @@ class SyncManager:
         # attempt just extends it. Detect the signature and back off straight to
         # the cap so the worker stops hammering a banned IP.
         lowered = msg.lower()
-        ban = any(
+        ban = not credentials and any(
             hint in lowered
             for hint in ("sso.garmin.com", "cloudflare", "banned", "429")
         )
-        if ban:
+        if credentials:
+            backoff_min = min(_BACKOFF_BASE_MIN * (2 ** count), _BACKOFF_CAP_MIN)
+            error = (
+                f"Garmin rejected the stored credentials ({exc}). Re-link your "
+                "Garmin account under Settings → Sync."
+            )[:500]
+        elif ban:
             backoff_min = _BACKOFF_CAP_MIN
             error = (
                 "Garmin is temporarily blocking this server's IP (Cloudflare/SSO "

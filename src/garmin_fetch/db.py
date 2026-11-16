@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 from .config import load_config
@@ -381,57 +382,6 @@ _AGENT_TABLES = (
     "training_block", "training_week", "weather_forecast",
 )
 
-#: PG types for columns that a legacy/fresh-enough Postgres DB might be missing
-#: (``_ensure_columns`` migration on the PG side; a brand-new PG schema already
-#: carries every column, so this only fires when a column is added later).
-_PG_MIGRATION_TYPES: dict[str, dict[str, str]] = {
-    "weather_forecast": {"condition_code": "INTEGER"},
-    "activities": {
-        "details_json": "TEXT",
-        "details_fetched_at": "TEXT",
-        "weather_json": "TEXT",
-        "weather_fetched_at": "TEXT",
-        "splits_json": "TEXT",
-        "splits_fetched_at": "TEXT",
-        "summary_parsed_at": "TEXT",
-        "details_parsed_at": "TEXT",
-        "weather_parsed_at": "TEXT",
-        "splits_parsed_at": "TEXT",
-    },
-    "metrics": {"parsed_at": "TEXT"},
-    "training_goal": {
-        "start_date": "TEXT",
-    },
-    "training_block": {
-        "target_weekly_km": "DOUBLE PRECISION",
-    },
-    "training_workout": {
-        "completed_activity_id": "BIGINT",
-        "goal_id": "BIGINT",
-        "target_pace_min_km": "DOUBLE PRECISION",
-        "target_hr_zone": "TEXT",
-        "target_power_w": "INTEGER",
-        "steps": "TEXT",
-        "status": "TEXT",
-    },
-    "training_week": {
-        "distance_km": "DOUBLE PRECISION",
-        "is_deload": "BOOLEAN",
-        "week_start": "TEXT",
-    },
-    "activity_summaries": {
-        "activity_name": "TEXT",
-        "activity_type": "TEXT",
-        "start_time_local": "TEXT",
-        "end_time_local": "TEXT",
-        "start_date": "TEXT",
-        "pace_min_km": "DOUBLE PRECISION",
-        "weather_description": "TEXT",
-        "is_pr": "BOOLEAN",
-    },
-}
-
-
 def _pg_type_for_value(value: Any) -> str:
     """Best PG column type for a scalar merge value."""
     if isinstance(value, bool):
@@ -516,10 +466,31 @@ class PostgresBackend:
             if col in existing:
                 continue
             column_type = (types or {}).get(col) or "DOUBLE PRECISION"
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {column_type}")
+            # IF NOT EXISTS: another account's sync may add the same column
+            # between the lookup above and this statement.
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {column_type}"
+            )
 
     def adapt_sql(self, sql: str) -> str:
         return sql.replace("?", "%s")
+
+
+#: DSNs whose schema this process has already created. ``create_schema`` drops
+#: and recreates every RLS policy (ACCESS EXCLUSIVE on each table), so it runs
+#: once per process — at server start, or on the CLI's first connect — and not
+#: on every per-sync ``Database``.
+_schema_ready: set[str] = set()
+_schema_lock = threading.Lock()
+
+
+def _create_schema_once(backend: "PostgresBackend", conn: Any) -> None:
+    with _schema_lock:
+        if backend.dsn in _schema_ready:
+            return
+        backend.create_schema(conn)
+        conn.commit()
+        _schema_ready.add(backend.dsn)
 
 
 def _ensure_rls(conn: Any) -> None:
@@ -572,8 +543,9 @@ class Database:
         self.path = url
         self.user_id = user_id
         self.conn = self._backend.connect()
-        self._backend.create_schema(self.conn)
-        self._migrate()
+        #: ``daily_metrics`` column names, loaded on the first ``merge_daily``.
+        self._daily_columns: set[str] | None = None
+        _create_schema_once(self._backend, self.conn)
         self.conn.commit()
 
     @classmethod
@@ -581,44 +553,32 @@ class Database:
         """Open a Postgres-backed Database from a ``postgres://`` DSN."""
         return cls(url, user_id=user_id)
 
-    def _migrate(self) -> None:
-        """Add any columns missing from a legacy/pre-version schema."""
-        self._ensure_columns("activities", ["details_json", "details_fetched_at"])
-        self._ensure_columns("activities", ["weather_json", "weather_fetched_at"])
-        self._ensure_columns(
-            "activity_summaries", list(self._ACTIVITY_SUMMARY_COLUMNS)
-        )
-        self._ensure_columns(
-            "activity_detail_series", list(self._ACTIVITY_SERIES_COLUMNS)
-        )
-        self._ensure_columns("metrics", ["parsed_at"])
-        self._ensure_columns("training_goal", ["start_date"])
-        self._ensure_columns("training_block", ["target_weekly_km"])
-        self._ensure_columns("training_workout", ["completed_activity_id"])
-        self._ensure_columns("training_workout", ["goal_id"])
-        self._ensure_columns("training_workout", [
-            "target_pace_min_km", "target_hr_zone", "target_power_w", "status",
-        ])
-        self._ensure_columns("training_workout", ["steps"])
-        self._ensure_columns("training_week", ["distance_km"])
-        self._ensure_columns("training_week", ["is_deload"])
-        self._ensure_columns("training_week", ["week_start"])
-        self._ensure_columns("weather_forecast", ["condition_code"])
-        self._ensure_columns("activities", [
-            "summary_parsed_at", "details_parsed_at", "weather_parsed_at",
-            "splits_json", "splits_fetched_at", "splits_parsed_at",
-        ])
+    def _ensure_daily_columns(self, values: dict[str, Any]) -> None:
+        """Create any ``daily_metrics`` column in ``values`` that doesn't exist.
 
-    def _ensure_columns(
-        self, table: str, columns: list[str], types: dict[str, str] | None = None
-    ) -> None:
+        The known column set is cached on the handle, so the catalog is only
+        consulted on the first merge and when a genuinely new column shows up.
+        """
+        if self._daily_columns is None:
+            self._daily_columns = {
+                r["name"] for r in self._backend.table_info(self.conn, "daily_metrics")
+            }
+        missing = [col for col in values if col not in self._daily_columns]
+        if not missing:
+            return
         self._backend.ensure_columns(
-            self.conn, table, columns, types or _PG_MIGRATION_TYPES.get(table, {})
+            self.conn, "daily_metrics", missing,
+            {col: _pg_type_for_value(values[col]) for col in missing},
         )
+        self._daily_columns.update(missing)
 
     def _execute(self, sql: str, params: Any = ()) -> Any:
         """Execute SQL with the backend's placeholder dialect."""
         return self.conn.execute(self._backend.adapt_sql(sql), params)
+
+    def _executemany(self, sql: str, rows: list[tuple[Any, ...]]) -> None:
+        """Run one statement for many parameter rows (pipelined by psycopg)."""
+        self.conn.cursor().executemany(self._backend.adapt_sql(sql), rows)
 
     def _uid(self) -> tuple[int]:
         if self.user_id is None:
@@ -846,32 +806,20 @@ class Database:
         if not values:
             return
         (uid,) = self._uid()
-        self._ensure_columns(
-            "daily_metrics",
-            list(values),
-            {col: _pg_type_for_value(value) for col, value in values.items()},
-        )
-        exists = self._execute(
-            "SELECT 1 FROM daily_metrics WHERE user_id = ? AND calendar_date = ?",
-            (uid, calendar_date),
-        ).fetchone()
-        if not exists:
-            self._execute(
-                "INSERT INTO daily_metrics (user_id, calendar_date) VALUES (?, ?)",
-                (uid, calendar_date),
-            )
-        for col, value in values.items():
-            self._execute(
-                f"UPDATE daily_metrics SET {col} = ? "
-                "WHERE user_id = ? AND calendar_date = ?",
-                (value, uid, calendar_date),
-            )
+        self._ensure_daily_columns(values)
+        row = dict(values)
         if fetched_at:
-            self._execute(
-                "UPDATE daily_metrics SET fetched_at = ? "
-                "WHERE user_id = ? AND calendar_date = ?",
-                (fetched_at, uid, calendar_date),
-            )
+            row["fetched_at"] = fetched_at
+        cols = list(row)
+        self._execute(
+            f"""
+            INSERT INTO daily_metrics (user_id, calendar_date, {', '.join(cols)})
+            VALUES (?, ?, {', '.join('?' for _ in cols)})
+            ON CONFLICT (user_id, calendar_date) DO UPDATE SET
+                {', '.join(f'{c} = excluded.{c}' for c in cols)}
+            """,
+            (uid, calendar_date, *row.values()),
+        )
         self.conn.commit()
 
     # -- Pruning ---------------------------------------------------------------
@@ -1076,16 +1024,15 @@ class Database:
             INSERT INTO activity_detail_series (user_id, activity_id, {', '.join(cols)})
             VALUES (?, ?, {placeholders})
         """
-        written = 0
         if not cols or not rows:
             self.conn.commit()
-            return written
-        for row in rows:
-            vals = tuple(row.get(c) for c in cols)
-            self._execute(insert, (uid, activity_id, *vals))
-            written += 1
+            return 0
+        self._executemany(
+            insert,
+            [(uid, activity_id, *(row.get(c) for c in cols)) for row in rows],
+        )
         self.conn.commit()
-        return written
+        return len(rows)
 
     _ACTIVITY_SPLIT_COLUMNS = (
         "split_type", "split_number", "distance_m", "duration_s", "start_time_s",
@@ -1117,16 +1064,15 @@ class Database:
             INSERT INTO activity_splits (user_id, activity_id, {', '.join(cols)})
             VALUES (?, ?, {placeholders})
         """
-        written = 0
         if not cols or not rows:
             self.conn.commit()
-            return written
-        for row in rows:
-            vals = tuple(row.get(c) for c in cols)
-            self._execute(insert, (uid, activity_id, *vals))
-            written += 1
+            return 0
+        self._executemany(
+            insert,
+            [(uid, activity_id, *(row.get(c) for c in cols)) for row in rows],
+        )
         self.conn.commit()
-        return written
+        return len(rows)
 
     # -- User profile ------------------------------------------------------
 
@@ -1324,16 +1270,18 @@ class Database:
         if not rows:
             self.conn.commit()
             return 0
-        for row in rows:
-            self._execute(
-                "INSERT INTO derived_metrics "
-                "(user_id, calendar_date, metric, value, qualifier, fetched_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+        self._executemany(
+            "INSERT INTO derived_metrics "
+            "(user_id, calendar_date, metric, value, qualifier, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
                 (
                     uid, row["calendar_date"], row["metric"],
                     row["value"], row.get("qualifier"), row.get("fetched_at"),
-                ),
-            )
+                )
+                for row in rows
+            ],
+        )
         self.conn.commit()
         return len(rows)
 
@@ -1408,57 +1356,17 @@ def init_db(user_id: int | None = None) -> Database:
 def ensure_schema(url: str) -> None:
     """Idempotently create the full schema (tables, RLS, grants) on one DSN.
 
-    Runs the same ``create_schema`` a ``Database`` would on connect, without
-    binding to a user — used by the server at startup so user-facing tables
-    (e.g. ``training_workout``) exist before the first sync ever runs.
+    Runs the same ``create_schema`` a ``Database`` would on its first connect,
+    without binding to a user — used by the server at startup so user-facing
+    tables (e.g. ``training_workout``) exist before the first sync ever runs,
+    and so the per-sync ``Database`` handles skip the schema work entirely.
     """
     backend = PostgresBackend(url)
     conn = backend.connect()
     try:
-        backend.create_schema(conn)
-        backend.ensure_columns(
-            conn, "training_goal", ["start_date"], {"start_date": "TEXT"},
-        )
-        backend.ensure_columns(
-            conn, "training_block", ["target_weekly_km"],
-            {"target_weekly_km": "DOUBLE PRECISION"},
-        )
-        backend.ensure_columns(
-            conn, "training_workout", ["completed_activity_id"],
-            {"completed_activity_id": "BIGINT"},
-        )
-        backend.ensure_columns(
-            conn, "training_workout", ["goal_id"],
-            {"goal_id": "BIGINT"},
-        )
-        backend.ensure_columns(
-            conn, "training_workout",
-            ["target_pace_min_km", "target_hr_zone", "target_power_w", "status"],
-            {
-                "target_pace_min_km": "DOUBLE PRECISION",
-                "target_hr_zone": "TEXT",
-                "target_power_w": "INTEGER",
-                "status": "TEXT",
-            },
-        )
-        backend.ensure_columns(
-            conn, "training_workout", ["steps"], {"steps": "TEXT"},
-        )
-        backend.ensure_columns(
-            conn, "training_week", ["distance_km"],
-            {"distance_km": "DOUBLE PRECISION"},
-        )
-        backend.ensure_columns(
-            conn, "training_week", ["is_deload"],
-            {"is_deload": "BOOLEAN"},
-        )
-        backend.ensure_columns(
-            conn, "training_week", ["week_start"], {"week_start": "TEXT"},
-        )
-        backend.ensure_columns(
-            conn, "weather_forecast", ["condition_code"],
-            {"condition_code": "INTEGER"},
-        )
-        conn.commit()
+        with _schema_lock:
+            backend.create_schema(conn)
+            conn.commit()
+            _schema_ready.add(url)
     finally:
         conn.close()

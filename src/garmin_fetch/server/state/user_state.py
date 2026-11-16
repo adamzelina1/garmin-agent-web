@@ -33,6 +33,8 @@ _MAX_FACTS = 40
 #: Training principles are free-form markdown the athlete writes, so they get a
 #: larger cap than a single memory value.
 _MAX_PRINCIPLES = 4000
+#: How many turns of tool-call trace are kept per user (newest win).
+_MAX_TRACE_RECORDS = 200
 
 
 class UserState:
@@ -109,6 +111,9 @@ class UserState:
             except json.JSONDecodeError:
                 rows = []
         rows.append(record)
+        # The list is stored as one value and rewritten on every turn, so only
+        # the most recent turns are kept.
+        rows = rows[-_MAX_TRACE_RECORDS:]
         self.set(user_id, _KEY_TRACE, json.dumps(rows, ensure_ascii=False))
 
     def close(self) -> None:

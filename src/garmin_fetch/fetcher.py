@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable
 
-from garminconnect import Garmin, GarminConnectConnectionError
+from garminconnect import (
+    Garmin,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 from .config import load_config
-from .datatypes import DataType, DEFAULT_TYPES, DATA_TYPES, resolve_types
+from .datatypes import DataType, DEFAULT_TYPES, resolve_types
 from .db import Database
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,23 @@ def _no_interactive_mfa() -> str:
         "Garmin MFA is required but this process cannot prompt for it; "
         "temporarily disable two-step verification in Garmin account settings"
     )
+
+
+_RATE_LIMIT_HINT = re.compile(r"\b429\b|too many requests|cloudflare", re.IGNORECASE)
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """Whether a Garmin error means "stop calling", not "this item is missing".
+
+    The per-day / per-activity loops skip an item that fails, which is right
+    for a day with no data but wrong once Garmin starts rate-limiting: every
+    remaining call would fail the same way and extend the block, and the sync
+    would still be reported as a success with no backoff. A rate-limit error
+    therefore ends the sync, so the worker's backoff takes over.
+    """
+    if isinstance(exc, GarminConnectTooManyRequestsError):
+        return True
+    return bool(_RATE_LIMIT_HINT.search(str(exc)))
 
 
 def _open_db(config: dict[str, str], user_id: int | None = None) -> Database:
@@ -184,7 +206,9 @@ class DataFetcher:
             try:
                 self._pace()
                 details = self.client.get_activity_details(activity_id)
-            except Exception:
+            except Exception as exc:
+                if _is_rate_limited(exc):
+                    raise
                 logger.exception(
                     "Failed to fetch details for activity %s, skipping", activity_id
                 )
@@ -213,7 +237,9 @@ class DataFetcher:
         try:
             self._pace()
             weather = self.client.get_activity_weather(str(activity_id))
-        except Exception:
+        except Exception as exc:
+            if _is_rate_limited(exc):
+                raise
             logger.debug(
                 "No weather for activity %s (will backfill later)", activity_id
             )
@@ -325,7 +351,9 @@ class DataFetcher:
                     stats = self.client.get_gear_stats(gear_uuid)
                     if isinstance(stats, dict):
                         entry.update(stats)
-                except Exception:
+                except Exception as exc:
+                    if _is_rate_limited(exc):
+                        raise
                     logger.warning(
                         "gear stats failed for %s; keeping list fields",
                         gear_uuid,
@@ -390,7 +418,9 @@ class DataFetcher:
         try:
             self._pace()
             splits = self.client.get_activity_splits(str(activity_id))
-        except Exception:
+        except Exception as exc:
+            if _is_rate_limited(exc):
+                raise
             logger.debug("No splits for activity %s (will backfill later)", activity_id)
             return False
         if not isinstance(splits, dict):
@@ -458,7 +488,9 @@ class DataFetcher:
         so a day fetched while still in progress gets re-fetched (and overwritten)
         once its data settles. When ``refetch`` is None, every stored date is
         skipped (pure incremental behavior). Returns the count of dates newly
-        fetched (including re-fetched incomplete days).
+        fetched (including re-fetched incomplete days). A day that fails is
+        logged and skipped; a rate-limit error ends the sync instead (see
+        ``_is_rate_limited``).
         """
         stored = db.stored_dates(data_type.name)
         fetched = 0
@@ -480,7 +512,9 @@ class DataFetcher:
                     "Refetched" if already else "Fetched",
                     data_type.name, day_str,
                 )
-            except Exception:
+            except Exception as exc:
+                if _is_rate_limited(exc):
+                    raise
                 logger.exception("Failed to fetch %s for %s", data_type.name, day_str)
             day += timedelta(days=1)
         return fetched
@@ -877,26 +911,6 @@ def detect_history_start(
             return day
         day += timedelta(days=1)
     return hi
-
-
-# --- Backward-compatible heart-rate helpers ---------------------------------
-
-_HEART_RATE = DATA_TYPES["heart_rate"]
-
-
-class HeartRateFetcher(DataFetcher):
-    """Back-compat alias: fetch only heart rate."""
-
-
-def fetch_heart_rates(
-    start: date | None = None,
-    end: date | None = None,
-    days_back: int = 7,
-) -> dict[str, int]:
-    """Back-compat: sync heart rate for an explicit range."""
-    end = end or date.today()
-    start = start or (end - timedelta(days=days_back - 1))
-    return sync_data(types=[_HEART_RATE], start=start, end=end)
 
 
 def main() -> None:

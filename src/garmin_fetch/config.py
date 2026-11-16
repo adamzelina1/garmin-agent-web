@@ -52,7 +52,6 @@ def load_config() -> dict[str, str]:
     cron_token = os.getenv("GARMIN_CRON_TOKEN", "")
     sync_interval_min = os.getenv("GARMIN_SYNC_INTERVAL_MIN", "60")
     sync_max_workers = os.getenv("GARMIN_SYNC_MAX_WORKERS", "4")
-    sync_timeout_min = os.getenv("GARMIN_SYNC_TIMEOUT_MIN", "30")
     fetch_sleep_sec = os.getenv("GARMIN_FETCH_SLEEP_SEC", "0")
     auto_sync = os.getenv("GARMIN_AUTO_SYNC", "0")
     local_user_id = os.getenv("GARMIN_LOCAL_USER_ID", "1")
@@ -61,13 +60,12 @@ def load_config() -> dict[str, str]:
         jwt_ttl = int(jwt_ttl_hours)
         sync_interval = int(sync_interval_min)
         max_workers = int(sync_max_workers)
-        sync_timeout = int(sync_timeout_min)
         local_uid = int(local_user_id)
     except ValueError as exc:
         raise RuntimeError(
             "GARMIN_JWT_TTL_HOURS / GARMIN_SYNC_INTERVAL_MIN / "
-            "GARMIN_SYNC_MAX_WORKERS / GARMIN_SYNC_TIMEOUT_MIN / "
-            "GARMIN_LOCAL_USER_ID must be integers in .env"
+            "GARMIN_SYNC_MAX_WORKERS / GARMIN_LOCAL_USER_ID must be integers "
+            "in .env"
         ) from exc
     if max_workers < 1:
         raise RuntimeError("GARMIN_SYNC_MAX_WORKERS must be >= 1 in .env")
@@ -80,6 +78,10 @@ def load_config() -> dict[str, str]:
         raise RuntimeError("GARMIN_FETCH_SLEEP_SEC must be >= 0 in .env")
 
     auto_sync_enabled = auto_sync.strip().lower() in ("1", "true", "yes", "on")
+    # Open by default; set to 0 once the people who should have accounts do.
+    allow_signup = os.getenv("GARMIN_ALLOW_SIGNUP", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
     try:
         freeze_days = int(activity_freeze_days)
@@ -112,8 +114,8 @@ def load_config() -> dict[str, str]:
         "cron_token": cron_token,
         "sync_interval_min": sync_interval,
         "sync_max_workers": max_workers,
-        "sync_timeout_min": sync_timeout,
         "fetch_sleep_sec": fetch_sleep,
         "auto_sync": auto_sync_enabled,
+        "allow_signup": allow_signup,
         "local_user_id": local_uid,
     }

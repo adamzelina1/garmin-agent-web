@@ -764,7 +764,6 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "garminconnect" },
-    { name = "gradio" },
     { name = "httpx" },
     { name = "plotly" },
     { name = "psycopg", extra = ["binary"] },
@@ -775,6 +774,11 @@ dependencies = [
     { name = "python-multipart" },
     { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+gradio-ui = [
+    { name = "gradio" },
 ]
 
 [package.dev-dependencies]
@@ -792,7 +796,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "garminconnect", specifier = ">=0.3.9" },
-    { name = "gradio", specifier = ">=6.22.0" },
+    { name = "gradio", marker = "extra == 'gradio-ui'", specifier = ">=6.22.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "plotly", specifier = ">=6.9.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
@@ -804,6 +808,7 @@ requires-dist = [
     { name = "tzdata", specifier = ">=2026.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.1" },
 ]
+provides-extras = ["gradio-ui"]
 
 [package.metadata.requires-dev]
 dev = [

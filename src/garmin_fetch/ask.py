@@ -86,7 +86,24 @@ _WRITE_WORDS = re.compile(
     re.IGNORECASE,
 )
 
+#: Functions a query may not call. ``set_config`` could rewrite ``app.user_id``
+#: (the Row-Level Security identity) mid-statement; the ``*_to_xml`` family and
+#: ``ts_stat``/``ts_rewrite`` execute a SQL *string*, which would slip past the
+#: table/keyword checks below; the rest stall or probe the server. This is the
+#: statement-gate layer only — the database enforces the same thing for the
+#: agent role (``setup_db.ensure_roles`` revokes EXECUTE on ``set_config``).
+_BLOCKED_FUNCTIONS = re.compile(
+    r"\b(set_config|(?:query|cursor|table|schema|database)_to_xml\w*|"
+    r"ts_stat|ts_rewrite|dblink\w*|pg_sleep\w*|pg_read_\w+|pg_ls_\w+|"
+    r"pg_stat_file|pg_advisory_\w+|pg_terminate_backend|pg_cancel_backend|"
+    r"pg_notify)\b",
+    re.IGNORECASE,
+)
+
 _MAX_ROWS = 500
+
+#: Hard ceiling on one agent/chart statement, enforced by Postgres.
+_STATEMENT_TIMEOUT_MS = 20_000
 
 #: A ``daily_metrics`` column counts as empty for an account (hidden like a
 #: disabled type's columns) when under this share of its days hold a value AND
@@ -802,10 +819,16 @@ class ReadOnlyDB:
     """Read-only handle over one account's Garmin data plus safe query execution.
 
     Bound to a ``user_id``: every call draws a pooled connection, runs
-    ``set_config('app.user_id', ...)`` so Row-Level Security scopes the
-    transaction, and executes as the read-only PG role (SELECT on the agent
-    tables only). Connections are per-call because Pydantic AI runs tools from a
-    worker thread.
+    ``SET LOCAL app.user_id`` so Row-Level Security scopes the transaction
+    (plus a statement timeout), and executes as the read-only PG role (SELECT
+    on the agent tables only). ``SET LOCAL`` rather than ``set_config`` because
+    that role has no EXECUTE on ``set_config`` — a query must not be able to
+    switch accounts. Connections are per-call because Pydantic AI runs tools
+    from a worker thread.
+
+    ``pool`` is an already-open pool to draw from (the server shares one across
+    requests; safe because the identity is transaction-scoped). Without it the
+    handle opens — and on ``close`` releases — its own.
 
     ``excluded_types`` is the account's disabled daily data types (a comma list
     string or an iterable): ``daily_metrics`` columns that no *enabled* type can
@@ -821,6 +844,7 @@ class ReadOnlyDB:
         *,
         user_id: int | None = None,
         excluded_types: Iterable[str] | str = (),
+        pool: Any = None,
     ) -> None:
         self.url = url
         self.user_id = user_id
@@ -835,7 +859,8 @@ class ReadOnlyDB:
         self._excluded_columns: frozenset[str] = frozenset(
             set().union(*(TYPE_COLUMNS.get(name, set()) for name in excluded)) - enabled
         )
-        self._pool: Any = None
+        self._pool: Any = pool
+        self._owns_pool = pool is None
         self._table_names: list[str] | None = None
         self._forbidden: re.Pattern | None = None
         self._hidden: frozenset[str] | None = None
@@ -844,21 +869,14 @@ class ReadOnlyDB:
     @contextmanager
     def _connect(self) -> Any:
         if self._pool is None:
-            from psycopg.rows import dict_row
-            from psycopg_pool import ConnectionPool
+            from .db import open_pg_pool
 
-            self._pool = ConnectionPool(
-                self.url,
-                min_size=1,
-                max_size=8,
-                open=True,
-                configure=lambda conn: setattr(conn, "row_factory", dict_row),
-            )
+            self._pool = open_pg_pool(self.url, min_size=1, max_size=8)
         with self._pool.connection() as conn:
+            # SET takes no bind parameters; both values are ints formatted here.
+            conn.execute(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}")
             if self.user_id is not None:
-                conn.execute(
-                    "SELECT set_config('app.user_id', %s, true)", (str(self.user_id),)
-                )
+                conn.execute(f"SET LOCAL app.user_id = '{int(self.user_id)}'")
             yield conn
 
     def _hidden_columns(self) -> frozenset[str]:
@@ -1217,6 +1235,11 @@ class ReadOnlyDB:
             raise ValueError(
                 f"statement contains a write keyword and was rejected: {write_word.group(0)}"
             )
+        blocked = _BLOCKED_FUNCTIONS.search(statement)
+        if blocked:
+            raise ValueError(
+                f"statement calls a function that is not allowed: {blocked.group(0)}"
+            )
         forbidden = self._forbidden_table_regex()
         if forbidden and forbidden.search(statement):
             raise ValueError(
@@ -1250,8 +1273,8 @@ class ReadOnlyDB:
         }
 
     def close(self) -> None:
-        """Release the pooled connections (no-op if never opened)."""
-        if self._pool is not None:
+        """Release the handle's own pool (no-op if never opened or shared)."""
+        if self._pool is not None and self._owns_pool:
             self._pool.close()
             self._pool = None
 

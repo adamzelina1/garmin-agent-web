@@ -146,7 +146,7 @@ curl -s -X POST localhost:8000/ask -H "$H" -H 'Content-Type: application/json' \
 
 | Group | Routes |
 | --- | --- |
-| Auth & config | `POST /auth/register`, `POST /auth/register/mfa`, `POST /auth/login`, `GET /auth/me`, `GET`/`PUT /auth/config` |
+| Auth & config | `POST /auth/register`, `POST /auth/register/mfa`, `POST /auth/login`, `POST /auth/garmin` (re-link the Garmin login), `GET /auth/me`, `GET`/`PUT /auth/config` |
 | Sync | `POST /sync`, `POST /sync/full`, `POST /sync/detect-start`, `GET /sync/status`, `POST /cron/sync` (uses `GARMIN_CRON_TOKEN`) |
 | Data | `GET /acwr`, `GET /run-acwr`, `GET /activities`, `GET /weather` |
 | Training | `GET`/`POST /training/workouts`, `PATCH`/`DELETE /training/workouts/{id}`, `GET`/`POST /training/anchor`, `PATCH`/`DELETE /training/anchor/{goal_id}`, `POST /training/undo` |
@@ -161,7 +161,7 @@ uv run garmin-fetch                        # incremental sync of all types
 uv run garmin-fetch --parse --full         # full re-parse of stored raw data
 uv run garmin-fetch --range 2026-01-01 2026-02-01 --type sleep
 uv run garmin-ask "avg sleep last week?"   # ask the agent from the terminal
-uv run garmin-ask-web                      # legacy Gradio chat UI
+uv run garmin-ask-web                      # legacy Gradio chat UI (uv sync --extra gradio-ui)
 uv run garmin-trace                        # inspect the agent's tool-call trace
 ```
 
@@ -172,9 +172,13 @@ Syncs with an explicit `--range` or `--type` never prune data.
 The agent is built on Pydantic AI and is read-only at every layer:
 
 1. It connects as `garmin_readonly`, a SELECT-only role with real REVOKEs.
-2. RLS limits it to the signed-in user's rows.
-3. A statement gate allows only `SELECT`, `WITH` and `EXPLAIN`, and an
-   allowed-tables list blocks raw and internal tables.
+2. RLS limits it to the signed-in user's rows. The role has no `EXECUTE` on
+   `set_config`, so a query cannot change `app.user_id`; the server binds the
+   user with `SET LOCAL` and refuses to start if the role could still switch.
+3. A statement gate allows only `SELECT`, `WITH` and `EXPLAIN`, an
+   allowed-tables list blocks raw and internal tables, and functions that run
+   SQL strings or change settings are rejected.
+4. Every statement runs under a 20-second `statement_timeout`.
 
 | Tool | Purpose |
 | --- | --- |
@@ -241,7 +245,8 @@ Per-account settings live in the `users` table and are edited from the UI.
 | `GARMIN_ENC_KEY` | Base64 of a 32-byte AES-GCM key |
 | `GARMIN_JWT_SECRET`, `GARMIN_JWT_TTL_HOURS` | JWT signing secret and token lifetime |
 | `GARMIN_CRON_TOKEN` | Bearer token for `POST /cron/sync` |
-| `GARMIN_SYNC_INTERVAL_MIN`, `GARMIN_SYNC_MAX_WORKERS`, `GARMIN_SYNC_TIMEOUT_MIN` | Background worker tuning |
+| `GARMIN_ALLOW_SIGNUP` | `0` closes `POST /auth/register` (on by default) |
+| `GARMIN_SYNC_INTERVAL_MIN`, `GARMIN_SYNC_MAX_WORKERS` | Background worker tuning |
 | `GARMIN_FETCH_SLEEP_SEC` | Delay between Garmin API calls (`2` is a good value for backfills) |
 | `GARMIN_AUTO_SYNC` | Default for the per-account auto-sync toggle (off unless set) |
 | `GARMIN_ACTIVITY_FREEZE_DAYS` | Trailing days re-scanned for late activity uploads |
@@ -266,10 +271,14 @@ uv run python -c "import secrets,base64;print(base64.b64encode(secrets.token_byt
 - **Defense in depth for the agent.** The read-only role is the real
   enforcement. The statement gate and the allowed-tables list are a second
   layer.
-- **Rate limits.** Failed syncs back off 30 min × 2ⁿ, capped at 8 h. A detected
-  ban jumps straight to 8 h.
+- **Rate limits.** Failed syncs (a rejected Garmin login included) back off
+  30 min × 2ⁿ, capped at 8 h. A detected ban jumps straight to 8 h, and a
+  rate-limit error mid-sync ends that sync instead of being skipped per day.
+  Sign-in, sign-up and Garmin re-link attempts are capped in memory per caller;
+  sign-ups are also capped server-wide because each one logs in to Garmin.
 - Run the server behind TLS for anything beyond localhost, and change the
-  default database passwords in `docker-compose.yml`.
+  default database passwords in `docker-compose.yml`. Postgres is published on
+  `127.0.0.1` only.
 
 ## Project layout
 
@@ -283,12 +292,14 @@ src/garmin_fetch/
   workload.py       ACWR
   run_workload.py   running ACWR + cadence drift
   ask.py            the read-only agent and its tools
-  ask_web.py        legacy Gradio UI
+  chat_format.py    answer/session shaping shared by the server and Gradio UI
+  ask_web.py        legacy Gradio UI (optional extra)
   trace.py          per-turn tool-call tracing
   config.py         .env loading
   server/
     app.py          FastAPI routes
-    auth.py         users, bcrypt, JWT, Garmin-verified signup + MFA
+    auth.py         users, bcrypt, JWT, Garmin-verified signup/re-link + MFA
+    ratelimit.py    in-memory attempt limits for the auth endpoints
     crypto.py       AES-GCM
     sync_worker.py  worker pool, APScheduler cron, backoff
     geocode.py      home city → lat/lon

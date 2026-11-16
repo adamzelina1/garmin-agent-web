@@ -5,7 +5,6 @@ description = "Data fetcher for Garmin Connect"
 requires-python = ">=3.14"
 dependencies = [
     "garminconnect>=0.3.9",
-    "gradio>=6.22.0",
     "httpx>=0.28.0",
     "plotly>=6.9.0",
     "psycopg[binary]>=3.2.0",
@@ -21,6 +20,10 @@ dependencies = [
     "python-multipart>=0.0.32",
     "tzdata>=2026.3",
 ]
+
+[project.optional-dependencies]
+# Only the legacy `garmin-ask-web` chat UI needs Gradio; the server doesn't.
+gradio-ui = ["gradio>=6.22.0"]
 
 [project.scripts]
 garmin-fetch = "garmin_fetch.fetcher:main"

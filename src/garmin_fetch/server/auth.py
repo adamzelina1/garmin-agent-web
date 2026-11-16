@@ -37,6 +37,14 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 #: start registration again.
 _MFA_TTL_S = 600
 
+#: bcrypt only hashes the first 72 bytes and (since bcrypt 5) refuses anything
+#: longer rather than truncating silently.
+_MAX_PASSWORD_BYTES = 72
+
+#: "Leave this column alone" marker for ``UserStore.set_sync_status`` fields
+#: where None means "clear it".
+_KEEP: Any = object()
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -113,13 +121,20 @@ class UserStore:
             conn.execute("DELETE FROM users WHERE id = %s", (user_id,))
 
     def set_garmin_creds(
-        self, user_id: int, garmin_cred_enc: str, tokens_enc: str
+        self,
+        user_id: int,
+        garmin_cred_enc: str,
+        tokens_enc: str,
+        *,
+        garmin_email: str | None = None,
     ) -> None:
+        """Store the encrypted password + tokens (and the Garmin email, when
+        the account is being re-linked to a different login)."""
         with self._pool.connection() as conn:
             conn.execute(
-                "UPDATE users SET garmin_cred_enc = %s, tokens_enc = %s "
-                "WHERE id = %s",
-                (garmin_cred_enc, tokens_enc, user_id),
+                "UPDATE users SET garmin_cred_enc = %s, tokens_enc = %s, "
+                "garmin_email = COALESCE(%s, garmin_email) WHERE id = %s",
+                (garmin_cred_enc, tokens_enc, garmin_email, user_id),
             )
 
     def confirm(self, user_id: int) -> None:
@@ -154,20 +169,27 @@ class UserStore:
         user_id: int,
         *,
         last_sync_at: str | None = None,
-        error: str | None = None,
+        error: str | None | object = _KEEP,
         fail_count: int | None = None,
-        rate_limit_until: str | None = None,
+        rate_limit_until: str | None | object = _KEEP,
     ) -> None:
+        """Update the account's sync bookkeeping.
+
+        ``last_sync_at`` / ``fail_count`` are left alone when None. ``error``
+        and ``rate_limit_until`` are left alone only when omitted: passing
+        None clears them, which is how a successful sync wipes the previous
+        failure's message and backoff.
+        """
         with self._pool.connection() as conn:
             sets = []
             params: list[Any] = []
-            for col, val in (
-                ("last_sync_at", last_sync_at),
-                ("sync_error", error),
-                ("sync_fail_count", fail_count),
-                ("rate_limit_until", rate_limit_until),
+            for col, val, skip in (
+                ("last_sync_at", last_sync_at, None),
+                ("sync_error", error, _KEEP),
+                ("sync_fail_count", fail_count, None),
+                ("rate_limit_until", rate_limit_until, _KEEP),
             ):
-                if val is not None:
+                if val is not skip:
                     sets.append(f"{col} = %s")
                     params.append(val)
             if not sets:
@@ -301,6 +323,10 @@ class AuthService:
             raise AuthError(400, "a valid email address is required")
         if not password or len(password) < 8:
             raise AuthError(400, "password must be at least 8 characters")
+        if len(password.encode("utf-8")) > _MAX_PASSWORD_BYTES:
+            raise AuthError(
+                400, f"password must be at most {_MAX_PASSWORD_BYTES} bytes long"
+            )
         if not garmin_email or not garmin_password:
             raise AuthError(400, "Garmin credentials are required to bind an account")
 
@@ -327,6 +353,54 @@ class AuthService:
                 garmin_cred_enc=cred_enc,
             )
 
+        try:
+            client, needs_mfa = self._garmin_login(garmin_email, garmin_password)
+        except AuthError as exc:
+            # Wrong credentials or a Garmin block: nothing is kept.
+            logger.warning("Garmin login failed at signup for %s: %s", email, exc)
+            self.store.delete(user_id)
+            if exc.status_code == 502:
+                exc.detail += " Nothing was created."
+            raise
+
+        if needs_mfa:
+            # The account stays unconfirmed until the code is submitted.
+            return self._mfa_challenge(client, user_id, email, cred_enc)
+
+        self._finish_login(user_id, email, client, cred_enc)
+        return {"status": "ok", "token": self._token(user_id, email)}
+
+    def relink_garmin(
+        self, user: dict[str, Any], *, garmin_email: str, garmin_password: str
+    ) -> dict[str, Any]:
+        """Replace an existing account's Garmin login (e.g. a changed password).
+
+        Logs in to Garmin with the new credentials first; nothing stored
+        changes unless that succeeds. Two-step verification works as at signup:
+        an ``mfa_required`` response carries a ``challenge`` for
+        :meth:`confirm_mfa`. A successful re-link also clears the sync error
+        and backoff left by the old credentials.
+        """
+        garmin_email = (garmin_email or "").strip() or user["garmin_email"]
+        if not garmin_password:
+            raise AuthError(400, "the Garmin password is required")
+        client, needs_mfa = self._garmin_login(garmin_email, garmin_password)
+        cred_enc = self.encryptor.encrypt(garmin_password)
+        if needs_mfa:
+            return self._mfa_challenge(
+                client, user["id"], user["email"], cred_enc, garmin_email=garmin_email
+            )
+        self._finish_login(
+            user["id"], user["email"], client, cred_enc, garmin_email=garmin_email
+        )
+        return {"status": "ok"}
+
+    def _garmin_login(self, garmin_email: str, garmin_password: str) -> tuple[Any, bool]:
+        """Log in to Garmin once; returns (client, needs_mfa).
+
+        Raises ``AuthError`` 400 for rejected credentials and 502 when Garmin
+        can't be reached (rate limit / Cloudflare).
+        """
         client = Garmin(
             email=garmin_email,
             password=garmin_password,
@@ -340,37 +414,39 @@ class AuthService:
         try:
             mfa_status, _ = client.login()
         except GarminConnectAuthenticationError as exc:
-            # Wrong Garmin credentials (or a locked account): fail signup.
-            logger.warning("invalid Garmin credentials at signup for %s: %s", email, exc)
-            self.store.delete(user_id)
+            # Wrong Garmin credentials (or a locked account).
             raise AuthError(400, f"invalid Garmin credentials: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - transient Garmin rate-limit / Cloudflare
-            logger.warning("Garmin login failed at signup for %s: %s", email, exc)
-            self.store.delete(user_id)
             raise AuthError(
                 502,
                 "Couldn't log in to Garmin right now — Garmin is likely "
                 "rate-limiting or Cloudflare-blocking this server (common from "
-                f"a server IP): {type(exc).__name__}. Nothing was created — "
-                "please try again in a few minutes.",
+                f"a server IP): {type(exc).__name__}. Please try again in a "
+                "few minutes.",
             ) from exc
+        return client, mfa_status == "needs_mfa"
 
-        if mfa_status == "needs_mfa":
-            # Hold the in-flight client so the verification code can complete
-            # the login in a follow-up request. The account stays unconfirmed.
-            self._prune_pending_mfa()
-            challenge = secrets.token_urlsafe(24)
-            self._pending_mfa[challenge] = {
-                "client": client,
-                "user_id": user_id,
-                "email": email,
-                "cred_enc": cred_enc,
-                "created_at": time.time(),
-            }
-            return {"status": "mfa_required", "challenge": challenge}
-
-        self._finish_login(user_id, email, client, cred_enc)
-        return {"status": "ok", "token": self._token(user_id, email)}
+    def _mfa_challenge(
+        self,
+        client: Any,
+        user_id: int,
+        email: str,
+        cred_enc: str,
+        *,
+        garmin_email: str | None = None,
+    ) -> dict[str, Any]:
+        """Park the in-flight Garmin client until its verification code arrives."""
+        self._prune_pending_mfa()
+        challenge = secrets.token_urlsafe(24)
+        self._pending_mfa[challenge] = {
+            "client": client,
+            "user_id": user_id,
+            "email": email,
+            "cred_enc": cred_enc,
+            "garmin_email": garmin_email,
+            "created_at": time.time(),
+        }
+        return {"status": "mfa_required", "challenge": challenge}
 
     def confirm_mfa(self, *, challenge: str, code: str) -> dict[str, Any]:
         """Complete a Garmin two-step login started by :meth:`register`.
@@ -400,15 +476,35 @@ class AuthService:
                 f"rate-limiting this server: {type(exc).__name__}. Please try again.",
             ) from exc
         self._pending_mfa.pop(challenge, None)
-        self._finish_login(entry["user_id"], entry["email"], client, entry["cred_enc"])
+        self._finish_login(
+            entry["user_id"], entry["email"], client, entry["cred_enc"],
+            garmin_email=entry.get("garmin_email"),
+        )
         return {"status": "ok", "token": self._token(entry["user_id"], entry["email"])}
 
     def _finish_login(
-        self, user_id: int, email: str, client: Any, cred_enc: str
+        self,
+        user_id: int,
+        email: str,
+        client: Any,
+        cred_enc: str,
+        *,
+        garmin_email: str | None = None,
     ) -> None:
+        """Store the verified credentials + fresh tokens and mark the bind good.
+
+        Any sync error/backoff on the account belonged to the previous
+        credentials, so it is cleared.
+        """
         tokens = client.client.dumps()
-        self.store.set_garmin_creds(user_id, cred_enc, self.encryptor.encrypt(tokens))
+        self.store.set_garmin_creds(
+            user_id, cred_enc, self.encryptor.encrypt(tokens),
+            garmin_email=garmin_email,
+        )
         self.store.confirm(user_id)
+        self.store.set_sync_status(
+            user_id, error=None, fail_count=0, rate_limit_until=None
+        )
 
     # -- login ----------------------------------------------------------------
 

@@ -6,6 +6,7 @@ API:
 - ``POST /auth/register``   — create account + bind Garmin (single-step login)
 - ``POST /auth/register/mfa`` — submit Garmin verification code, finish bound
 - ``POST /auth/login``      — email+password -> JWT
+- ``POST /auth/garmin``     — re-link the caller's Garmin login (JWT)
 - ``GET  /auth/me``         — current user (JWT)
 - ``POST /sync``            — enqueue the caller's own sync (JWT)
 - ``GET  /sync/status``     — sync status for the caller (JWT)
@@ -34,7 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -53,16 +54,12 @@ from ..ask import (
     _record_turn,
     compact,
 )
-from ..ask_web import (
-    _extract_charts,
-    _history_to_messages,
-    _messages_to_history,
-    _replace_workout_dumps,
-)
+from ..chat_format import extract_charts, messages_to_history, replace_workout_dumps
 from ..config import load_config
-from ..db import ensure_schema
+from ..db import ensure_schema, open_pg_pool
 from .auth import AuthError, AuthService, UserStore
-from .setup_db import ensure_roles
+from .ratelimit import RateLimiter
+from .setup_db import agent_role_can_switch_user, ensure_roles
 from .state import (
     PgMemory, PgPrinciples, TrainingAnchorStore, TrainingWorkoutStore,
     TrainingSeason, TrainingStore, UserState,
@@ -93,9 +90,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class GarminLinkRequest(BaseModel):
+    garmin_password: str
+    garmin_email: str | None = None
+
+
 class AskRequest(BaseModel):
     question: str
-    history: list[dict[str, Any]] = []
     stream: bool = False
 
 
@@ -211,27 +212,46 @@ class TrainingAnchor(BaseModel):
 
 # -- App state ---------------------------------------------------------------
 
-def _per_user_cfg(cfg: dict[str, Any], user_id: int) -> dict[str, Any]:
-    """Config copy for one user's agent run.
-
-    Agent state (memory, session, trace) lives in the ``user_state`` table, so
-    there is nothing to write under a per-user directory anymore.
-    """
-    return dict(cfg)
-
-
 def _readonly(
-    cfg: dict[str, Any], user_id: int, excluded_types: str = ""
+    request: Request, user_id: int, excluded_types: str = ""
 ) -> ReadOnlyDB:
-    url = cfg.get("readonly_db_url") or cfg["db_url"]
-    if not cfg.get("readonly_db_url"):
-        logger.warning(
-            "GARMIN_READONLY_DB_URL not set — agent connects as the writer role"
+    """The agent's read-only handle for one user, on the shared agent pool.
+
+    ``excluded_types`` hides columns the account can't have data for (disabled
+    data types) so the agent's schema introspection stays lean and never costs
+    tokens on metrics it will only ever see as NULL.
+    """
+    cfg = request.app.state.cfg
+    return ReadOnlyDB(
+        cfg.get("readonly_db_url") or cfg["db_url"],
+        user_id=user_id,
+        excluded_types=excluded_types,
+        pool=request.app.state.agent_pool,
+    )
+
+
+@contextmanager
+def _user_conn(request: Request, user_id: int) -> Any:
+    """A pooled app-role connection scoped to ``user_id`` for one transaction."""
+    with request.app.state.pool.connection() as conn:
+        conn.execute("SELECT set_config('app.user_id', %s, true)", (str(user_id),))
+        yield conn
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _limit(limiter: RateLimiter, key: str, what: str) -> None:
+    """429 when ``key`` has used up ``limiter``; otherwise count this attempt."""
+    wait = limiter.retry_after(key)
+    if wait:
+        raise HTTPException(
+            429,
+            f"too many {what} — try again in about {max(1, round(wait / 60))} min",
+            headers={"Retry-After": str(wait)},
         )
-    # Hide columns the account can't have data for (disabled data types) so the
-    # agent's schema introspection stays lean and never costs tokens on metrics
-    # it will only ever see as NULL.
-    return ReadOnlyDB(url, user_id=user_id, excluded_types=excluded_types)
+    limiter.record(key)
 
 
 def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dict[str, Any]:
@@ -241,7 +261,7 @@ def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dic
     from the server ``.env`` — it is never per-account. Only the weather
     location and the excluded data types remain user-specific overrides.
     """
-    user_cfg = _per_user_cfg(cfg, user["id"])
+    user_cfg = dict(cfg)
     user_cfg["llm_api_key"] = cfg.get("llm_api_key") or ""
     user_cfg["llm_base_url"] = cfg.get("llm_base_url") or ""
     user_cfg["llm_model"] = cfg.get("llm_model") or ""
@@ -264,6 +284,21 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             cfg.get("admin_db_url", ""), cfg["db_url"], cfg.get("readonly_db_url", "")
         )
         ensure_schema(cfg["db_url"])
+        agent_url = cfg.get("readonly_db_url") or ""
+        if not agent_url:
+            logger.warning(
+                "GARMIN_READONLY_DB_URL not set — agent connects as the writer role"
+            )
+        elif agent_role_can_switch_user(agent_url):
+            raise RuntimeError(
+                "the agent's database role can still call set_config(), so a "
+                "query could switch app.user_id and read another account. Set "
+                "GARMIN_ADMIN_DB_URL so the server can lock it down at startup, "
+                "or run as a superuser: REVOKE EXECUTE ON FUNCTION "
+                "pg_catalog.set_config(text, text, boolean) FROM PUBLIC; GRANT "
+                "EXECUTE ON FUNCTION pg_catalog.set_config(text, text, boolean) "
+                "TO garmin_app;"
+            )
         auth = AuthService(cfg)
         sync = SyncManager(cfg)
         state = UserState(cfg["db_url"])
@@ -275,18 +310,35 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         app.state.workouts = training.workouts
         app.state.anchor = training.anchor
         app.state.cfg = cfg
+        # Shared pools: one for the app role's per-user reads, one for the
+        # agent role. Both scope every transaction to a user, so sharing a
+        # connection across requests can't leak rows between accounts.
+        app.state.pool = open_pg_pool(cfg["db_url"], min_size=1, max_size=8)
+        app.state.agent_pool = open_pg_pool(
+            agent_url or cfg["db_url"], min_size=1, max_size=8
+        )
         sync.start()
         logger.info("garmin server started")
         try:
             yield
         finally:
             sync.shutdown()
+            app.state.agent_pool.close()
+            app.state.pool.close()
             state.close()
             training.close()
             auth.close()
 
     app = FastAPI(title="Garmin Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    # Attempt limits (see ``ratelimit``). Signup and re-link each cost a Garmin
+    # login from this server's IP, so they are capped per caller and overall.
+    login_limit = RateLimiter(10, 5 * 60)
+    signup_limit = RateLimiter(5, 60 * 60)
+    signup_total = RateLimiter(20, 60 * 60)
+    mfa_limit = RateLimiter(10, 10 * 60)
+    relink_limit = RateLimiter(5, 60 * 60)
 
     # -- dependencies ---------------------------------------------------------
 
@@ -311,6 +363,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     @app.post("/auth/register")
     def register(body: RegisterRequest, request: Request) -> dict[str, Any]:
         auth: AuthService = request.app.state.auth
+        if not request.app.state.cfg.get("allow_signup", True):
+            raise HTTPException(403, "sign-ups are disabled on this server")
+        _limit(signup_limit, _client_ip(request), "sign-up attempts")
+        _limit(signup_total, "all", "sign-ups on this server right now")
         try:
             return auth.register(
                 email=body.email,
@@ -327,6 +383,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         the code the user was sent. ``challenge`` is from the ``mfa_required``
         response of ``POST /auth/register``."""
         auth: AuthService = request.app.state.auth
+        _limit(mfa_limit, _client_ip(request), "verification attempts")
         try:
             return auth.confirm_mfa(challenge=body.challenge, code=body.code)
         except AuthError as exc:
@@ -335,8 +392,39 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     @app.post("/auth/login")
     def login(body: LoginRequest, request: Request) -> dict[str, Any]:
         auth: AuthService = request.app.state.auth
+        # Only failed attempts count, per caller + account, so a correct
+        # password is never locked out by its own successful logins.
+        key = f"{_client_ip(request)}|{body.email.strip().lower()}"
+        wait = login_limit.retry_after(key)
+        if wait:
+            raise HTTPException(
+                429,
+                "too many failed sign-in attempts — try again in about "
+                f"{max(1, round(wait / 60))} min",
+                headers={"Retry-After": str(wait)},
+            )
         try:
             return auth.login(email=body.email, password=body.password)
+        except AuthError as exc:
+            if exc.status_code == 401:
+                login_limit.record(key)
+            raise HTTPException(exc.status_code, exc.detail) from exc
+
+    @app.post("/auth/garmin")
+    def relink_garmin(
+        body: GarminLinkRequest, request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """Replace the caller's stored Garmin login (e.g. after a password
+        change). Verified by logging in to Garmin; ``mfa_required`` responses
+        are finished through ``POST /auth/register/mfa`` like a signup."""
+        auth: AuthService = request.app.state.auth
+        _limit(relink_limit, str(user["id"]), "Garmin re-link attempts")
+        try:
+            return auth.relink_garmin(
+                user,
+                garmin_email=body.garmin_email or "",
+                garmin_password=body.garmin_password,
+            )
         except AuthError as exc:
             raise HTTPException(exc.status_code, exc.detail) from exc
 
@@ -484,15 +572,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         ``activity_summaries``. Returns the per-day series plus the most
         recent day with a ratio.
         """
-        from ..db import PostgresBackend
         from ..workload import read_series
 
-        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
-        conn = backend.connect()
-        try:
+        with _user_conn(request, user["id"]) as conn:
             days = read_series(conn)
-        finally:
-            conn.close()
         scored = [d for d in days if d.get("acwr") is not None]
         return {"today": scored[-1] if scored else None, "days": days}
 
@@ -506,15 +589,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         cannot mask low running volume. Returns the per-day series plus the most
         recent day with a ratio.
         """
-        from ..db import PostgresBackend
         from ..run_workload import read_series
 
-        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
-        conn = backend.connect()
-        try:
+        with _user_conn(request, user["id"]) as conn:
             days = read_series(conn)
-        finally:
-            conn.close()
         scored = [d for d in days if d.get("run_acwr") is not None]
         return {"today": scored[-1] if scored else None, "days": days}
 
@@ -523,15 +601,10 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         """The learned running pace per HR zone (stored in ``derived_metrics``,
         recomputed each sync). ``paces`` is None until a sync has a lactate
         threshold and HR zones to work from."""
-        from ..db import PostgresBackend
         from ..zone_pace import HALF_LIFE_DAYS, read_zone_paces
 
-        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
-        conn = backend.connect()
-        try:
+        with _user_conn(request, user["id"]) as conn:
             paces = read_zone_paces(conn)
-        finally:
-            conn.close()
         return {
             "paces": paces,
             "half_life_days": HALF_LIFE_DAYS,
@@ -632,8 +705,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         """
         from datetime import date as _date
 
-        from ..db import PostgresBackend
-
         for label, value in (("from_date", from_date), ("to_date", to_date)):
             if value:
                 try:
@@ -645,9 +716,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         if not from_date or not to_date:
             raise HTTPException(400, "pass both from_date and to_date")
 
-        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
-        conn = backend.connect()
-        try:
+        with _user_conn(request, user["id"]) as conn:
             rows = conn.execute(
                 "SELECT activity_id, start_date, activity_type, distance_km, "
                 "duration_hours FROM activity_summaries "
@@ -655,8 +724,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 "ORDER BY start_date",
                 (user["id"], from_date, to_date),
             ).fetchall()
-        finally:
-            conn.close()
         return {"activities": [dict(r) for r in rows]}
 
     # -- long-term anchor -----------------------------------------------------
@@ -767,8 +834,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         """
         from datetime import date as _date, timedelta as _timedelta
 
-        from ..db import PostgresBackend
-
         for label, value in (("from_date", from_date), ("to_date", to_date)):
             if value:
                 try:
@@ -788,9 +853,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         if end < start:
             raise HTTPException(400, "to_date must not be before from_date")
 
-        backend = PostgresBackend(request.app.state.cfg["db_url"], user_id=user["id"])
-        conn = backend.connect()
-        try:
+        with _user_conn(request, user["id"]) as conn:
             rows = conn.execute(
                 "SELECT calendar_date AS date, temp_max_c, temp_min_c, precip_mm, "
                 "wind_max_kmh, condition_code, source "
@@ -799,8 +862,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 "ORDER BY calendar_date",
                 (user["id"], start.isoformat(), end.isoformat()),
             ).fetchall()
-        finally:
-            conn.close()
         return {"days": [dict(r) for r in rows]}
 
     # -- ask ------------------------------------------------------------------
@@ -818,8 +879,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
 
     def _user_readonly(request: Request, user: dict) -> ReadOnlyDB:
         return _readonly(
-            request.app.state.cfg,
-            user["id"],
+            request, user["id"],
             excluded_types=user.get("excluded_data_types") or "",
         )
 
@@ -844,10 +904,8 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             on_status=on_status,
         )
 
-    def _turn_history(request: Request, user: dict, body: AskRequest) -> list[Any] | None:
-        """The history a turn resumes from: client-supplied, else the stored session."""
-        if body.history:
-            return _history_to_messages(body.history)
+    def _turn_history(request: Request, user: dict) -> list[Any] | None:
+        """The stored session a turn resumes from (None for a fresh one)."""
         return request.app.state.state.get_session_messages(user["id"])
 
     def _finish_turn(
@@ -865,11 +923,11 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             user_cfg, question, result, answer=answer,
             trace_writer=lambda record: state.append_trace(user["id"], record),
         )
-        text, specs = _extract_charts(answer)
+        text, specs = extract_charts(answer)
         messages = _prune_session_messages(result.all_messages())
         state.set_session_messages(user["id"], messages)
         return {
-            "answer": _replace_workout_dumps(text),
+            "answer": replace_workout_dumps(text),
             "chart_specs": specs,
             "chart_figures": [charts.get(s.get("sql", "").strip()) for s in specs],
             "tokens": _messages_token_estimate(messages),
@@ -891,7 +949,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             try:
                 agent = _user_agent(request, user, user_cfg, db, charts=charts)
                 result = await agent.run(
-                    body.question, message_history=_turn_history(request, user, body)
+                    body.question, message_history=_turn_history(request, user)
                 )
                 return _finish_turn(request, user, user_cfg, body.question, result, charts)
             except Exception as exc:  # noqa: BLE001 - a bad question must not crash the server
@@ -915,7 +973,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                     agent = _user_agent(
                         request, user, user_cfg, db, charts=charts, on_status=on_status
                     )
-                    history = _turn_history(request, user, body)
+                    history = _turn_history(request, user)
 
                     # ``agent.run_stream`` treats the *first* text part as the
                     # final output and stops the graph there, so a model that
@@ -1003,11 +1061,11 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         plan dumps are replaced with the <plan_table /> marker."""
         state: UserState = request.app.state.state
         messages = state.get_session_messages(user["id"]) or []
-        history = _messages_to_history(messages)
+        history = messages_to_history(messages)
         for item in history:
             if item.get("role") in ("assistant", "bot"):
-                text, specs = _extract_charts(item["content"])
-                item["content"] = _replace_workout_dumps(text)
+                text, specs = extract_charts(item["content"])
+                item["content"] = replace_workout_dumps(text)
                 item["chart_specs"] = specs
         return {
             "history": history,
@@ -1051,7 +1109,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         sql = body.spec.get("sql")
         if not isinstance(sql, str):
             raise HTTPException(400, "chart spec needs a string 'sql' key")
-        db = _readonly(request.app.state.cfg, user["id"])
+        db = _readonly(request, user["id"])
         try:
             figure = _build_chart_figure(body.spec, db.run_sql(sql))
             return json.loads(figure.to_json())

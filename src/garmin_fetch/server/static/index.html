@@ -827,6 +827,25 @@
             clients and can suspend accounts that hammer it. Syncs are spaced and auto-back-off on
             failures.</div>
         </div>
+        <div class="card">
+          <h3 class="card-title">Garmin account</h3>
+          <div class="save-note" style="margin:-4px 0 6px">Changed your Garmin password? Re-link here.
+            The new login is checked with Garmin before anything is saved.</div>
+          <label for="relink-email">Garmin Connect email</label>
+          <input id="relink-email" type="email" autocomplete="off">
+          <label for="relink-password">Garmin Connect password</label>
+          <div class="pwd-wrap">
+            <input id="relink-password" type="password" autocomplete="off">
+            <button type="button" class="pwd-toggle" data-for="relink-password" title="Show password" aria-label="Show password"></button>
+          </div>
+          <div id="relink-mfa" class="hidden">
+            <label for="relink-mfa-code">Garmin verification code</label>
+            <input id="relink-mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code">
+          </div>
+          <div class="banner err hidden" id="relink-error"></div>
+          <div class="banner ok hidden" id="relink-ok"></div>
+          <div style="margin-top:14px"><button id="btn-relink" class="secondary">Re-link Garmin</button></div>
+        </div>
       </div>
 
       <div id="sub-config" class="hidden">
@@ -1794,7 +1813,9 @@ async function refreshStatus() {
     if (s.last_sync_at) $("sync-status").textContent = "last sync: " + fmtTime(s.last_sync_at);
     if (s.sync_error) { setErr($("sync-error"), "last sync error: " + s.sync_error); }
     else { setErr($("sync-error"), ""); }
-    if (s.rate_limit_until) $("sync-status").textContent += " · backoff until " + fmtTime(s.rate_limit_until);
+    if (s.rate_limit_until && new Date(s.rate_limit_until) > new Date()) {
+      $("sync-status").textContent += " · backoff until " + fmtTime(s.rate_limit_until);
+    }
     return s.running;
   } catch (e) { return null; }
 }
@@ -4373,6 +4394,60 @@ async function detectStartDate() {
   } finally { btn.disabled = false; }
 }
 
+// Replace the stored Garmin login (Settings → Sync). The server verifies the new
+// credentials with Garmin first; a two-step account answers "mfa_required" and
+// the code goes through the same endpoint signup uses.
+let relinkChallenge = "";
+async function relinkGarmin() {
+  const btn = $("btn-relink");
+  setErr($("relink-error"), ""); setErr($("relink-ok"), "");
+  const done = async () => {
+    relinkChallenge = "";
+    $("relink-password").value = ""; $("relink-mfa-code").value = "";
+    $("relink-mfa").classList.add("hidden");
+    btn.textContent = "Re-link Garmin";
+    setErr($("relink-ok"), "Garmin account re-linked. The next sync uses the new login.");
+    await pollStatus();
+  };
+  if (relinkChallenge) {
+    const code = $("relink-mfa-code").value.trim();
+    if (!code) { setErr($("relink-error"), "Please enter the verification code."); return; }
+    setBusy(btn, "Verifying code…");
+    try {
+      await api("/auth/register/mfa", { challenge: relinkChallenge, code });
+      clearBusy(btn);
+      await done();
+    } catch (e) {
+      clearBusy(btn);
+      setErr($("relink-error"), e.message);
+    }
+    return;
+  }
+  const garmin_email = $("relink-email").value.trim();
+  const garmin_password = $("relink-password").value;
+  if (!garmin_password) {
+    setErr($("relink-error"), "Please enter your Garmin password.");
+    return;
+  }
+  setBusy(btn, "Checking with Garmin…");
+  try {
+    const data = await api("/auth/garmin", { garmin_email, garmin_password });
+    clearBusy(btn);
+    if (data.status === "mfa_required") {
+      relinkChallenge = data.challenge;
+      btn.textContent = "Verify code";
+      $("relink-mfa").classList.remove("hidden");
+      $("relink-mfa-code").focus();
+      setErr($("relink-ok"), "Garmin sent you a verification code — enter it to finish re-linking.");
+      return;
+    }
+    await done();
+  } catch (e) {
+    clearBusy(btn);
+    setErr($("relink-error"), e.message);
+  }
+}
+
 // Preferences save as soon as a field changes (text fields on blur/Enter), each
 // with its own "Saved ✓" — there is no separate Save button.
 async function saveConfigField(key, value, fieldId) {
@@ -4406,6 +4481,7 @@ async function enterApp() {
   $("who").textContent = me.email;
   $("logout").classList.remove("hidden");
   $("bind-pending").classList.toggle("hidden", !!me.confirmed);
+  $("relink-email").value = me.garmin_email || "";
   $("llm-missing").classList.toggle("hidden", !!me.llm_configured);
   $("chat").innerHTML = "";
   showApp();
@@ -4473,6 +4549,7 @@ for (const b of document.querySelectorAll("#settings-tabs button")) {
 $("cfg-autosync").addEventListener("change", saveAutoSync);
 $("cfg-sync-start").addEventListener("change", saveStartDate);
 $("btn-detect-start").addEventListener("click", detectStartDate);
+$("btn-relink").addEventListener("click", relinkGarmin);
 wireConfigAutosave();
 $("open-principles").addEventListener("click", () => openTextModal("principles"));
 $("open-memory").addEventListener("click", () => openTextModal("memory"));
