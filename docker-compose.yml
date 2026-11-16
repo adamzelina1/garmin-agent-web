@@ -24,9 +24,13 @@ services:
       POSTGRES_READONLY_PASSWORD: garmin_readonly
     # Loopback only: the default role passwords above must not be reachable
     # from the network. The server container talks to `db` over the compose
-    # network and local dev uses localhost, so neither needs more.
+    # network and local dev uses localhost, so neither needs more. Both
+    # loopback addresses are published because `localhost` resolves to ::1
+    # first on Windows, and psycopg waits out its whole connect timeout
+    # (~2 min per connection) on a refused ::1 before trying 127.0.0.1.
     ports:
       - "127.0.0.1:5432:5432"
+      - "[::1]:5432:5432"
     volumes:
       - garmin_pgdata:/var/lib/postgresql/data
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
