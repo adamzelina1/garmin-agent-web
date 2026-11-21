@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from .config import load_config
 
@@ -545,13 +546,55 @@ class Database:
         self.conn = self._backend.connect()
         #: ``daily_metrics`` column names, loaded on the first ``merge_daily``.
         self._daily_columns: set[str] | None = None
+        #: Open ``batch()`` blocks; while > 0 the write methods don't commit.
+        self._batch_depth = 0
         _create_schema_once(self._backend, self.conn)
-        self.conn.commit()
+        self._commit()
 
     @classmethod
     def from_url(cls, url: str, *, user_id: int | None = None) -> "Database":
         """Open a Postgres-backed Database from a ``postgres://`` DSN."""
         return cls(url, user_id=user_id)
+
+    def _commit(self) -> None:
+        """Commit, unless a ``batch()`` is open (it commits once at the end)."""
+        if not self._batch_depth:
+            self.conn.commit()
+
+    @contextmanager
+    def batch(self) -> Iterator["Database"]:
+        """Run many writes as one transaction (nestable).
+
+        Each write method normally commits on its own; inside a batch they
+        don't, and the outermost block commits once at the end, or rolls the
+        whole batch back on an error. A parse pass uses this so thousands of
+        row upserts cost one commit, and a failed pass leaves no half-written
+        projection behind (its parse markers roll back with it, so the next
+        run redoes it).
+
+        Don't add ``daily_metrics`` columns inside a batch: the ALTER would
+        hold its table lock until the batch commits, blocking every other
+        account's reads. Call ``ensure_daily_columns`` first.
+        """
+        self._batch_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                self.conn.rollback()
+            raise
+        self._batch_depth -= 1
+        if not self._batch_depth:
+            self.conn.commit()
+
+    def ensure_daily_columns(self, values: dict[str, Any]) -> None:
+        """Create (and commit) any ``daily_metrics`` column ``values`` names.
+
+        ``values`` maps column -> a sample value, which picks the column type.
+        """
+        self._ensure_daily_columns(values)
+        self._commit()
 
     def _ensure_daily_columns(self, values: dict[str, Any]) -> None:
         """Create any ``daily_metrics`` column in ``values`` that doesn't exist.
@@ -606,7 +649,7 @@ class Database:
                 payload.get("fetched_at"),
             ),
         )
-        self.conn.commit()
+        self._commit()
 
     def stored_dates(self, data_type: str) -> set[str]:
         """Calendar dates already stored for a data type."""
@@ -680,7 +723,7 @@ class Database:
                 payload.get("fetched_at"),
             ),
         )
-        self.conn.commit()
+        self._commit()
 
     def stored_activity_ids(self) -> set[int]:
         (uid,) = self._uid()
@@ -690,6 +733,67 @@ class Database:
                 "SELECT activity_id FROM activities WHERE user_id = ?", self._uid()
             )
         }
+
+    def activity_payloads(self, activity_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """The stored raw summary payload of each given activity id."""
+        if not activity_ids:
+            return {}
+        (uid,) = self._uid()
+        return {
+            row["activity_id"]: json.loads(row["raw_json"])
+            for row in self._execute(
+                "SELECT activity_id, raw_json FROM activities "
+                "WHERE user_id = ? AND activity_id = ANY(?)",
+                (uid, list(activity_ids)),
+            )
+        }
+
+    def activity_ids_started_between(self, after: str, before: str) -> set[int]:
+        """Parsed activities whose local start date is strictly inside (after, before)."""
+        (uid,) = self._uid()
+        return {
+            row["activity_id"]
+            for row in self._execute(
+                "SELECT activity_id FROM activity_summaries "
+                "WHERE user_id = ? AND start_date > ? AND start_date < ?",
+                (uid, after, before),
+            )
+        }
+
+    def delete_activity(self, activity_id: int) -> None:
+        """Remove one activity: its raw row and every projection of it."""
+        (uid,) = self._uid()
+        for table in (
+            "activity_detail_series", "activity_splits", "activity_summaries",
+            "activities",
+        ):
+            self._execute(
+                f"DELETE FROM {table} WHERE user_id = ? AND activity_id = ?",
+                (uid, activity_id),
+            )
+        self._commit()
+
+    def latest_metric_payloads(self, data_type: str, limit: int) -> list[dict[str, Any]]:
+        """The newest ``limit`` raw payloads of a data type, newest first."""
+        (uid,) = self._uid()
+        return [
+            json.loads(row["raw_json"])
+            for row in self._execute(
+                "SELECT raw_json FROM metrics WHERE user_id = ? AND data_type = ? "
+                "ORDER BY calendar_date DESC LIMIT ?",
+                (uid, data_type, limit),
+            )
+        ]
+
+    def latest_activity_payload(self) -> dict[str, Any] | None:
+        """The raw summary payload of the most recently stored activity."""
+        (uid,) = self._uid()
+        row = self._execute(
+            "SELECT raw_json FROM activities WHERE user_id = ? "
+            "ORDER BY activity_id DESC LIMIT 1",
+            (uid,),
+        ).fetchone()
+        return json.loads(row["raw_json"]) if row else None
 
     def set_activity_details(
         self, activity_id: int, details: dict[str, Any], fetched_at: str | None = None
@@ -701,7 +805,7 @@ class Database:
             "WHERE user_id = ? AND activity_id = ?",
             (json.dumps(details), fetched_at, uid, activity_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def set_activity_weather(
         self, activity_id: int, weather: dict[str, Any], fetched_at: str | None = None
@@ -713,7 +817,7 @@ class Database:
             "WHERE user_id = ? AND activity_id = ?",
             (json.dumps(weather), fetched_at, uid, activity_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def activities_missing_weather(self) -> list[int]:
         """Activity ids that have no stored weather payload yet."""
@@ -766,7 +870,7 @@ class Database:
             "WHERE user_id = ? AND activity_id = ?",
             (json.dumps(splits), fetched_at, uid, activity_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def activities_missing_splits(self) -> list[int]:
         """Activity ids that have no stored splits payload yet."""
@@ -820,7 +924,7 @@ class Database:
             """,
             (uid, calendar_date, *row.values()),
         )
-        self.conn.commit()
+        self._commit()
 
     # -- Pruning ---------------------------------------------------------------
     #
@@ -846,7 +950,7 @@ class Database:
             (uid, calendar_date),
         )
         projected_deleted = cur.rowcount
-        self.conn.commit()
+        self._commit()
         return raw_deleted + projected_deleted
 
     def prune_excluded_types(
@@ -870,7 +974,7 @@ class Database:
             )
             deleted += cur.rowcount
         if not excluded:
-            self.conn.commit()
+            self._commit()
             return deleted
         enabled_cols: set[str] = set()
         for name in enabled:
@@ -890,7 +994,7 @@ class Database:
                     f"UPDATE daily_metrics SET {cols} WHERE user_id = ?",
                     self._uid(),
                 )
-        self.conn.commit()
+        self._commit()
         return deleted
 
     # -- Parse markers --------------------------------------------------------
@@ -993,7 +1097,7 @@ class Database:
             """,
             (uid, activity_id, fetched_at, *vals),
         )
-        self.conn.commit()
+        self._commit()
 
     _ACTIVITY_SERIES_COLUMNS = (
         "tick", "ts_ms", "elapsed_s", "heart_rate", "cadence", "power_w", "speed_kmh",
@@ -1025,13 +1129,13 @@ class Database:
             VALUES (?, ?, {placeholders})
         """
         if not cols or not rows:
-            self.conn.commit()
+            self._commit()
             return 0
         self._executemany(
             insert,
             [(uid, activity_id, *(row.get(c) for c in cols)) for row in rows],
         )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     _ACTIVITY_SPLIT_COLUMNS = (
@@ -1065,13 +1169,13 @@ class Database:
             VALUES (?, ?, {placeholders})
         """
         if not cols or not rows:
-            self.conn.commit()
+            self._commit()
             return 0
         self._executemany(
             insert,
             [(uid, activity_id, *(row.get(c) for c in cols)) for row in rows],
         )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     # -- User profile ------------------------------------------------------
@@ -1091,7 +1195,7 @@ class Database:
             """,
             (uid, profile_type, raw, fetched_at),
         )
-        self.conn.commit()
+        self._commit()
 
     def get_profile(self, profile_type: str) -> dict[str, Any] | None:
         """Return (raw_json, fetched_at) for a stored profile, or None."""
@@ -1137,7 +1241,7 @@ class Database:
                     row.get("resting_hr_auto_update"), row.get("fetched_at"),
                 ),
             )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     def replace_race_predictions(self, row: dict[str, Any] | None) -> int:
@@ -1150,7 +1254,7 @@ class Database:
         (uid,) = self._uid()
         self._execute("DELETE FROM race_predictions WHERE user_id = ?", self._uid())
         if row is None:
-            self.conn.commit()
+            self._commit()
             return 0
         self._execute(
             """
@@ -1165,7 +1269,7 @@ class Database:
                 row.get("time_marathon_min"), row.get("fetched_at"),
             ),
         )
-        self.conn.commit()
+        self._commit()
         return 1
 
     def replace_gear(self, rows: list[dict[str, Any]]) -> int:
@@ -1193,7 +1297,7 @@ class Database:
                     row.get("retired"), row.get("fetched_at"),
                 ),
             )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     def replace_power_zones(self, rows: list[dict[str, Any]]) -> int:
@@ -1228,7 +1332,7 @@ class Database:
                     row.get("functional_threshold_power"), row.get("fetched_at"),
                 ),
             )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     def replace_devices(self, rows: list[dict[str, Any]]) -> int:
@@ -1251,7 +1355,7 @@ class Database:
                     row.get("display_name"), row.get("fetched_at"),
                 ),
             )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     # -- Derived metrics -------------------------------------------------------
@@ -1268,7 +1372,7 @@ class Database:
         (uid,) = self._uid()
         self._execute("DELETE FROM derived_metrics WHERE user_id = ?", self._uid())
         if not rows:
-            self.conn.commit()
+            self._commit()
             return 0
         self._executemany(
             "INSERT INTO derived_metrics "
@@ -1282,7 +1386,7 @@ class Database:
                 for row in rows
             ],
         )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     def replace_weather_forecast(self, rows: list[dict[str, Any]]) -> int:
@@ -1297,7 +1401,7 @@ class Database:
         (uid,) = self._uid()
         self._execute("DELETE FROM weather_forecast WHERE user_id = ?", self._uid())
         if not rows:
-            self.conn.commit()
+            self._commit()
             return 0
         for row in rows:
             self._execute(
@@ -1312,7 +1416,7 @@ class Database:
                     row.get("source"), row.get("fetched_at"),
                 ),
             )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     # -- Sync state -----------------------------------------------------------
@@ -1334,7 +1438,7 @@ class Database:
             """,
             (uid, key, value),
         )
-        self.conn.commit()
+        self._commit()
 
 
 def init_db(user_id: int | None = None) -> Database:

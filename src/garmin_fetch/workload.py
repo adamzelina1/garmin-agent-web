@@ -58,12 +58,15 @@ def _ema(series: list[float], span: int) -> list[float]:
     return out
 
 
-def compute_acwr(loads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def compute_acwr(
+    loads: list[dict[str, Any]], today: date | None = None
+) -> list[dict[str, Any]]:
     """Compute the ACWR series from per-day training loads.
 
     ``loads`` is the list of {calendar_date, daily_load} rows (one or more per
     date; they are summed per date). Returns a continuous daily series from
-    the first load date to today, each day with ``daily_load`` (0 on rest
+    the first load date to ``today`` (the user's date; default the
+    machine's), each day with ``daily_load`` (0 on rest
     days), ``acute_load``, ``chronic_load``, ``acwr`` and ``category`` (all
     null on days where chronic load is zero). Days keep chronological order.
     """
@@ -81,7 +84,7 @@ def compute_acwr(loads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return []
 
     start = date.fromisoformat(min(by_date))
-    end = max(date.today(), date.fromisoformat(max(by_date)))
+    end = max(today or date.today(), date.fromisoformat(max(by_date)))
     days: list[dict[str, Any]] = []
     cursor = start
     while cursor <= end:

@@ -612,6 +612,15 @@ def build_daily_rows(
     default only rows whose raw payload changed since last parsed are touched
     (tracked via ``metrics.parsed_at``); pass ``force=True`` to re-parse
     everything. Returns {data_type: dates_parsed}.
+
+    Forward-filled types only rewrite from their earliest changed date on:
+    a change there can alter the carried value of every later day, but not of
+    any earlier one. The carry into that date is rebuilt by parsing (not
+    writing) the rows before it, which is cheap next to the writes. In steady
+    state only today's row changes, so only today is written.
+
+    All writes of the pass go in one transaction (``db.batch``), after any new
+    ``daily_metrics`` columns have been created and committed on their own.
     """
     # Some registered types (e.g. training_readiness) are fetch-only and have
     # no projection; skip them rather than crash.
@@ -622,38 +631,54 @@ def build_daily_rows(
     # just the syncing user's, and they only come back for dates that user
     # re-parses. Stale columns from renamed/removed metrics simply linger as
     # NULLs — a safe trade-off for the multi-user server.
-    counts: dict[str, int] = {}
+    marks: list[tuple[str, str]] = []
+    #: (data_type, calendar_date, values, fetched_at), in registry then date
+    #: order: where several types write one column, the later type wins, as
+    #: before.
+    writes: list[tuple[str, str, dict[str, Any], str]] = []
     for name in names:
         rows = db.metrics_rows(name)
-        parsed_at = {} if force else db.metric_parsed_at(name)
         if force:
-            dirty: set[str] | None = None
+            changed = {r["calendar_date"] for r in rows}
         else:
+            parsed_at = db.metric_parsed_at(name)
             changed = {
                 r["calendar_date"]
                 for r in rows
                 if parsed_at.get(r["calendar_date"]) != r["fetched_at"]
             }
-            if name in _FFILL_TYPES:
-                # Carry semantics: a change anywhere recasts the whole chain, so
-                # re-parse the entire (sparse) type from scratch — cheap and exact.
-                if changed:
-                    dirty = {r["calendar_date"] for r in rows}
-                else:
-                    dirty = set()
-            else:
-                dirty = changed
+        if not changed:
+            continue
+        ffill = name in _FFILL_TYPES
+        first_changed = min(changed)
         carry: dict[str, Any] = {}
         for row in rows:
-            if not force and row["calendar_date"] not in dirty:
+            cal = row["calendar_date"]
+            if ffill and cal < first_changed:
+                carry.update(PARSERS[name](json.loads(row["raw_json"])))
+                continue
+            if not ffill and cal not in changed:
                 continue
             parsed = PARSERS[name](json.loads(row["raw_json"]))
-            if name in _FFILL_TYPES:
+            if ffill:
                 parsed = _forward_fill(parsed, carry)
-            db.mark_metric_parsed(name, row["calendar_date"])
-            if not parsed:
-                continue
-            db.merge_daily(row["calendar_date"], parsed, row["fetched_at"])
+            if cal in changed:
+                marks.append((name, cal))
+            if parsed:
+                writes.append((name, cal, parsed, row["fetched_at"]))
+
+    samples: dict[str, Any] = {}
+    for _, _, values, _ in writes:
+        for column, value in values.items():
+            samples.setdefault(column, value)
+    if samples:
+        db.ensure_daily_columns(samples)
+    counts: dict[str, int] = {}
+    with db.batch():
+        for name, cal in marks:
+            db.mark_metric_parsed(name, cal)
+        for name, cal, values, fetched_at in writes:
+            db.merge_daily(cal, values, fetched_at)
             counts[name] = counts.get(name, 0) + 1
     return counts
 
@@ -779,15 +804,16 @@ def build_activity_summaries(db: Any, force: bool = False) -> dict[str, int]:
     marker = "summary_parsed_at"
     stamped = {} if force else db.activity_parsed_at(marker)
     count = 0
-    for row in rows:
-        if not force and stamped.get(row["activity_id"]) == row["fetched_at"]:
-            continue
-        parsed = parse_activity_summary(json.loads(row["raw_json"]))
-        if not parsed:
-            continue
-        db.upsert_activity_summary(row["activity_id"], parsed, row["fetched_at"])
-        db.mark_activity_parsed(row["activity_id"], marker, "fetched_at")
-        count += 1
+    with db.batch():
+        for row in rows:
+            if not force and stamped.get(row["activity_id"]) == row["fetched_at"]:
+                continue
+            parsed = parse_activity_summary(json.loads(row["raw_json"]))
+            if not parsed:
+                continue
+            db.upsert_activity_summary(row["activity_id"], parsed, row["fetched_at"])
+            db.mark_activity_parsed(row["activity_id"], marker, "fetched_at")
+            count += 1
     return {"activities": count}
 
 
@@ -955,22 +981,23 @@ def build_activity_details(db: Any, force: bool = False) -> dict[str, int]:
     stamped = {} if force else db.activity_parsed_at(marker)
     activities = 0
     series = 0
-    for row in rows:
-        if (
-            not force
-            and row["details_fetched_at"] is not None
-            and stamped.get(row["activity_id"]) == row["details_fetched_at"]
-        ):
-            continue
-        payload = json.loads(row["details_json"])
-        agg = parse_activity_details(payload)
-        if agg:
-            db.upsert_activity_summary(row["activity_id"], agg, row["details_fetched_at"])
-            activities += 1
-        ticks = parse_activity_detail_series(payload)
-        if ticks:
-            series += db.replace_activity_series(row["activity_id"], ticks)
-        db.mark_activity_parsed(row["activity_id"], marker, "details_fetched_at")
+    with db.batch():
+        for row in rows:
+            if (
+                not force
+                and row["details_fetched_at"] is not None
+                and stamped.get(row["activity_id"]) == row["details_fetched_at"]
+            ):
+                continue
+            payload = json.loads(row["details_json"])
+            agg = parse_activity_details(payload)
+            if agg:
+                db.upsert_activity_summary(row["activity_id"], agg, row["details_fetched_at"])
+                activities += 1
+            ticks = parse_activity_detail_series(payload)
+            if ticks:
+                series += db.replace_activity_series(row["activity_id"], ticks)
+            db.mark_activity_parsed(row["activity_id"], marker, "details_fetched_at")
     return {"activities": activities, "series": series}
 
 
@@ -1072,20 +1099,21 @@ def build_activity_splits(db: Any, force: bool = False) -> dict[str, int]:
     stamped = {} if force else db.activity_parsed_at(marker)
     activities = 0
     splits = 0
-    for row in rows:
-        if (
-            not force
-            and row["splits_fetched_at"] is not None
-            and stamped.get(row["activity_id"]) == row["splits_fetched_at"]
-        ):
-            continue
-        payload = json.loads(row["splits_json"])
-        parsed = parse_activity_splits(payload)
-        if parsed:
-            splits += db.replace_activity_splits(row["activity_id"], parsed)
-            activities += 1
-        if row["splits_fetched_at"] is not None:
-            db.mark_activity_parsed(row["activity_id"], marker, "splits_fetched_at")
+    with db.batch():
+        for row in rows:
+            if (
+                not force
+                and row["splits_fetched_at"] is not None
+                and stamped.get(row["activity_id"]) == row["splits_fetched_at"]
+            ):
+                continue
+            payload = json.loads(row["splits_json"])
+            parsed = parse_activity_splits(payload)
+            if parsed:
+                splits += db.replace_activity_splits(row["activity_id"], parsed)
+                activities += 1
+            if row["splits_fetched_at"] is not None:
+                db.mark_activity_parsed(row["activity_id"], marker, "splits_fetched_at")
     return {"activities": activities, "splits": splits}
 
 
@@ -1480,19 +1508,20 @@ def build_activity_weather(db: Any, force: bool = False) -> dict[str, int]:
     marker = "weather_parsed_at"
     stamped = {} if force else db.activity_parsed_at(marker)
     count = 0
-    for row in rows:
-        if (
-            not force
-            and row["weather_fetched_at"] is not None
-            and stamped.get(row["activity_id"]) == row["weather_fetched_at"]
-        ):
-            continue
-        parsed = parse_activity_weather(json.loads(row["weather_json"]))
-        if not parsed:
-            continue
-        db.upsert_activity_summary(
-            row["activity_id"], parsed, row["weather_fetched_at"]
-        )
-        db.mark_activity_parsed(row["activity_id"], marker, "weather_fetched_at")
-        count += 1
+    with db.batch():
+        for row in rows:
+            if (
+                not force
+                and row["weather_fetched_at"] is not None
+                and stamped.get(row["activity_id"]) == row["weather_fetched_at"]
+            ):
+                continue
+            parsed = parse_activity_weather(json.loads(row["weather_json"]))
+            if not parsed:
+                continue
+            db.upsert_activity_summary(
+                row["activity_id"], parsed, row["weather_fetched_at"]
+            )
+            db.mark_activity_parsed(row["activity_id"], marker, "weather_fetched_at")
+            count += 1
     return {"activities": count}

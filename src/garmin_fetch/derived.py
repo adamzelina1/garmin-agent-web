@@ -9,7 +9,7 @@ read exactly the same values.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from .run_workload import (
@@ -27,10 +27,11 @@ from .workload import (
 )
 
 
-def build_derived(db: Any) -> dict[str, int]:
+def build_derived(db: Any, today: date | None = None) -> dict[str, int]:
     """Recompute ACWR + running ACWR + gait drift + zone paces from the parsed tables.
 
-    ``db`` is a user-bound ``Database``. The cardio ACWR and running ACWR series
+    ``db`` is a user-bound ``Database``; ``today`` is the user's calendar
+    date (the server runs in UTC; default the machine's date). The cardio ACWR and running ACWR series
     always run from the first training/run day to today (rest days are stored
     with a null ratio once chronic load decays to zero); gait drift is stored
     per run day; zone paces are one row per HR zone dated today. Returns
@@ -41,11 +42,11 @@ def build_derived(db: Any) -> dict[str, int]:
 
     rows: list[dict[str, Any]] = []
 
-    acwr_days = compute_acwr(fetch_activity_loads(db.conn))
+    acwr_days = compute_acwr(fetch_activity_loads(db.conn), today)
     for day in acwr_days:
         rows.extend(acwr_rows(day, built_at))
 
-    run_days = compute_run_acwr(fetch_running_runs(db.conn))
+    run_days = compute_run_acwr(fetch_running_runs(db.conn), today)
     for day in run_days:
         rows.extend(run_rows(day, built_at))
 
@@ -53,7 +54,7 @@ def build_derived(db: Any) -> dict[str, int]:
     for day in gait_days:
         rows.extend(to_gait_rows(day, built_at))
 
-    zone_rows = zone_pace_rows(compute_zone_paces(db.conn), built_at)
+    zone_rows = zone_pace_rows(compute_zone_paces(db.conn, today), built_at, today)
     rows.extend(zone_rows)
 
     written = db.replace_derived_metrics(rows)

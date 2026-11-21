@@ -56,7 +56,9 @@ RUN_METRICS: dict[str, str] = {
 }
 
 
-def _daily_series(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _daily_series(
+    runs: list[dict[str, Any]], today: date | None = None
+) -> list[dict[str, Any]]:
     """Continuous per-day running-distance series (rest days zero).
 
     ``runs`` is the aggregated {calendar_date, run_km} rows. Returns an ordered
@@ -67,7 +69,7 @@ def _daily_series(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not by_date:
         return []
     start = date.fromisoformat(min(by_date))
-    end = max(date.today(), date.fromisoformat(max(by_date)))
+    end = max(today or date.today(), date.fromisoformat(max(by_date)))
     days: list[dict[str, Any]] = []
     cursor = start
     while cursor <= end:
@@ -77,16 +79,18 @@ def _daily_series(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return days
 
 
-def compute_run_acwr(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def compute_run_acwr(
+    runs: list[dict[str, Any]], today: date | None = None
+) -> list[dict[str, Any]]:
     """Compute the running-volume ACWR series from per-day running km.
 
     ``runs`` is the {calendar_date, run_km} rows (one per date that had running;
     they are aggregated upstream). Returns a continuous daily series from the
-    first run date to today, each day with ``run_km`` (0 on rest days),
+    first run date to ``today`` (default the machine's date), each day with ``run_km`` (0 on rest days),
     ``run_acute_km``, ``run_chronic_km`` and ``run_acwr`` + ``category`` (both
     null where chronic running is too thin to judge). Rows keep date order.
     """
-    days = _daily_series(runs)
+    days = _daily_series(runs, today)
     acute = _ema([d["run_km"] for d in days], _ACUTE_SPAN)
     chronic = _ema([d["run_km"] for d in days], _CHRONIC_SPAN)
     for day, a, c in zip(days, acute, chronic):

@@ -104,7 +104,7 @@ def _lt_pace_now(conn: Any) -> float | None:
     return 60.0 / row["v"] if row else None
 
 
-def _windows(conn: Any) -> list[dict[str, Any]]:
+def _windows(conn: Any, today: date) -> list[dict[str, Any]]:
     """One-minute windows of eligible runs: average moving pace and HR, plus
     the LT pace that applied on the run's date. A window counts only when it
     spans most of the minute and most of its samples were moving with HR."""
@@ -131,7 +131,7 @@ def _windows(conn: Any) -> list[dict[str, Any]]:
         "    AND d.heart_rate IS NOT NULL) >= 0.6 * count(*)",
         {
             "types": list(_OUTDOOR_RUNNING),
-            "since": date.fromordinal(date.today().toordinal() - WINDOW_DAYS).isoformat(),
+            "since": date.fromordinal(today.toordinal() - WINDOW_DAYS).isoformat(),
             "min_v": MIN_SPEED_KMH, "warmup": WARMUP_S, "win": SAMPLE_S,
         },
     ).fetchall()]
@@ -174,7 +174,7 @@ def _enforce_order(post: dict[int, dict[str, float]]) -> None:
             post[z].update(ratio=mean, precision=precision, honest=honest)
 
 
-def compute_zone_paces(conn: Any) -> dict[str, Any] | None:
+def compute_zone_paces(conn: Any, today: date | None = None) -> dict[str, Any] | None:
     """The learned pace per zone, or None without a threshold pace or zones.
 
     Returns {"lt_pace", "sigma", "zones": {z: {pace_min_km, sd_s, ratio,
@@ -187,14 +187,14 @@ def compute_zone_paces(conn: Any) -> dict[str, Any] | None:
     lt_now = _lt_pace_now(conn)
     if floors is None or lt_now is None:
         return None
-    today = date.today().toordinal()
+    today = today or date.today()
     by_zone: dict[int, list[float]] = {z: [] for z in PRIORS}
     weights: dict[int, list[float]] = {z: [] for z in PRIORS}
-    for win in _windows(conn):
+    for win in _windows(conn, today):
         if not win["pace"] or win["avg_hr"] is None:
             continue
         z = zone_of_hr(float(win["avg_hr"]), floors)
-        age = today - date.fromisoformat(win["start_date"][:10]).toordinal()
+        age = today.toordinal() - date.fromisoformat(win["start_date"][:10]).toordinal()
         by_zone[z].append(float(win["pace"]) / float(win["lt_pace"]))
         weights[z].append(0.5 ** (max(age, 0) / HALF_LIFE_DAYS))
     sigma = _sample_sigma(by_zone)
@@ -223,14 +223,16 @@ def compute_zone_paces(conn: Any) -> dict[str, Any] | None:
     return {"lt_pace": round(lt_now, 3), "sigma": round(sigma, 4), "zones": zones}
 
 
-def to_metric_rows(result: dict[str, Any] | None, fetched_at: str) -> list[dict[str, Any]]:
-    """``derived_metrics`` rows (dated today), one per zone."""
+def to_metric_rows(
+    result: dict[str, Any] | None, fetched_at: str, today: date | None = None,
+) -> list[dict[str, Any]]:
+    """``derived_metrics`` rows (dated ``today``), one per zone."""
     if not result:
         return []
-    today = date.today().isoformat()
+    as_of = (today or date.today()).isoformat()
     return [
         {
-            "calendar_date": today,
+            "calendar_date": as_of,
             "metric": f"{METRIC_PREFIX}{z}",
             "value": info["pace_min_km"],
             "qualifier": json.dumps({

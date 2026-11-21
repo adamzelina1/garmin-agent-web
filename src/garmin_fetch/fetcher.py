@@ -68,29 +68,83 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _fetch_local_date(fetched_at: str) -> date:
-    """The local calendar date a fetch completed, regardless of tz in the iso.
+#: Widest real UTC offset (UTC+14 / UTC-12); anything beyond is bad data.
+_MAX_UTC_OFFSET = timedelta(hours=14)
+
+
+def _offset_between(local: Any, gmt: Any) -> timedelta | None:
+    """UTC offset implied by a local and a GMT timestamp of the same instant.
+
+    Rounded to the nearest 15 minutes (every real zone is a multiple of it);
+    None when either value is missing or unparseable, or the gap is no zone.
+    """
+    try:
+        delta = datetime.fromisoformat(str(local)) - datetime.fromisoformat(str(gmt))
+    except (TypeError, ValueError):
+        return None
+    offset = timedelta(minutes=round(delta.total_seconds() / 900) * 15)
+    return offset if abs(offset) <= _MAX_UTC_OFFSET else None
+
+
+def user_utc_offset(db: Database) -> timedelta | None:
+    """The account's current UTC offset, read from its own Garmin data.
+
+    The server runs in UTC, but "today" and "is this day finished" are the
+    user's calendar, not the server's. Garmin stamps each daily summary with
+    both the local and GMT start of the day, so the newest summary gives the
+    offset (DST included, as of that day); the newest activity's start times
+    are the fallback. None before any data exists (callers then fall back to
+    the machine's zone), so it costs no Garmin call.
+    """
+    for payload in db.latest_metric_payloads("daily_summary", 7):
+        offset = _offset_between(
+            payload.get("wellnessStartTimeLocal"), payload.get("wellnessStartTimeGmt")
+        )
+        if offset is not None:
+            return offset
+    activity = db.latest_activity_payload()
+    if activity:
+        activity = activity.get("activity") or activity
+        return _offset_between(activity.get("startTimeLocal"), activity.get("startTimeGMT"))
+    return None
+
+
+def user_today(offset: timedelta | None) -> date:
+    """The user's current calendar date (the machine's when the offset is unknown)."""
+    if offset is None:
+        return date.today()
+    return (datetime.now(UTC) + offset).date()
+
+
+def _fetch_local_date(fetched_at: str, offset: timedelta | None = None) -> date:
+    """The user's calendar date at the moment a fetch completed.
 
     Naive timestamps (stored historically without a tz) were written from the
-    caller's wall clock, so they're already local. Offset timestamps are
-    converted to the machine's local zone.
+    caller's wall clock, so they're already local. Offset timestamps are moved
+    to the user's ``offset``, or to the machine's zone when it is unknown.
     """
     dt = datetime.fromisoformat(fetched_at)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone()
-    return dt.date()
+    if dt.tzinfo is None:
+        return dt.date()
+    if offset is None:
+        return dt.astimezone().date()
+    return (dt.astimezone(UTC) + offset).date()
 
 
-def _nonfinal_dates(stored: dict[str, str]) -> set[str]:
+def _nonfinal_dates(
+    stored: dict[str, str], offset: timedelta | None = None
+) -> set[str]:
     """Calendar dates whose stored copy was fetched on (or before) that day.
 
     Such days were captured while still in progress and are thus incomplete:
     the next sync re-fetches them once their data has settled. The last of
-    these is the frontier the sync resumes from.
+    these is the frontier the sync resumes from. "That day" is the user's
+    calendar (``offset``): judged in server time, a user west of UTC would see
+    an evening fetch of their today count as final, freezing a partial day.
     """
     return {
         cal for cal, fetched in stored.items()
-        if _fetch_local_date(fetched) <= date.fromisoformat(cal)
+        if _fetch_local_date(fetched, offset) <= date.fromisoformat(cal)
     }
 
 
@@ -108,6 +162,13 @@ _PROFILE_POWER_ZONES = "power_zones"
 
 _PROFILE_DEVICES = "devices"
 """user_profile key for the current device list (+ per-device settings)."""
+
+_PROFILE_FETCHED_KEY = "profile_fetched_on"
+"""sync_state key: the user-local date the profile snapshots were last fetched.
+
+HR/power zones, race predictions, gear and devices change rarely but cost ~11
+Garmin calls, so they're refreshed on the first sync of each day only.
+"""
 
 
 class DataFetcher:
@@ -179,22 +240,38 @@ class DataFetcher:
         payload["fetched_at"] = _now_iso()
         return payload
 
-    def fetch_activities(self, start: date, end: date, db: Database) -> int:
-        """Fetch activity summaries + details in [start, end], skipping known ids.
+    def fetch_activities(self, start: date, end: date, db: Database) -> dict[str, int]:
+        """Bring the stored activities in [start, end] in line with Garmin's list.
 
-        For a new activity, the per-activity detail payload is fetched before the
-        summary is stored. If the details fetch fails, the activity is skipped
-        entirely (no summary-only row), so every stored activity always carries
-        both the summary and its details. Returns the number of activities
-        stored.
+        - New activity: the per-activity detail payload is fetched before the
+          summary is stored. If the details fetch fails, the activity is
+          skipped entirely (no summary-only row), so every stored activity
+          always carries both the summary and its details.
+        - Known activity: the list already carries its current summary, so a
+          changed one (renamed, sport type changed, training effect
+          recalculated by Garmin) is re-stored at no extra API cost and gets
+          re-parsed. Its details, weather and splits are kept.
+        - Deleted on Garmin: a stored activity that started strictly inside the
+          window but is no longer listed is removed with its projections. The
+          window's two edge days are left alone (Garmin's date filter and our
+          local start date may disagree there), and an empty list is never
+          trusted for deletions, so a glitchy response can't wipe a week.
+
+        Returns {"new", "updated", "deleted"} counts.
         """
         self._ensure_logged_in()
         self._pace()
         summaries = self.client.get_activities_by_date(
             start.isoformat(), end.isoformat()
-        )
+        ) or []
         stored = db.stored_activity_ids()
-        fetched = 0
+        listed: set[int] = set()
+        for item in summaries:
+            activity_id = (item.get("activity") or item).get("activityId")
+            if activity_id is not None:
+                listed.add(activity_id)
+        known = db.activity_payloads(sorted(listed & stored))
+        fetched = updated = 0
         for item in summaries:
             activity = item.get("activity") or item
             activity_id = activity.get("activityId")
@@ -202,6 +279,19 @@ class DataFetcher:
                 logger.warning("Activity without activityId, skipping: %s", item)
                 continue
             if activity_id in stored:
+                previous = known.get(activity_id)
+                if previous is not None:
+                    previous = dict(previous)
+                    previous.pop("fetched_at", None)
+                    if previous != item:
+                        payload = dict(item)
+                        payload["fetched_at"] = _now_iso()
+                        db.upsert_activity(payload)
+                        updated += 1
+                        logger.info(
+                            "Updated activity %s (%s): changed on Garmin",
+                            activity_id, activity.get("activityName"),
+                        )
                 continue
             try:
                 self._pace()
@@ -225,7 +315,16 @@ class DataFetcher:
                 "Stored activity %s (%s, %s) with details",
                 activity_id, activity.get("activityName"), activity.get("startTimeLocal"),
             )
-        return fetched
+        deleted = 0
+        if listed:
+            gone = db.activity_ids_started_between(
+                start.isoformat(), end.isoformat()
+            ) - listed
+            for activity_id in sorted(gone):
+                db.delete_activity(activity_id)
+                deleted += 1
+                logger.info("Removed activity %s: deleted on Garmin", activity_id)
+        return {"new": fetched, "updated": updated, "deleted": deleted}
 
     def _fetch_activity_weather(self, activity_id: int, db: Database) -> bool:
         """Best-effort: fetch and store one activity's observed weather.
@@ -562,6 +661,7 @@ def sync_data(
     end: date | None = None,
     include_activities: bool = True,
     include_profile: bool = True,
+    refresh_profile: bool = False,
     parse: bool = True,
     full_reparse: bool = False,
     db: Database | None = None,
@@ -572,13 +672,16 @@ def sync_data(
     Runs for a single ``user_id``: every row is written with that account and
     the connection applies ``SET app.user_id`` so RLS scopes all writes. For
     each type, fetches every missing date from the resolved start date to
-    ``end`` (default today). If ``include_activities`` (default True), also
-    backfills activity summaries for the same window. If ``include_profile``
-    (default True), refreshes the heart-rate zone profile snapshot. After
-    fetching, the newly stored raw metrics are parsed into ``daily_metrics``
-    (unless ``parse`` is False).
-    Returns {type_name: dates_fetched} plus optional {"activities": count} and
-    {"hr_zones": rows}, {"race_predictions": rows}, {"gear": rows}.
+    ``end`` (default: the user's today, see ``user_utc_offset``). If
+    ``include_activities`` (default True), also syncs activities for the
+    rolling window (new, edited and deleted ones). If ``include_profile``
+    (default True), refreshes the profile snapshots (HR/power zones, race
+    predictions, gear, devices) on the first sync of the user's day only;
+    ``refresh_profile`` forces it. After fetching, the newly stored raw
+    metrics are parsed into ``daily_metrics`` (unless ``parse`` is False).
+    Returns {type_name: dates_fetched} plus optional {"activities": count},
+    {"activities_updated"/"activities_deleted": count} and the profile row
+    counts when they were re-parsed.
 
     ``full_reparse`` (default False) forces every stored row to be re-parsed
     from raw, ignoring the incremental ``parsed_at`` markers — useful after a
@@ -594,7 +697,9 @@ def sync_data(
         config["email"], config["password"], config["tokens_path"],
         sleep_sec=config.get("fetch_sleep_sec", 0.0),
     )
-    end = end or date.today()
+    offset = user_utc_offset(db)
+    today = user_today(offset)
+    end = end or today
     freeze_days = config["activity_freeze_days"]
     configured_start = (
         date.fromisoformat(config["start_date"]) if config["start_date"] else None
@@ -607,9 +712,9 @@ def sync_data(
         for data_type in selected_types:
             # Resumes from the oldest still-incomplete day so each gets
             # re-fetched once its data has settled.
-            nonfinal = _nonfinal_dates(db.stored_fetches(data_type.name))
+            nonfinal = _nonfinal_dates(db.stored_fetches(data_type.name), offset)
             sync_start = _resolve_start_date(
-                db, data_type.name, configured_start, nonfinal or None
+                db, data_type.name, configured_start, nonfinal or None, today
             )
             dates = fetcher.fetch_range(data_type, sync_start, end, db, nonfinal)
             counts[data_type.name] = dates
@@ -619,11 +724,16 @@ def sync_data(
             )
         if include_activities:
             act_start = _resolve_activity_start(db, configured_start, freeze_days, end)
-            counts["activities"] = fetcher.fetch_activities(act_start, end, db)
+            synced = fetcher.fetch_activities(act_start, end, db)
+            counts["activities"] = synced["new"]
+            if synced["updated"]:
+                counts["activities_updated"] = synced["updated"]
+            if synced["deleted"]:
+                counts["activities_deleted"] = synced["deleted"]
             mark_activities_finalized(db, end, freeze_days, act_start)
             logger.info(
-                "synced activities: fetched %d new (%s to %s)",
-                counts["activities"], act_start, end,
+                "synced activities: %d new, %d updated, %d deleted (%s to %s)",
+                synced["new"], synced["updated"], synced["deleted"], act_start, end,
             )
             weather_count = fetcher.backfill_activity_weather(db)
             if weather_count:
@@ -631,16 +741,24 @@ def sync_data(
             splits_count = fetcher.backfill_activity_splits(db)
             if splits_count:
                 logger.info("backfilled splits for %d activity(ies)", splits_count)
-        if include_profile:
+        profile_due = include_profile and (
+            refresh_profile
+            or db.get_state(_PROFILE_FETCHED_KEY) != today.isoformat()
+        )
+        if profile_due:
             fetcher.fetch_profile(db)
             fetcher.fetch_race_predictions(db)
             fetcher.fetch_gear(db)
             fetcher.fetch_power_zones(db)
             fetcher.fetch_devices(db)
+            # Only once every snapshot is in: a failure retries next sync.
+            db.set_state(_PROFILE_FETCHED_KEY, today.isoformat())
             logger.info(
                 "synced user profile: heart-rate zones + race predictions + gear "
                 "+ power zones + devices"
             )
+        elif include_profile:
+            logger.info("user profile already refreshed today (%s); skipping", today)
         if parse:
             from .parser import (
                 build_activity_details,
@@ -674,7 +792,7 @@ def sync_data(
                     splits_parsed.get("activities", 0),
                     detail_parsed.get("series", 0),
                 )
-            if include_profile:
+            if profile_due or (include_profile and full_reparse):
                 zone_parsed = build_hr_zones(db)
                 counts["hr_zones"] = zone_parsed.get("hr_zones", 0)
                 race_parsed = build_race_predictions(db)
@@ -700,7 +818,7 @@ def sync_data(
             # for the AI agent.
             from .derived import build_derived
 
-            derived = build_derived(db)
+            derived = build_derived(db, today=today)
             counts.update(derived)
             logger.info(
                 "rebuilt derived metrics: acwr %s, run_acwr %s, %s rows",
@@ -763,9 +881,20 @@ def _configured_types(config: dict[str, str]) -> list[DataType]:
 _ACTIVITY_FINALIZED_KEY = "activities_last_finalized"
 """sync_state key for the newest activity date considered settled.
 
-Days up to and including this date are treated as finalized and never
-re-synced; days after it are re-scanned each run so late/retroactive
-uploads within the freeze buffer are still caught.
+Set to ``end - freeze_days`` after each successful activity sync. The next run
+re-scans from the day after it, so the freeze buffer catches late/retroactive
+uploads, and after downtime longer than the buffer the run resumes where the
+last one stopped instead of leaving the days in between unscanned.
+"""
+
+_ACTIVITY_BACKFILLED_KEY = "activities_backfilled_from"
+"""sync_state key for the earliest date activities were listed from.
+
+Kept apart from the finalized marker: a configured start date earlier than
+this means the account's start date was moved back, so one run re-backfills
+from it. (Pinning the finalized marker to the start date instead made every
+other sync re-list the whole history, since the marker moved forward again on
+the next run and the start date was then earlier than it.)
 """
 
 
@@ -774,53 +903,52 @@ def _resolve_activity_start(
 ) -> date:
     """Earliest date to re-scan activities for a run.
 
-    Steady state (a finalization marker exists): re-scan only the rolling
-    freeze buffer, i.e. ``end - freeze_days + 1``, bounded below by the
-    finalized marker. A ``configured_start`` earlier than the marker means the
-    account's start date was set/changed after data was settled, so this run
-    re-backfills from it. First run: full backfill from ``configured_start``,
-    else just the rolling window.
+    A ``configured_start`` earlier than everything listed so far (first run,
+    or the start date was moved back) backfills from it once. Otherwise the
+    run re-scans the rolling window: the freeze buffer, or from the day after
+    the finalized marker when that is earlier (the server was down).
     """
-    finalized = db.get_state(_ACTIVITY_FINALIZED_KEY)
-    if finalized:
-        marker = date.fromisoformat(finalized)
-        if configured_start and configured_start < marker:
-            return configured_start
-        return _rolling_start(end, freeze_days, marker)
     if configured_start:
-        return configured_start
-    return _rolling_start(end, freeze_days, None)
+        backfilled = db.get_state(_ACTIVITY_BACKFILLED_KEY)
+        if backfilled is None or configured_start < date.fromisoformat(backfilled):
+            return configured_start
+    finalized = db.get_state(_ACTIVITY_FINALIZED_KEY)
+    return _rolling_start(
+        end, freeze_days, date.fromisoformat(finalized) if finalized else None
+    )
 
 
 def _rolling_start(end: date, freeze_days: int, finalized: date | None) -> date:
-    """Rolling window start: ``end - freeze_days + 1``, never before finalized."""
-    start = end - timedelta(days=freeze_days - 1)
-    if finalized and finalized >= start:
-        return finalized + timedelta(days=1)
+    """Rolling window start: the freeze buffer, or the day after ``finalized``
+    when that is earlier. A zero buffer still re-scans today."""
+    start = end - timedelta(days=max(freeze_days, 1) - 1)
+    if finalized is not None:
+        start = min(start, finalized + timedelta(days=1))
     return start
 
 
 def mark_activities_finalized(
     db: Database, end: date, freeze_days: int, effective_start: date | None = None
 ) -> None:
-    """After a successful sync, freeze everything older than the buffer.
+    """After a successful activity sync, record what it covered.
 
-    ``effective_start`` is the activity start actually used this run. When it
-    predates the freeze boundary (a backfill from a user-set start date), the
-    marker is pinned to it so the next run resumes the normal rolling window
-    instead of re-backfilling the whole range.
+    Everything older than the freeze buffer is marked settled, and
+    ``effective_start`` (the start actually listed this run) extends the
+    backfilled range when it reaches further back than before.
     """
+    if effective_start is not None:
+        backfilled = db.get_state(_ACTIVITY_BACKFILLED_KEY)
+        if backfilled is None or effective_start < date.fromisoformat(backfilled):
+            db.set_state(_ACTIVITY_BACKFILLED_KEY, effective_start.isoformat())
     if freeze_days <= 0:
         return
-    finalized = end - timedelta(days=freeze_days)
-    if effective_start and effective_start < finalized:
-        finalized = effective_start
-    db.set_state(_ACTIVITY_FINALIZED_KEY, finalized.isoformat())
+    db.set_state(_ACTIVITY_FINALIZED_KEY, (end - timedelta(days=freeze_days)).isoformat())
 
 
 def _resolve_start_date(
     db: Database, data_type: str, configured_start: date | None,
     nonfinal: set[str] | None = None,
+    today: date | None = None,
 ) -> date:
     """Earliest date to sync for a type: config > last incomplete > max + 1 > today."""
     if configured_start:
@@ -830,7 +958,7 @@ def _resolve_start_date(
     max_stored = db.max_calendar_date(data_type)
     if max_stored:
         return date.fromisoformat(max_stored) + timedelta(days=1)
-    return date.today()
+    return today or date.today()
 
 
 #: Day offsets checked back from a probe point: a week, every other day, so a
@@ -1025,7 +1153,7 @@ def main() -> None:
                 counts.update(build_devices(db))
             counts.update(build_daily_rows(db, day_names or None, force=force))
             from .derived import build_derived
-            counts.update(build_derived(db))
+            counts.update(build_derived(db, today=user_today(user_utc_offset(db))))
         finally:
             db.close()
         total = sum(counts.values())
@@ -1055,6 +1183,7 @@ def main() -> None:
             types=types, start=args.range[0], end=args.range[1],
             include_activities=include_activities,
             include_profile=want_profile or not type_names,
+            refresh_profile=want_profile,
         )
     else:
         counts = sync_data(
@@ -1062,6 +1191,7 @@ def main() -> None:
             types=types,
             include_activities=include_activities,
             include_profile=want_profile or not type_names,
+            refresh_profile=want_profile,
         )
 
     total = sum(counts.values())
