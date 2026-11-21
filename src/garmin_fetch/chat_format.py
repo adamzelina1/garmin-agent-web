@@ -112,34 +112,96 @@ def _parse_block(raw: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def recover_chart_specs(messages: list[Any]) -> list[dict[str, Any]]:
-    """Recover validated chart specs from a run's successful ``chart`` tool calls.
+#: How the ``chart`` tool answers a validated chart (see :func:`chart_reply`):
+#: the id the model embeds, then the spec on the last line for the server.
+_CHART_REPLY = re.compile(r"^OK: chart (c\d+)\b.*\nSpec: (\{.*\})\s*$", re.S)
+#: A chart the model placed by reference: ``<chart id="c1"/>`` (also tolerates
+#: no quotes, no self-close, or an empty ``</chart>`` right after).
+_CHART_REF = re.compile(
+    r"""<chart\s+id\s*=\s*["']?(c\d+)["']?\s*/?\s*>(?:\s*</chart\s*>)?""", re.I
+)
 
-    The model is told to embed each validated spec in ``<chart> ... </chart>``
-    but occasionally only *says* a chart exists and never emits the spec — the
-    tool call itself still holds the spec. This walks the turn's messages and
-    returns the spec of every successful ``chart`` return so a dropped chart can
-    still be drawn. Duplicate specs will be filtered by the caller.
+
+def chart_reply(chart_id: str, spec: dict[str, Any], detail: str) -> str:
+    """The ``chart`` tool's reply for a validated chart.
+
+    The model only has to write ``<chart id="…"/>`` where the chart belongs
+    (it used to copy the whole spec into its answer, re-typing every SQL query
+    as output tokens); :func:`finish_chart_text` swaps the spec back in. The
+    spec rides on the last line so the server can do that from the run's
+    messages alone.
     """
-    rebuilt: list[dict[str, Any]] = []
+    return (
+        f"OK: chart {chart_id} ({detail}). Put <chart id=\"{chart_id}\"/> on its "
+        "own line where the chart belongs, with one sentence on what it shows; "
+        "never paste the spec or the data.\nSpec: "
+        + json.dumps(spec, ensure_ascii=False)
+    )
+
+
+def turn_chart_specs(messages: list[Any]) -> dict[str, dict[str, Any]]:
+    """``{chart id: spec}`` for every chart the ``chart`` tool validated in
+    ``messages`` (one turn's worth). A stored, already-pruned tool reply no
+    longer parses, which is fine: its turn was resolved when it was saved."""
+    specs: dict[str, dict[str, Any]] = {}
     for message in messages:
         if not isinstance(message, ModelRequest):
             continue
         for part in message.parts:
             if getattr(part, "tool_name", None) != "chart":
                 continue
-            if getattr(part, "outcome", None) != "success":
-                continue
-            content = str(getattr(part, "content", "") or "")
-            if not content.startswith("OK: "):
-                continue
-            data = _parse_block(content[len("OK: ") :])
-            if isinstance(data, dict) and data.get("sql"):
-                rebuilt.append(data)
-    return rebuilt
+            match = _CHART_REPLY.match(str(getattr(part, "content", "") or ""))
+            if match:
+                data = _parse_block(match.group(2))
+                if data is not None:
+                    specs[match.group(1)] = data
+    return specs
 
 
-def extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
+def resolve_chart_refs(text: str, specs: dict[str, dict[str, Any]]) -> str:
+    """Replace each ``<chart id="…"/>`` with that chart's full ``<chart>``
+    block; a reference to an unknown id is dropped."""
+
+    def block(match: re.Match[str]) -> str:
+        spec = specs.get(match.group(1).lower())
+        return f"<chart>{json.dumps(spec, ensure_ascii=False)}</chart>" if spec else ""
+
+    return _CHART_REF.sub(block, text)
+
+
+def unplaced_charts(
+    texts: list[str], specs: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The validated charts none of ``texts`` (already resolved) shows,
+    matched by SQL."""
+    placed = {
+        spec.get("sql", "").strip() for text in texts for spec in extract_charts(text)[1]
+    }
+    return [s for s in specs.values() if s.get("sql", "").strip() not in placed]
+
+
+def append_charts(text: str, specs: list[dict[str, Any]]) -> str:
+    """``text`` with a full ``<chart>`` block per spec added at the end."""
+    if not specs:
+        return text
+    blocks = "\n\n".join(
+        f"<chart>{json.dumps(spec, ensure_ascii=False)}</chart>" for spec in specs
+    )
+    return f"{text.rstrip()}\n\n{blocks}" if text.strip() else blocks
+
+
+def finish_chart_text(text: str, specs: dict[str, dict[str, Any]]) -> str:
+    """An answer with its chart references resolved, plus a block for every
+    validated chart it never placed — a model sometimes validates a chart and
+    then forgets it (or ends with a short acknowledgement), and the user would
+    otherwise never see it. Idempotent: a placed chart is matched by its SQL."""
+    text = resolve_chart_refs(text, specs)
+    return append_charts(text, unplaced_charts([text], specs))
+
+
+def extract_charts(
+    answer: str, *, slots: bool = False
+) -> tuple[str, list[dict[str, Any]]]:
     """Split an agent answer into (plain text, list of plotly figure dicts).
 
     ``<chart>`` blocks are consumed and their JSON parsed (tolerating a
@@ -147,9 +209,18 @@ def extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
     an unclosed block runs to the end of the answer and its JSON prefix is read
     with a raw JSON decoder, so a model that forgets the close tag (or appends
     trailing filler after the JSON) still produces a chart. Malformed blocks
-    are dropped along with their marker text.
+    are dropped along with their marker text. With ``slots`` each chart leaves
+    a ``<chart_slot n="i"/>`` marker (its index in the list) where it stood,
+    so the web page can draw it in place.
     """
     charts: list[dict[str, Any]] = []
+    pieces: list[str] = []
+
+    def keep(data: dict[str, Any] | None) -> None:
+        if data is not None:
+            charts.append(data)
+            if slots:
+                pieces.append(f'\n\n<chart_slot n="{len(charts) - 1}"/>\n\n')
 
     def _figure_prefix(raw: str) -> tuple[dict[str, Any] | None, int]:
         """Return the leading dict and the index just past it, else (None, 0)."""
@@ -165,7 +236,6 @@ def extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
             return obj, start + end
         return None, 0
 
-    pieces: list[str] = []
     low = answer.lower()
     pos = 0
     while True:
@@ -177,14 +247,12 @@ def extract_charts(answer: str) -> tuple[str, list[dict[str, Any]]]:
         close = low.find("</chart>", start)
         if close != -1:  # well-formed block: JSON ends at the close tag
             inner = answer[start + len("<chart>") : close]
-            data = _parse_block(inner)
-            if data is not None:
-                charts.append(data)
+            keep(_parse_block(inner))
             end = close + len("</chart>")
         else:  # unclosed block: parse JSON prefix, keep the text tail
             data, end = _figure_prefix(answer[start + len("<chart>") :])
             if data is not None:
-                charts.append(data)
+                keep(data)
                 end += start + len("<chart>")
                 tail = answer[end:]
                 if tail.lstrip().startswith(("```", "~~~")):

@@ -28,6 +28,7 @@ and ``/new`` folds it into a compact summary that seeds a new session.
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import math
 import re
@@ -42,7 +43,10 @@ import psycopg.rows
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import ModelRetry, RunContext
 
-from .chat_format import strip_leaked_tool_call
+from .chat_format import (
+    append_charts, chart_reply, finish_chart_text, resolve_chart_refs,
+    strip_leaked_tool_call, turn_chart_specs, unplaced_charts,
+)
 from .config import load_config
 from .parser import TYPE_COLUMNS
 from .tool_args import AsList, Loose, compact_schema
@@ -427,9 +431,9 @@ Query rules:
   HRV, resting HR, stress, load); `get_recent_activities` for a list of
   activities; `get_activity_detail` for how one session went (HR zones, laps,
   or one stretch of it). Otherwise write SQL with `run_sql`.
-- `chart` when the user asks for a chart. On `OK: <spec>`, embed the spec
-  verbatim in `<chart> ... </chart>` with one descriptive sentence; never paste
-  the data.
+- `chart` when the user asks for a chart. On `OK: chart c1`, put
+  `<chart id="c1"/>` on its own line where the chart belongs, with one
+  descriptive sentence; never paste the spec or the data.
 - `weather` only for a day or place the database does not cover. A stored
   activity has its own weather columns; the home forecast is `weather_forecast`.
 - `memory` for durable facts the user tells you about themselves.
@@ -1967,6 +1971,10 @@ def _register_tools(
     """Register every agent tool. Only ``memory`` and ``training_apply`` write, each
     through its own app store — never through the read-only connection."""
 
+    #: Chart ids for ``<chart id="…"/>``; unique for the agent's lifetime, so
+    #: within every turn.
+    chart_ids = itertools.count(1)
+
     async def compact(ctx: RunContext[None], tool_def: Any) -> Any:
         """Send the tool's schema without pydantic's optional-field noise."""
         from dataclasses import replace
@@ -2102,9 +2110,9 @@ def _register_tools(
         """Validate a chart and return its spec ready to embed.
 
         The query is run and the Plotly figure built to check it; on success
-        the reply is ``OK: <spec>`` — embed that spec verbatim in
-        <chart> ... </chart>. The data itself is never returned; the UI reruns
-        the query to draw it. Aggregate to at most ~200 points.
+        the reply is ``OK: chart c1`` — place it in the answer as
+        <chart id="c1"/>. The data itself is never returned. Aggregate to at
+        most ~200 points.
 
         Args:
             sql: read-only query returning the data.
@@ -2129,10 +2137,9 @@ def _register_tools(
         figure = _build_chart_figure(parsed, result)
         if charts is not None:
             charts[parsed["sql"].strip()] = json.loads(figure.to_json())
-        return (
-            "OK: " + json.dumps(parsed, ensure_ascii=False)
-            + f" (query returned {len(result['rows'])} rows"
-            + _chart_ranges(parsed, result) + ")"
+        return chart_reply(
+            f"c{next(chart_ids)}", parsed,
+            f"query returned {len(result['rows'])} rows" + _chart_ranges(parsed, result),
         )
 
     if weather is not None:
@@ -2396,7 +2403,15 @@ _SALVAGE_RATIO = 3
 
 
 def _final_answer(result: Any) -> str:
-    """Return the user-facing answer for a completed run, salvaging a lost reply.
+    """The user-facing answer for a completed run: :func:`_pick_answer`, with
+    its ``<chart id="…"/>`` references swapped for the validated specs and any
+    chart the run validated but never placed added at the end (see
+    ``chat_format.finish_chart_text``)."""
+    return finish_chart_text(_pick_answer(result), turn_chart_specs(result.new_messages()))
+
+
+def _pick_answer(result: Any) -> str:
+    """Return the answer text for a completed run, salvaging a lost reply.
 
     The final model response is normally the answer. But a model can emit its
     real (long) reply in the *same* response as a side-effect tool call — most
@@ -2512,6 +2527,56 @@ def _messages_token_estimate(messages: Iterable[Any]) -> int:
 _PRUNE_OVER_CHARS = 350
 _PRUNED_CHARS = 250
 
+def _resolve_session_charts(messages: list[Any]) -> list[Any]:
+    """``messages`` with each turn's chart references resolved, and the charts
+    the turn validated but showed nowhere added to its last text-only reply
+    (the one the chat shows last). Turns without validated charts are
+    returned untouched."""
+    from dataclasses import replace
+
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    def shown(msg: Any) -> bool:
+        """A reply the chat displays: text and no tool call."""
+        return isinstance(msg, ModelResponse) and not any(
+            getattr(p, "tool_name", None) for p in msg.parts
+        ) and any(isinstance(p, TextPart) for p in msg.parts)
+
+    def with_text(msg: Any, edit: Callable[[str], str]) -> Any:
+        parts = [
+            replace(p, content=edit(p.content)) if isinstance(p, TextPart) else p
+            for p in msg.parts
+        ]
+        if all(new.content == old.content for new, old in zip(parts, msg.parts)
+               if isinstance(old, TextPart)):
+            return msg
+        return replace(msg, parts=parts)
+
+    starts = [
+        i for i, msg in enumerate(messages)
+        if isinstance(msg, ModelRequest)
+        and any(isinstance(p, UserPromptPart) for p in msg.parts)
+    ] or [0]
+    out = list(messages)
+    for lo, hi in zip(starts, [*starts[1:], len(messages)]):
+        specs = turn_chart_specs(messages[lo:hi])
+        if not specs:
+            continue
+        for i in range(lo, hi):
+            if isinstance(out[i], ModelResponse):
+                out[i] = with_text(out[i], lambda t: resolve_chart_refs(t, specs))
+        visible = [i for i in range(lo, hi) if shown(out[i])]
+        texts = [p.content for i in visible for p in out[i].parts if isinstance(p, TextPart)]
+        missing = unplaced_charts(texts, specs)
+        if missing and visible:
+            final = out[visible[-1]]
+            last = max(j for j, p in enumerate(final.parts) if isinstance(p, TextPart))
+            parts = list(final.parts)
+            parts[last] = replace(parts[last], content=append_charts(parts[last].content, missing))
+            out[visible[-1]] = replace(final, parts=parts)
+    return out
+
+
 def _prune_session_messages(messages: list[Any]) -> list[Any]:
     """Slim the stored history that every later model request re-sends.
 
@@ -2528,6 +2593,11 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
     it would be shown again on reload and would teach the model to repeat the
     mistake.
 
+    Each turn's ``<chart id="…"/>`` references are resolved to full chart
+    blocks first, while the chart tool's replies still hold the specs (they
+    are cut below), and a chart the turn validated but never placed is added
+    to its final reply — so a reload shows what the live answer showed.
+
     Idempotent, so it is also applied to a stored session when it is loaded.
     """
     from dataclasses import replace
@@ -2535,6 +2605,8 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
     from pydantic_ai.messages import (
         ModelRequest, ModelResponse, TextPart, ThinkingPart, ToolReturnPart,
     )
+
+    messages = _resolve_session_charts(messages)
 
     def prune(part: Any) -> Any:
         if not isinstance(part, ToolReturnPart):

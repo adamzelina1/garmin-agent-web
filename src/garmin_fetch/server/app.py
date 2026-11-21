@@ -948,7 +948,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             user_cfg, question, result, answer=answer,
             trace_writer=lambda record: state.append_trace(user["id"], record),
         )
-        text, specs = extract_charts(answer)
+        text, specs = extract_charts(answer, slots=True)
         messages = _prune_session_messages(result.all_messages())
         state.set_session_messages(user["id"], messages)
         return {
@@ -1102,7 +1102,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             if item.get("role") == "user" and item["content"].startswith(_SUMMARY_LABEL):
                 item["role"] = "summary"
             elif item.get("role") in ("assistant", "bot"):
-                text, specs = extract_charts(item["content"])
+                text, specs = extract_charts(item["content"], slots=True)
                 item["content"] = replace_workout_dumps(text)
                 item["chart_specs"] = specs
         return {

@@ -29,7 +29,7 @@ from .ask import (
     _open_readonly,
     _record_turn,
 )
-from .chat_format import extract_charts, messages_to_history, recover_chart_specs
+from .chat_format import extract_charts, messages_to_history
 from .config import load_config
 
 
@@ -115,16 +115,9 @@ class ChatSession:
             result,
             trace_writer=lambda r: self._state.append_trace(self._user_id, r),
         )
+        # _final_answer already resolves <chart id> references and adds any
+        # validated chart the model never placed.
         text, specs = extract_charts(_final_answer(result))
-
-        # Fallback: the model may validate a chart via the tool but forget to
-        # embed the spec in <chart> tags. Recover any validated specs that were
-        # not embedded so the chart still renders.
-        embedded_sql = {spec.get("sql") for spec in specs}
-        for spec in recover_chart_specs(result.new_messages()):
-            if spec["sql"] not in embedded_sql:
-                specs.append(spec)
-                embedded_sql.add(spec["sql"])
 
         self._state.set_session_messages(self._user_id, result.all_messages())
 

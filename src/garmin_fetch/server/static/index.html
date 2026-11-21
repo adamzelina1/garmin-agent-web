@@ -274,7 +274,7 @@
   .askrow textarea { flex:1; resize:none; min-height:38px; max-height:180px; margin:0; line-height:1.4; padding:8px 10px; font-family:inherit; }
   .askrow button { height:38px; flex:none; min-width:76px; font-weight:600; }
   #btn-ask.stop { background:var(--panel2); border:1px solid var(--border); color:var(--text); }
-  .chartbox { margin-top:8px; }
+  .chartbox { margin:8px 0; }
   .toolbar { display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap; }
   .stat { font-size:13px; color:var(--muted); }
   .hidden { display:none !important; }
@@ -1380,6 +1380,9 @@ function buildMd() {
 // tags must never surface as literal text — especially during live streaming.
 function stripMarkers(s) {
   return s
+    // A chart placed by reference (<chart id="c1"/>) and the server's slot
+    // markers go first: the unclosed-block rule below would eat the rest.
+    .replace(/<chart(?:_slot)?\b[^>]*\/\s*>/gi, "")
     .replace(/<chart\b[^>]*>[\s\S]*?<\/chart\s*>/gi, "")
     .replace(/<chart\b[^>]*>[\s\S]*$/gi, "")
     .replace(/<plan_table\b[^>]*(?:\/>|>)/gi, "");
@@ -1410,7 +1413,22 @@ function copyCode(btn) {
 }
 window.copyCode = copyCode;
 
+// The placeholder for chart `idx` of a reply, drawn later by renderCharts;
+// null when there is no such chart or it was already placed.
+function chartHolder(charts, figures, idx, placed) {
+  const spec = (charts || [])[idx];
+  if (!spec || placed.has(idx)) return null;
+  placed.add(idx);
+  const holder = document.createElement("div");
+  holder.className = "chartbox";
+  holder.dataset.sql = spec.sql || "";
+  holder.dataset.spec = JSON.stringify(spec);
+  if (figures && figures[idx]) holder.dataset.figure = JSON.stringify(figures[idx]);
+  return holder;
+}
+
 function addMsg(role, text, charts, figures) {
+  const placed = new Set();  // chart indexes already drawn inline
   const box = $("chat");
   const m = document.createElement("div");
   m.className = "msg " + role;
@@ -1423,32 +1441,37 @@ function addMsg(role, text, charts, figures) {
     b.textContent = text || "";
   } else {
     // <plan_table .../> markers are replaced by the stored plan, rendered
-    // from /training/workouts (the model must not transcribe the table itself).
-    const parts = (text || "").split(/<plan_table\b([^>]*)>/gi);
-    for (let i = 0; i < parts.length; i++) {
-      if (i % 2 === 0) {
-        if (parts[i]) b.insertAdjacentHTML("beforeend", renderMarkdown(parts[i]));
-      } else {
-        const box = document.createElement("div");
-        box.className = "planbox";
-        const from = parts[i].match(/from\s*=\s*["']([^"']*)["']/i);
-        const to = parts[i].match(/to\s*=\s*["']([^"']*)["']/i);
-        box.dataset.from = from ? from[1] : "";
-        box.dataset.to = to ? to[1] : "";
-        b.appendChild(box);
+    // from /training/workouts (the model must not transcribe the table itself);
+    // <chart_slot n="i"/> markers (set by the server) by chart i, so each chart
+    // sits next to the sentence the model wrote about it.
+    const marker = /<plan_table\b([^>]*)>|<chart_slot\s+n="(\d+)"\s*\/>/gi;
+    const src = text || "";
+    let pos = 0, hit;
+    while ((hit = marker.exec(src)) !== null) {
+      const chunk = src.slice(pos, hit.index);
+      if (chunk.trim()) b.insertAdjacentHTML("beforeend", renderMarkdown(chunk));
+      pos = marker.lastIndex;
+      if (hit[2] !== undefined) {
+        const holder = chartHolder(charts, figures, Number(hit[2]), placed);
+        if (holder) b.appendChild(holder);
+        continue;
       }
+      const box = document.createElement("div");
+      box.className = "planbox";
+      const from = hit[1].match(/from\s*=\s*["']([^"']*)["']/i);
+      const to = hit[1].match(/to\s*=\s*["']([^"']*)["']/i);
+      box.dataset.from = from ? from[1] : "";
+      box.dataset.to = to ? to[1] : "";
+      b.appendChild(box);
     }
+    const rest = src.slice(pos);
+    if (rest.trim()) b.insertAdjacentHTML("beforeend", renderMarkdown(rest));
   }
   m.appendChild(body); m.appendChild(b);
+  // A chart without a slot (an older reply) goes after the text, as before.
   (charts || []).forEach((spec, idx) => {
-    const holder = document.createElement("div");
-    holder.className = "chartbox";
-    holder.dataset.sql = spec.sql || "";
-    holder.dataset.spec = JSON.stringify(spec);
-    if (figures && figures[idx]) {
-      holder.dataset.figure = JSON.stringify(figures[idx]);
-    }
-    m.appendChild(holder);
+    const holder = chartHolder(charts, figures, idx, placed);
+    if (holder) m.appendChild(holder);
   });
   box.appendChild(m);
   box.scrollTop = box.scrollHeight;
