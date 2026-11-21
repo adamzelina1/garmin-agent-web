@@ -116,6 +116,40 @@ def user_today(offset: timedelta | None) -> date:
     return (datetime.now(UTC) + offset).date()
 
 
+class _ConnPayloads:
+    """The two reads ``user_utc_offset`` makes, over an open app-role
+    connection already scoped to one user by RLS — so a request can learn the
+    user's date without opening a ``Database``."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def _rows(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        from psycopg.rows import tuple_row
+
+        rows = self._conn.cursor(row_factory=tuple_row).execute(sql, params).fetchall()
+        return [r[0] if isinstance(r[0], dict) else json.loads(r[0]) for r in rows]
+
+    def latest_metric_payloads(self, data_type: str, limit: int) -> list[dict[str, Any]]:
+        return self._rows(
+            "SELECT raw_json FROM metrics WHERE data_type = %s "
+            "ORDER BY calendar_date DESC LIMIT %s",
+            (data_type, limit),
+        )
+
+    def latest_activity_payload(self) -> dict[str, Any] | None:
+        rows = self._rows(
+            "SELECT raw_json FROM activities ORDER BY activity_id DESC LIMIT 1", ()
+        )
+        return rows[0] if rows else None
+
+
+def conn_utc_offset(conn: Any) -> timedelta | None:
+    """``user_utc_offset`` over a user-scoped app-role connection (the agent's
+    read-only role cannot read the raw payloads the offset comes from)."""
+    return user_utc_offset(_ConnPayloads(conn))
+
+
 def _fetch_local_date(fetched_at: str, offset: timedelta | None = None) -> date:
     """The user's calendar date at the moment a fetch completed.
 

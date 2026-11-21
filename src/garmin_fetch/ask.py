@@ -35,15 +35,17 @@ from argparse import ArgumentParser
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Any, Callable, Iterable, Protocol
+from typing import Annotated, Any, Callable, Iterable, Protocol
 
 import psycopg
 import psycopg.rows
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import ModelRetry, RunContext
 
 from .chat_format import strip_leaked_tool_call
 from .config import load_config
 from .parser import TYPE_COLUMNS
+from .tool_args import AsList, Loose, compact_schema
 
 
 class _Memory(Protocol):
@@ -80,11 +82,13 @@ class _Training(Protocol):
     def apply(self, spec: dict[str, Any]) -> dict[str, Any]: ...
 
 
-#: Guard a statement is a read-only query and not a write.
+#: Guard a statement is a read-only query and not a write. (No REPLACE:
+#: Postgres has no such statement, and the word blocked the harmless
+#: ``replace()`` string function.)
 _SELECT_PREFIX = re.compile(r"^\s*(?:SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
 _WRITE_WORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|REINDEX|VACUUM|"
-    r"REPLACE|TRIGGER)\b",
+    r"TRIGGER)\b",
     re.IGNORECASE,
 )
 
@@ -125,15 +129,21 @@ _ALLOWED_TABLES = (
     "training_block", "training_week", "weather_forecast",
 )
 
-#: Metrics ``get_metric_trend`` supports: derived scores, then daily columns
-#: (a daily column is only offered when the account's enabled data types can
-#: write it).
-_DERIVED_TREND_METRICS = ("acwr", "run_acwr", "run_cadence_drift")
-_DAILY_TREND_METRICS = (
-    "sleep_score", "sleep_time_hours", "resting_hr", "hrv_last_night_avg",
-    "vo2max", "total_steps", "total_distance_m", "avg_stress",
-    "body_battery_highest", "body_battery_lowest", "weight_kg", "sweat_loss_ml",
+#: Derived metrics ``get_metric_trend`` reads (``derived_metrics`` rows).
+_DERIVED_TREND_METRICS = (
+    "acwr", "acwr_acute_load", "acwr_chronic_load", "acwr_daily_load",
+    "run_acwr", "run_acute_km", "run_chronic_km",
+    "run_cadence_drift", "run_cadence", "run_gct_ms",
 )
+#: Daily columns the tool's description names. Any numeric ``daily_metrics``
+#: column visible to the account works; these are the ones worth suggesting.
+_DAILY_TREND_METRICS = (
+    "resting_hr", "hrv_last_night_avg", "sleep_score", "sleep_time_hours",
+    "avg_stress", "body_battery_highest", "body_battery_lowest", "vo2max",
+    "total_steps", "total_distance_m", "weight_kg",
+)
+#: Most metrics one ``get_metric_trend`` call returns side by side.
+_MAX_TREND_METRICS = 8
 
 #: Data-driven schema annotations: table-level overviews and per-column
 #: unit/semantic hints. ``_schema_text`` renders the agent-facing *table
@@ -180,45 +190,49 @@ _TABLE_NOTES: dict[str, str] = {
     "gear": "one row per equipment item (type, name, cumulative distance, activity count, retired); current snapshot",
     "devices": "one row per Garmin device (model name); current snapshot",
     "derived_metrics": (
-        "one row per (calendar_date, metric); daily derived scores recomputed "
-        "and stored each sync. metric = 'acwr' (ratio) with acwr_acute_load / "
-        "acwr_chronic_load / acwr_daily_load, qualifier Sweet "
-        "Spot/Elevated/Danger/Detraining. "
-        "RUNNING-SPECIFIC (running activities only, so cycling/swimming cannot "
-        "inflate it): 'run_acwr' (foot-strike volume ratio) with "
-        "run_acute_km / run_chronic_km (km/day, 7d/28d EMA); 'run_cadence_drift' "
-        "(pace-normalised cadence z-score over the trailing 90d fit — negative = "
-        "overstriding / worse mechanics) with run_cadence (spm PER LEG; total "
-        "both-feet = 2x) and run_gct_ms, "
-        "qualifier Form Up/Stable/Form Dropping/Breaking Down. "
+        "TALL key/value table, one row per (calendar_date, metric), recomputed "
+        "each sync. Its ONLY data columns are value and qualifier: every name "
+        "below is a VALUE of the metric column, never a column of its own. "
+        "'acwr' (ratio, qualifier Sweet Spot/Elevated/Danger/Detraining) plus "
+        "its component rows 'acwr_acute_load' / 'acwr_chronic_load' / "
+        "'acwr_daily_load'. RUNNING-SPECIFIC (running activities only, so "
+        "cycling/swimming cannot inflate it): 'run_acwr' (foot-strike volume "
+        "ratio) plus 'run_acute_km' / 'run_chronic_km' (km/day, 7d/28d EMA); "
+        "'run_cadence_drift' (pace-normalised cadence z-score over the "
+        "trailing 90d fit — negative = overstriding / worse mechanics, "
+        "qualifier Form Up/Stable/Form Dropping/Breaking Down) plus "
+        "'run_cadence' (spm PER LEG; total both-feet = 2x) and 'run_gct_ms'. "
         "'zone_pace_z1'..'zone_pace_z5' (dated today): learned running pace "
         "per HR zone in decimal min/km, qualifier JSON with sd_s / minutes / "
-        "ratio to lactate-threshold pace. Pivot with "
-        "WHERE metric = '<name>' (a day's components share its calendar_date)"
+        "ratio to lactate-threshold pace. Put several metrics side by side "
+        "with one row per day: SELECT calendar_date, MAX(value) FILTER (WHERE "
+        "metric = 'run_acwr') AS run_acwr, MAX(value) FILTER (WHERE metric = "
+        "'run_acute_km') AS acute_km FROM derived_metrics WHERE metric IN "
+        "('run_acwr', 'run_acute_km') GROUP BY 1 ORDER BY 1"
     ),
     "training_workout": (
-        "planned workouts; READ-ONLY via SQL — write only through the training "
-        "tool. planned_date and activity_type associate workouts to the active "
+        "planned workouts; READ-ONLY via SQL — write only through "
+        "training_apply. planned_date and activity_type associate workouts to the active "
         "block and goal (goal_id is an optional manual override). status is "
         "planned/completed/partial/skipped; target_* columns hold the prescribed pace/HR-zone/power"
     ),
     "training_goal": (
         "one row per long-term goal/target (an event such as a marathon or a "
         "half-marathon) over [start_date, target_date]; an account may hold many. read-only via "
-        "SQL — write only through the training tool. sport is "
+        "SQL — write only through training_apply. sport is "
         "run/cycle/swim/strength/rest/other"
     ),
     "training_block": (
         "one row per periodized phase of a goal: name/focus are free text, "
         "start_date/end_date define the span (ordered chronologically by start_date), "
         "target_weekly_km provides an optional baseline weekly volume for weeks in this phase; "
-        "read-only via SQL — write only through the training tool"
+        "read-only via SQL — write only through training_apply"
     ),
     "training_week": (
         "one row per (block_id, week_start): explicit targets for one calendar "
         "week (Mon..Sun) of a block — distance_km and/or duration_min, optional "
         "is_deload flag; falls back to block's target_weekly_km when distance_km is NULL. "
-        "read-only via SQL — write only through the training tool"
+        "read-only via SQL — write only through training_apply"
     ),
     "weather_forecast": (
         "stored daily Open-Meteo weather forecast refreshed each sync (calendar_date, "
@@ -312,8 +326,8 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         ),
     },
     "derived_metrics": {
-        "metric": "which derived metric the row holds — see the table note for known names",
-        "value": "the metric's value; units differ per metric (acwr ratio, loads arbitrary)",
+        "metric": "which derived metric the row holds (a name such as 'run_acwr' or 'run_acute_km' — see the table note); never a column",
+        "value": "the metric's value; units differ per metric (acwr ratio, loads arbitrary, run_*_km km/day)",
         "qualifier": "category label: acwr = Sweet Spot/Elevated/Danger/Detraining; run_cadence_drift = Form Up/Stable/Form Dropping/Breaking Down",
     },
     "training_workout": {
@@ -324,13 +338,14 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "target_hr_zone": "prescribed HR zone/target, free text (e.g. 'Z2' or '140-150')",
         "target_power_w": "prescribed power in watts (int)",
         "steps": (
-            "ordered JSON array of the session's segments (warm-up/work/"
+            "TEXT holding an ordered JSON array (cast `steps::jsonb` before any "
+            "JSON function) of the session's segments (warm-up/work/"
             "recovery/cool-down, intervals, strides, ...); at least one for "
             "every non-rest workout (NULL only on rest days); stored as "
             "{kind: warmup/steady/work/recovery/cooldown/rest, duration_sec, "
             "repeat?, label?, intensity?, target_pace_min_km?, target_hr_zone?, "
             "target_power_w?}; label is a short segment name (no duration/rep). "
-            "When WRITING via the training tool pass a friendly `duration` "
+            "When WRITING via training_apply pass a friendly `duration` "
             "string ('15m', '90s', '1:30') instead of seconds; NULL/[] only for "
             "a single continuous effort"
         ),
@@ -387,11 +402,9 @@ returning raw numbers.
 
 {overview}
 
-Common columns (write SQL with these directly; call `table_schema` for any other):
-- **daily_metrics**: `calendar_date`, `resting_hr` (bpm), `hrv_last_night_avg` (ms), `sleep_score` (0-100), `sleep_time_hours`, `vo2max`, `total_steps`, `total_distance_m` (METRES), `body_battery_highest/lowest`, `avg_stress`, `weight_kg`
-- **activity_summaries**: `activity_id`, `activity_name`, `activity_type` (running, cycling, ...), `start_date`, `duration_hours`, `distance_km` (KM), `avg_hr`, `max_hr`, `pace_min_km` (decimal min/km; 5.5 = 5:30), `avg_cadence` (PER LEG), `avg_power_w`, `training_load`, `elevation_gain_m`, `weather_temp_c`
-- **derived_metrics**: `calendar_date`, `metric` ('acwr', 'run_acwr', 'run_cadence_drift', 'zone_pace_z1'..'z5'), `value`, `qualifier`
-- **weather_forecast**: `calendar_date`, `temp_max_c`, `temp_min_c`, `precip_mm`, `wind_max_kmh`, `condition_code`
+Common columns (exact names — write SQL with these directly and call
+`table_schema` before using any column not listed; never guess a name):
+{common}
 
 Query rules:
 1. PostgreSQL dialect. Never `SELECT *`; pick only the columns you need.
@@ -409,9 +422,11 @@ Query rules:
 
 # Tools
 
-- `get_day_summary` for one day; `get_metric_trend` for a core metric over time;
-  `get_recent_activities` for a list of activities; `get_activity_detail` for
-  how one session went. Otherwise write SQL with `run_sql`.
+- `get_day_summary` for one day; `get_metric_trend` for one or several daily
+  metrics over time and against the athlete's normal level (readiness: sleep,
+  HRV, resting HR, stress, load); `get_recent_activities` for a list of
+  activities; `get_activity_detail` for how one session went (HR zones, laps,
+  or one stretch of it). Otherwise write SQL with `run_sql`.
 - `chart` when the user asks for a chart. On `OK: <spec>`, embed the spec
   verbatim in `<chart> ... </chart>` with one descriptive sentence; never paste
   the data.
@@ -435,9 +450,9 @@ Query rules:
 
 #: The training bullet of the prompt, emitted only when a season is wired.
 _TRAINING_BULLET = """\
-- `training` for everything about the training season (goals, blocks, weekly
-  targets, planned workouts): read it before building or reshaping a week and
-  to answer "how is my week going?". To show a plan in chat, embed
+- `training` to read the training season (goals, blocks, weekly targets,
+  planned workouts) — before building or reshaping a week and to answer "how
+  is my week going?" — and `training_apply` to change it. To show a plan in chat, embed
   `<plan_table />` (or `<plan_table from="YYYY-MM-DD" to="YYYY-MM-DD" />`) —
   never a JSON dump or a markdown table.
 """
@@ -557,6 +572,21 @@ _LEGACY_TRACES: dict[str, dict[str, Any]] = {
     "histogram": {"go": "Histogram"},
     "box": {"go": "Box"},
 }
+
+
+class ChartTrace(BaseModel):
+    """One trace of the ``chart`` tool. Any other key (marker, line, mode,
+    orientation, labels, ...) passes to the Plotly trace as-is."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str | None = Field(None, description="line|scatter|area|bar|pie|histogram|box")
+    go: str | None = Field(
+        None, description="instead of type: any plotly.graph_objects class (Scattergl, Violin, Heatmap, ...)"
+    )
+    x: str | None = Field(None, description="result column for x")
+    y: str | None = Field(None, description="numeric result column for y")
+    z: str | None = Field(None, description="result column for z (heatmaps)")
 
 
 def _go_class_name(go: Any, name: str) -> str | None:
@@ -838,6 +868,12 @@ class ReadOnlyDB:
     from the schema and day summaries and rejected in SQL, so the agent never
     sees metrics the account turned off (even before the next sync prunes their
     stored values) or that its devices don't record.
+
+    ``utc_offset`` is the account's UTC offset (``fetcher.conn_utc_offset``):
+    the server runs in UTC, so ``today()`` — the agent's "today" in its
+    instructions and trailing tool windows — is the user's calendar date,
+    computed live so a long-lived handle never goes stale. None falls back to
+    the machine's date.
     """
 
     def __init__(
@@ -847,9 +883,11 @@ class ReadOnlyDB:
         user_id: int | None = None,
         excluded_types: Iterable[str] | str = (),
         pool: Any = None,
+        utc_offset: timedelta | None = None,
     ) -> None:
         self.url = url
         self.user_id = user_id
+        self.utc_offset = utc_offset
         if isinstance(excluded_types, str):
             excluded_types = excluded_types.split(",")
         excluded = {s.strip() for s in excluded_types if s.strip()}
@@ -867,6 +905,12 @@ class ReadOnlyDB:
         self._forbidden: re.Pattern | None = None
         self._hidden: frozenset[str] | None = None
         self._hidden_re: re.Pattern | None = None
+
+    def today(self) -> date:
+        """The account's current calendar date (see ``utc_offset``)."""
+        from .fetcher import user_today
+
+        return user_today(self.utc_offset)
 
     @contextmanager
     def _connect(self) -> Any:
@@ -1042,60 +1086,116 @@ class ReadOnlyDB:
             return None
 
     def trend_metrics(self) -> list[str]:
-        """The metrics ``metric_trend`` supports for this account."""
-        present = {c["name"] for c in self.columns("daily_metrics")}
-        return list(_DERIVED_TREND_METRICS) + [
-            m for m in _DAILY_TREND_METRICS if m in present
+        """Every metric ``metric_trend`` accepts for this account: the derived
+        scores plus each numeric ``daily_metrics`` column it can see."""
+        daily = [
+            c["name"] for c in self.columns("daily_metrics")
+            if c["type"] in _NUM_TYPE
+        ]
+        return list(_DERIVED_TREND_METRICS) + daily
+
+    def suggested_trend_metrics(self) -> list[str]:
+        """The trend metrics worth naming in the tool description."""
+        present = set(self.trend_metrics())
+        return [
+            m for m in (*_DAILY_TREND_METRICS, *_DERIVED_TREND_METRICS)
+            if m in present
         ]
 
-    def metric_trend(self, metric: str, days: int = 30) -> dict[str, Any]:
-        """Query time series and summary stats for a core metric over N trailing days."""
-        days = max(1, min(int(days), 365))
-        m = metric.strip().lower()
-        supported = self.trend_metrics()
-        if m not in supported:
+    def metric_trend(
+        self, metrics: list[str], days: int = 30, baseline_days: int = 60
+    ) -> dict[str, Any]:
+        """Daily values of up to ``_MAX_TREND_METRICS`` metrics side by side
+        over the trailing ``days`` (today included), plus per-metric stats:
+        min/max/avg/latest/change over the window, the last-7-day average and
+        how it compares with the trailing ``baseline_days`` average (the
+        athlete's normal level; 0 skips it)."""
+        names = list(dict.fromkeys(m.strip().lower() for m in metrics if m and m.strip()))
+        if not names:
+            raise ValueError("pass at least one metric")
+        if len(names) > _MAX_TREND_METRICS:
+            raise ValueError(f"at most {_MAX_TREND_METRICS} metrics per call")
+        supported = set(self.trend_metrics())
+        unknown = [m for m in names if m not in supported]
+        if unknown:
             raise ValueError(
-                f"unsupported metric '{metric}'. Supported: {', '.join(supported)} "
-                "(or write custom SQL with run_sql)"
+                f"unsupported metric(s): {', '.join(unknown)}. Use a derived metric "
+                f"({', '.join(_DERIVED_TREND_METRICS)}) or a numeric daily_metrics "
+                "column (see table_schema), or write SQL with run_sql"
             )
-        start = (date.today() - timedelta(days=days)).isoformat()
+        days = max(1, min(int(days), 365))
+        baseline_days = max(0, min(int(baseline_days), 365))
+        today = self.today()
+
+        def since(n: int) -> str:
+            return (today - timedelta(days=n - 1)).isoformat()
+
+        window_from, week_from = since(days), since(7)
+        read_from = since(max(days, baseline_days, 7))
+        values: dict[str, dict[str, float]] = {}
+        qualifiers: dict[str, str | None] = {}
+        daily = [m for m in names if m not in _DERIVED_TREND_METRICS]
+        derived = [m for m in names if m in _DERIVED_TREND_METRICS]
         with self._connect() as conn:
-            if m in _DERIVED_TREND_METRICS:
-                rows = conn.execute(
-                    "SELECT calendar_date, value, qualifier FROM derived_metrics "
-                    "WHERE metric = %s AND calendar_date >= %s ORDER BY calendar_date ASC",
-                    (m, start),
-                ).fetchall()
-                series = [
-                    {"date": r["calendar_date"], "value": _jsonable(r["value"]), "qualifier": r["qualifier"]}
-                    for r in rows
-                ]
-            else:
-                # ``m`` is whitelisted above, so interpolating it is safe.
-                rows = conn.execute(
-                    f"SELECT calendar_date, {m} FROM daily_metrics "
-                    f"WHERE calendar_date >= %s AND {m} IS NOT NULL ORDER BY calendar_date ASC",
-                    (start,),
-                ).fetchall()
-                series = [
-                    {"date": r["calendar_date"], "value": _jsonable(r[m])}
-                    for r in rows
-                ]
-        vals = [s["value"] for s in series if isinstance(s.get("value"), (int, float))]
-        summary: dict[str, Any] = {"count": len(series)}
-        if vals:
-            summary["min"] = min(vals)
-            summary["max"] = max(vals)
-            summary["avg"] = round(sum(vals) / len(vals), 2)
-            summary["latest"] = vals[-1]
-            summary["latest_date"] = series[-1]["date"]
+            if daily:
+                # The names are information_schema column names (checked above).
+                cols = ", ".join(f'"{m}"' for m in daily)
+                for r in conn.execute(
+                    f"SELECT calendar_date, {cols} FROM daily_metrics "
+                    "WHERE calendar_date >= %s ORDER BY calendar_date",
+                    (read_from,),
+                ).fetchall():
+                    for m in daily:
+                        if isinstance(v := _jsonable(r[m]), (int, float)):
+                            values.setdefault(r["calendar_date"], {})[m] = v
+            if derived:
+                for r in conn.execute(
+                    "SELECT calendar_date, metric, value, qualifier FROM derived_metrics "
+                    "WHERE metric = ANY(%s) AND calendar_date >= %s ORDER BY calendar_date",
+                    (derived, read_from),
+                ).fetchall():
+                    if isinstance(v := _jsonable(r["value"]), (int, float)):
+                        values.setdefault(r["calendar_date"], {})[r["metric"]] = v
+                        qualifiers[r["metric"]] = r["qualifier"]
+
+        def avg(xs: list[float]) -> float | None:
+            return round(sum(xs) / len(xs), 2) if xs else None
+
+        dates = sorted(d for d in values if d >= window_from)
+        stats: dict[str, Any] = {}
+        for m in names:
+            window = [(d, values[d][m]) for d in dates if m in values[d]]
+            if not window:
+                stats[m] = {"count": 0}
+                continue
+            vals = [v for _, v in window]
+            entry: dict[str, Any] = {
+                "count": len(vals),
+                "latest": vals[-1],
+                "latest_date": window[-1][0],
+                "min": min(vals),
+                "max": max(vals),
+                "avg": avg(vals),
+                "avg_7d": avg([values[d][m] for d in values if d >= week_from and m in values[d]]),
+            }
             if len(vals) >= 2:
-                summary["change_vs_start"] = round(vals[-1] - vals[0], 2)
+                entry["change_vs_start"] = round(vals[-1] - vals[0], 2)
+            if baseline_days:
+                base = avg([values[d][m] for d in values if d >= since(baseline_days) and m in values[d]])
+                entry[f"baseline_avg_{baseline_days}d"] = base
+                if base is not None and entry["avg_7d"] is not None:
+                    entry["avg_7d_vs_baseline"] = round(entry["avg_7d"] - base, 2)
+            if qualifiers.get(m):
+                entry["latest_qualifier"] = qualifiers[m]
+            stats[m] = entry
         return {
-            "metric": m,
-            "days_requested": days,
-            "summary": summary,
-            "series": series,
+            "days": days,
+            "from": window_from,
+            "stats": stats,
+            "series": {
+                "columns": ["date", *names],
+                "rows": [[d, *(values[d].get(m) for m in names)] for d in dates],
+            },
         }
 
     def recent_activities(
@@ -1120,7 +1220,7 @@ class ReadOnlyDB:
             date_end = date.fromisoformat(date_end).isoformat()
         if date_start and date_end and date_start > date_end:
             date_start, date_end = date_end, date_start
-        start = date_start or (date.today() - timedelta(days=days)).isoformat()
+        start = date_start or (self.today() - timedelta(days=days)).isoformat()
         params: list[Any] = [start]
         sql = f"SELECT {_ACTIVITY_COLUMNS} FROM activity_summaries WHERE start_date >= %s "
         if date_end:
@@ -1135,13 +1235,38 @@ class ReadOnlyDB:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [_format_activity(r) for r in rows]
 
+    def _hr_zones(self, conn: Any, activity_type: str | None) -> list[tuple[int, float]]:
+        """``[(zone, lower bpm), ...]`` for the activity's sport (falling back
+        to Garmin's DEFAULT zones), or ``[]`` when none are configured."""
+        kind = (activity_type or "").lower()
+        sport = "RUNNING" if "run" in kind else (
+            "CYCLING" if any(k in kind for k in ("cycl", "bik", "ride")) else "DEFAULT"
+        )
+        rows = {
+            r["sport"]: r for r in conn.execute(
+                "SELECT sport, zone1_min, zone2_min, zone3_min, zone4_min, zone5_min "
+                "FROM hr_zones WHERE sport IN (%s, 'DEFAULT')",
+                (sport,),
+            ).fetchall()
+        }
+        row = rows.get(sport) or rows.get("DEFAULT")
+        if not row:
+            return []
+        return [(z, row[f"zone{z}_min"]) for z in range(1, 6) if row[f"zone{z}_min"] is not None]
+
     def activity_detail(
-        self, activity_id: int | None = None, bucket_s: int = 60
+        self,
+        activity_id: int | None = None,
+        bucket_s: int = 60,
+        from_s: int | None = None,
+        to_s: int | None = None,
     ) -> dict[str, Any]:
-        """One activity in one call: its summary, its laps, and its time series
-        averaged into ``bucket_s``-second buckets of elapsed time (widened so
-        there are at most ``_MAX_BUCKETS``). ``activity_id=None`` is the most
-        recent activity."""
+        """One activity in one call: its summary, time in HR zones, its laps,
+        and its time series averaged into ``bucket_s``-second buckets of
+        elapsed time (widened so there are at most ``_MAX_BUCKETS``).
+        ``activity_id=None`` is the most recent activity. ``from_s``/``to_s``
+        (seconds of elapsed time) narrow the series to one stretch and add a
+        ``window`` summary of it, time in each HR zone included."""
         with self._connect() as conn:
             if activity_id is None:
                 row = conn.execute(
@@ -1157,21 +1282,33 @@ class ReadOnlyDB:
             if row is None:
                 raise ValueError(f"activity {activity_id} not found")
             aid = row["activity_id"]
+            zone_pct = conn.execute(
+                "SELECT " + ", ".join(f"hr_time_zone_{z}_pct AS z{z}" for z in range(1, 6))
+                + " FROM activity_summaries WHERE activity_id = %s",
+                (aid,),
+            ).fetchone()
+            zones = self._hr_zones(conn, row["activity_type"])
             span = conn.execute(
                 "SELECT MAX(elapsed_s) AS span FROM activity_detail_series "
                 "WHERE activity_id = %s",
                 (aid,),
             ).fetchone()["span"] or 0
-            bucket = max(5, int(bucket_s), math.ceil(span / _MAX_BUCKETS))
+            lo = max(0, int(from_s)) if from_s is not None else 0
+            hi = int(to_s) if to_s is not None else int(math.ceil(span))
+            if (from_s is not None or to_s is not None) and hi <= lo:
+                raise ValueError(
+                    f"to_s must be after from_s (the activity spans 0..{span:g} s)"
+                )
+            bucket = max(5, int(bucket_s), math.ceil(max(hi - lo, 0) / _MAX_BUCKETS))
             series = conn.execute(
                 "SELECT FLOOR(elapsed_s / %s) * %s AS t, AVG(heart_rate) AS hr, "
                 "MAX(heart_rate) AS hr_max, AVG(speed_kmh) AS speed_kmh, "
                 "AVG(cadence) AS cadence, AVG(power_w) AS power_w, "
                 "AVG(elevation_m) AS elevation_m, MAX(distance_m) AS distance_m "
                 "FROM activity_detail_series "
-                "WHERE activity_id = %s AND elapsed_s IS NOT NULL "
+                "WHERE activity_id = %s AND elapsed_s BETWEEN %s AND %s "
                 "GROUP BY 1 ORDER BY 1",
-                (bucket, bucket, aid),
+                (bucket, bucket, aid, lo, hi),
             ).fetchall()
             laps = conn.execute(
                 "SELECT split_number, split_type, start_time_s, duration_s, "
@@ -1180,6 +1317,9 @@ class ReadOnlyDB:
                 "WHERE activity_id = %s ORDER BY split_number",
                 (aid,),
             ).fetchall()
+            window = None
+            if from_s is not None or to_s is not None:
+                window = self._window_summary(conn, aid, lo, hi, zones)
         running = _is_running(row["activity_type"])
         points = [
             {
@@ -1197,30 +1337,94 @@ class ReadOnlyDB:
         ]
         # Columnar and without all-NULL metrics: a ~200-row series stays small.
         columns = [c for c in (points[0] if points else {}) if any(p[c] is not None for p in points)]
-        return {
-            "activity": _format_activity(row),
-            "laps": [
+        out: dict[str, Any] = {"activity": _format_activity(row)}
+        if any(zone_pct[f"z{z}"] for z in range(1, 6)):
+            # Garmin's own split of the whole activity, as Connect shows it.
+            minutes = (row["duration_hours"] or 0) * 60
+            bounds = dict(zones)
+            out["hr_zones"] = [
                 {
-                    "lap": lap["split_number"] + 1,
-                    "type": lap["split_type"],
-                    "start": _fmt_duration(lap["start_time_s"]),
-                    "duration": _fmt_duration(lap["duration_s"]),
-                    "km": _round((lap["distance_m"] or 0) / 1000.0, 2) if lap["distance_m"] else None,
-                    "pace": _fmt_pace(lap["pace_sec_per_km"] / 60.0) if running and lap["pace_sec_per_km"] else None,
-                    "avg_hr": _round(lap["avg_hr"]),
-                    "max_hr": _round(lap["max_hr"]),
-                    "cadence": _fmt_cadence(lap["avg_cadence"], running),
-                    "power_w": _round(lap["avg_power"]),
-                    "elevation_gain_m": _round(lap["elevation_gain_m"]),
+                    "zone": f"Z{z}",
+                    **({"from_bpm": _round(bounds[z])} if z in bounds else {}),
+                    "pct": _round(zone_pct[f"z{z}"] or 0, 1),
+                    "min": _round((zone_pct[f"z{z}"] or 0) * minutes / 100, 1),
                 }
-                for lap in laps
-            ],
-            "series": {
-                "bucket_s": bucket,
-                "columns": columns,
-                "rows": [[p[c] for c in columns] for p in points],
-            },
+                for z in range(1, 6)
+            ]
+        if window is not None:
+            out["window"] = window
+        out["laps"] = [
+            {
+                "lap": lap["split_number"] + 1,
+                "type": lap["split_type"],
+                "start": _fmt_duration(lap["start_time_s"]),
+                "duration": _fmt_duration(lap["duration_s"]),
+                "km": _round((lap["distance_m"] or 0) / 1000.0, 2) if lap["distance_m"] else None,
+                "pace": _fmt_pace(lap["pace_sec_per_km"] / 60.0) if running and lap["pace_sec_per_km"] else None,
+                "avg_hr": _round(lap["avg_hr"]),
+                "max_hr": _round(lap["max_hr"]),
+                "cadence": _fmt_cadence(lap["avg_cadence"], running),
+                "power_w": _round(lap["avg_power"]),
+                "elevation_gain_m": _round(lap["elevation_gain_m"]),
+            }
+            for lap in laps
+        ]
+        out["series"] = {
+            "bucket_s": bucket,
+            "columns": columns,
+            "rows": [[p[c] for c in columns] for p in points],
         }
+        return out
+
+    @staticmethod
+    def _window_summary(
+        conn: Any, aid: int, lo: int, hi: int, zones: list[tuple[int, float]],
+    ) -> dict[str, Any]:
+        """Totals and averages of the samples in ``[lo, hi]`` seconds, with
+        minutes per HR zone (each sample weighted by the gap to the next one,
+        capped so a pause doesn't count as time in a zone)."""
+        zone_sql, params = "", []
+        for i, (z, lower) in enumerate(zones):
+            upper = zones[i + 1][1] if i + 1 < len(zones) else None
+            cond = "heart_rate >= %s" + (" AND heart_rate < %s" if upper is not None else "")
+            params += [lower] + ([upper] if upper is not None else [])
+            zone_sql += f", SUM(dt) FILTER (WHERE {cond}) AS z{z}"
+        if zones:
+            zone_sql += ", SUM(dt) FILTER (WHERE heart_rate < %s) AS z0"
+            params.append(zones[0][1])
+        r = conn.execute(
+            "WITH s AS (SELECT elapsed_s, heart_rate, cadence, power_w, distance_m, "
+            "LEAST(LEAD(elapsed_s) OVER (ORDER BY elapsed_s) - elapsed_s, 10) AS dt "
+            "FROM activity_detail_series WHERE activity_id = %s AND elapsed_s IS NOT NULL) "
+            "SELECT MIN(elapsed_s) AS lo, MAX(elapsed_s) AS hi, "
+            "MAX(distance_m) - MIN(distance_m) AS dist_m, AVG(heart_rate) AS hr, "
+            "MAX(heart_rate) AS hr_max, AVG(NULLIF(cadence, 0)) AS cadence, "
+            "AVG(power_w) AS power_w"
+            + zone_sql
+            + " FROM s WHERE elapsed_s BETWEEN %s AND %s",
+            (aid, *params, lo, hi),
+        ).fetchone()
+        if r["lo"] is None:
+            return {"from": _fmt_duration(lo), "to": _fmt_duration(hi), "samples": 0}
+        seconds = float(r["hi"] - r["lo"])
+        km = (r["dist_m"] or 0) / 1000.0
+        out: dict[str, Any] = {
+            "from": _fmt_duration(r["lo"]),
+            "to": _fmt_duration(r["hi"]),
+            "duration": _fmt_duration(seconds),
+            "km": _round(km, 2) if km else None,
+            "pace": _fmt_pace(seconds / 60.0 / km) if km else None,
+            "avg_hr": _round(r["hr"]),
+            "max_hr": _round(r["hr_max"]),
+            "cadence_per_leg": _round(r["cadence"]),
+            "power_w": _round(r["power_w"]),
+        }
+        if zones:
+            out["hr_zone_min"] = {
+                ("below Z1" if z == 0 else f"Z{z}"): _round((r[f"z{z}"] or 0) / 60.0, 1)
+                for z in (0, *(z for z, _ in zones))
+            }
+        return out
 
 
     def run_sql(self, sql: str) -> dict[str, Any]:
@@ -1262,7 +1466,8 @@ class ReadOnlyDB:
             try:
                 cur.execute(statement)
             except psycopg.Error as exc:
-                raise QueryError(f"{exc} | statement: {statement!r}") from exc
+                # Not echoing the statement: the model has it in its own call.
+                raise QueryError(str(exc).strip()) from exc
             columns = [d[0] for d in (cur.description or [])]
             rows = cur.fetchmany(_MAX_ROWS + 1)
         truncated = len(rows) > _MAX_ROWS
@@ -1282,7 +1487,12 @@ class ReadOnlyDB:
 
 
 class Weather:
-    """Stateless Open-Meteo access (archive + short forecast).
+    """Stateless Open-Meteo access (forecast endpoint + historical archive).
+
+    The forecast endpoint also serves the last ``PAST_DAYS`` days, so any range
+    from three months back to ``FORECAST_DAYS`` ahead is one request, today
+    included; only older ranges go to the archive (which also lags a few days
+    behind, so recent days come back empty there).
 
     Every call is one small HTTP request; nothing is cached or stored here, so
     the agent's ``weather`` tool can never be a source of truth — only context
@@ -1294,6 +1504,7 @@ class Weather:
     ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
     FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
     MAX_DAYS = 92
+    PAST_DAYS = 92
     FORECAST_DAYS = 16
     _DAILY_FIELDS = (
         "temperature_2m_max,temperature_2m_min,precipitation_sum,"
@@ -1345,18 +1556,21 @@ class Weather:
         date_end: str | None = None,
         lat: float | None = None,
         lon: float | None = None,
+        today: date | None = None,
     ) -> dict[str, Any]:
         """Return per-day weather for ``date_start``..``date_end`` (inclusive).
 
-        A range fully before today uses the historical archive; a range
-        starting today or later is the forecast (up to ``FORECAST_DAYS`` days
-        ahead). With no dates the forecast from today onward is returned. Raises
-        ``ValueError`` with a model-facing message on invalid input.
+        Up to ``PAST_DAYS`` back and ``FORECAST_DAYS`` ahead comes from the
+        forecast endpoint (one request, a range may span today); older ranges
+        from the historical archive. With no dates the forecast from today
+        onward is returned. Raises
+        ``ValueError`` with a model-facing message on invalid input. ``today``
+        is the user's date (default: the machine's).
         """
         import httpx
 
         lat, lon = self._resolve(lat, lon)
-        today = date.today()
+        today = today or date.today()
         if date_start is None and date_end is None:
             start = today
             end = today + timedelta(days=self.FORECAST_DAYS - 1)
@@ -1381,25 +1595,26 @@ class Weather:
             "daily": self._DAILY_FIELDS,
             "timezone": "auto",
         }
-        if end < today:
+        forecast_end = today + timedelta(days=self.FORECAST_DAYS - 1)
+        if end > forecast_end:
+            raise ValueError(
+                f"the forecast only covers up to {forecast_end.isoformat()} "
+                f"({self.FORECAST_DAYS} days)"
+            )
+        if start >= today - timedelta(days=self.PAST_DAYS):
+            url = self.FORECAST_URL
+            # past/forecast_days are exclusive with start/end dates, so ask for
+            # the span around today and trim to the range below.
+            params["past_days"] = max(0, (today - start).days)
+            params["forecast_days"] = max(1, (end - today).days + 1)
+        elif end < today:
             url = self.ARCHIVE_URL
             params["start_date"] = start.isoformat()
             params["end_date"] = end.isoformat()
-        elif start >= today:
-            url = self.FORECAST_URL
-            forecast_end = today + timedelta(days=self.FORECAST_DAYS - 1)
-            if end > forecast_end:
-                raise ValueError(
-                    f"the forecast only covers up to {forecast_end.isoformat()} "
-                    f"({self.FORECAST_DAYS} days)"
-                )
-            # ``forecast_days`` is mutually exclusive with start/end dates, so
-            # request from today and trim to the range below.
-            params["forecast_days"] = (end - today).days + 1
         else:
             raise ValueError(
-                "the range crosses today: pick range wholly before today "
-                "(history) or wholly today-and-later (forecast)"
+                f"a range starting over {self.PAST_DAYS} days ago must end "
+                "before today; split it at today"
             )
         try:
             resp = httpx.get(url, params=params, timeout=15.0, follow_redirects=True)
@@ -1416,7 +1631,7 @@ class Weather:
                     row[alias] = series[i] if i < len(series) else None
                 days.append(row)
         return {
-            "source": "forecast" if url == self.FORECAST_URL else "historical",
+            "source": "historical" if url == self.ARCHIVE_URL else "forecast",
             "location": {"lat": lat, "lon": lon},
             "days": days,
             "note": (
@@ -1532,6 +1747,62 @@ def _column_descriptions(db: ReadOnlyDB, table: str) -> list[dict[str, str]]:
     return out
 
 
+#: The prompt's common columns per table, each with an optional short hint.
+#: Rendered against the live schema (``_common_columns_text``), so a column
+#: that is hidden for the account or doesn't exist yet is never advertised —
+#: the model otherwise writes SQL against names it was told exist.
+_COMMON_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "daily_metrics": (
+        ("calendar_date", ""), ("resting_hr", "bpm"),
+        ("hrv_last_night_avg", "ms"), ("sleep_score", "0-100"),
+        ("sleep_time_hours", ""), ("vo2max", ""), ("total_steps", ""),
+        ("total_distance_m", "METRES"), ("body_battery_highest", ""),
+        ("body_battery_lowest", ""), ("avg_stress", ""), ("weight_kg", ""),
+    ),
+    "activity_summaries": (
+        ("activity_id", ""), ("activity_name", ""),
+        ("activity_type", "running, cycling, ..."), ("start_date", ""),
+        ("duration_hours", ""), ("distance_km", "KM"), ("avg_hr", ""),
+        ("max_hr", ""), ("pace_min_km", "decimal min/km; 5.5 = 5:30"),
+        ("avg_cadence", "PER LEG"), ("avg_power_w", ""), ("training_load", ""),
+        ("elevation_gain_m", ""), ("weather_temp_c", ""),
+    ),
+    "activity_splits": (
+        ("activity_id", ""), ("split_number", "0-based"), ("split_type", ""),
+        ("distance_m", "METRES"), ("duration_s", "SECONDS"),
+        ("pace_sec_per_km", "seconds/km"), ("avg_hr", ""), ("avg_power", "W"),
+        ("avg_cadence", "PER LEG"), ("elevation_gain_m", ""),
+    ),
+    "derived_metrics": (
+        ("calendar_date", ""),
+        ("metric", "a NAME such as 'run_acwr' — no per-metric columns"),
+        ("value", ""), ("qualifier", ""),
+    ),
+    "weather_forecast": (
+        ("calendar_date", ""), ("temp_max_c", ""), ("temp_min_c", ""),
+        ("precip_mm", ""), ("wind_max_kmh", ""), ("condition_code", ""),
+    ),
+}
+
+
+def _common_columns_text(db: ReadOnlyDB) -> str:
+    """The prompt's common-column bullets, limited to columns that exist and
+    are visible for this account."""
+    lines: list[str] = []
+    tables = set(db.tables())
+    for table, cols in _COMMON_COLUMNS.items():
+        if table not in tables:
+            continue
+        live = {c["name"] for c in db.columns(table)}
+        names = [
+            f"`{name}` ({hint})" if hint else f"`{name}`"
+            for name, hint in cols if name in live
+        ]
+        if names:
+            lines.append(f"- **{table}**: " + ", ".join(names))
+    return "\n".join(lines)
+
+
 def _schema_text(db: ReadOnlyDB) -> str:
     """The agent-facing *table overview*: one ``_TABLE_NOTES`` line per table.
 
@@ -1544,11 +1815,14 @@ def _schema_text(db: ReadOnlyDB) -> str:
     ) or "(no tables available in the database)"
 
 
-def _render_system_prompt(overview: str, *, has_training: bool) -> str:
+def _render_system_prompt(
+    overview: str, *, common: str = "", has_training: bool
+) -> str:
     """Fill the static instructions for the tools this agent actually has, so
     the prompt never advertises a tool the model cannot call."""
     return _PROMPT_TEMPLATE.format(
         overview=overview,
+        common=common,
         training=_TRAINING_BULLET if has_training else "",
     ).strip()
 
@@ -1556,7 +1830,7 @@ def _render_system_prompt(overview: str, *, has_training: bool) -> str:
 def _date_prompt(db: ReadOnlyDB) -> str:
     """Today's date (with weekday, which models otherwise miscompute), the
     stored data span and, when the data lags today, a staleness warning."""
-    today = date.today()
+    today = db.today()
     first, last = db.data_span()
     span = f"{first}..{last}" if first and last else "nothing yet (no data synced)"
     text = _DATE_PROMPT.format(today=today.strftime("%Y-%m-%d (%A)"), span=span)
@@ -1652,6 +1926,34 @@ def _tool_error(exc: BaseException) -> str:
     return msg if msg.startswith("ERROR: ") else f"ERROR: {msg}"
 
 
+#: Most characters of JSON one ``run_sql`` result may put in the context
+#: (~7.5k tokens); 500 wide rows would otherwise flood a single turn.
+_MAX_RESULT_CHARS = 30_000
+
+
+def _fit_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Cut a ``run_sql`` result's rows to fit ``_MAX_RESULT_CHARS``, saying so.
+
+    Only for what the model reads: the chart tool needs every row.
+    """
+    size = len(json.dumps(result, ensure_ascii=False))
+    rows = result["rows"]
+    if size <= _MAX_RESULT_CHARS or not rows:
+        return result
+    keep = max(1, len(rows) * _MAX_RESULT_CHARS // size)
+    while keep > 1 and len(json.dumps(rows[:keep], ensure_ascii=False)) > _MAX_RESULT_CHARS:
+        keep = max(1, keep * 9 // 10)
+    return {
+        **result,
+        "rows": rows[:keep],
+        "truncated": True,
+        "note": (
+            f"cut to the first {keep} of {len(rows)} rows to fit the output "
+            "limit — aggregate, select fewer columns or narrow the range"
+        ),
+    }
+
+
 def _register_tools(
     agent: Any,
     db: ReadOnlyDB,
@@ -1662,12 +1964,22 @@ def _register_tools(
     charts: dict[str, Any] | None,
     on_status: Callable[[str], None] | None,
 ) -> None:
-    """Register every agent tool. Only ``memory`` and ``training`` write, each
+    """Register every agent tool. Only ``memory`` and ``training_apply`` write, each
     through its own app store — never through the read-only connection."""
+
+    async def compact(ctx: RunContext[None], tool_def: Any) -> Any:
+        """Send the tool's schema without pydantic's optional-field noise."""
+        from dataclasses import replace
+
+        return replace(
+            tool_def, parameters_json_schema=compact_schema(tool_def.parameters_json_schema)
+        )
 
     def tool(status: str, **options: Any) -> Callable[[Callable[..., Any]], Any]:
         """Register ``fn`` as a plain tool that reports ``status``, returns a
-        dict/list as JSON and turns an expected failure into ``ERROR: ...``."""
+        dict/list as JSON and turns an expected failure into ``ERROR: ...``.
+        Typed arguments that fail validation go back to the model as a retry
+        (``retries`` per tool, as pydantic-ai counts them)."""
 
         def register(fn: Callable[..., Any]) -> Any:
             @functools.wraps(fn)
@@ -1680,24 +1992,35 @@ def _register_tools(
                     return _tool_error(exc)
                 return out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
 
-            return agent.tool_plain(**options)(wrapper)
+            return agent.tool_plain(prepare=compact, **options)(wrapper)
 
         return register
 
     @tool("Inspecting table schema…")
-    def table_schema(table: str) -> Any:
-        """Return a table's live columns (name, type, description each).
+    def table_schema(tables: Annotated[list[str], AsList]) -> Any:
+        """Return the live columns (name, type, description each) of one or
+        more tables, keyed by table.
 
         Call this before querying a column that is not in the prompt's common
         column list. Columns are read live, so newly-added ones appear.
+
+        Args:
+            tables: table names, e.g. ["activity_splits", "hr_zones"].
         """
-        return _column_descriptions(db, table)
+        out: dict[str, Any] = {}
+        for table in dict.fromkeys(t.strip() for t in tables if t.strip()):
+            try:
+                out[table] = _column_descriptions(db, table)
+            except ValueError as exc:
+                out[table] = _tool_error(exc)
+        return out
 
     @tool("Running database query…")
     def run_sql(sql: str) -> Any:
         """Run one read-only SQL query (SELECT / WITH / EXPLAIN only) and return
-        its columns and rows as JSON. Results are capped at 500 rows."""
-        return db.run_sql(sql)
+        its columns and rows as JSON. Results are capped at 500 rows (and at
+        an output size limit: aggregate or pick fewer columns when cut)."""
+        return _fit_result(db.run_sql(sql))
 
     @tool("Fetching day summary…")
     def get_day_summary(calendar_date: str) -> Any:
@@ -1707,16 +2030,23 @@ def _register_tools(
         return db.day_summary(calendar_date)
 
     @tool(
-        "Analyzing metric trend…",
+        "Analyzing metric trends…",
         description=(
-            "Return the daily values plus min/max/avg/latest/change for one core "
-            "metric over the trailing `days` (default 30, max 365). Metrics: "
-            + ", ".join(db.trend_metrics())
-            + ". Use it instead of SQL for trends or averages of these metrics."
+            f"Return up to {_MAX_TREND_METRICS} metrics side by side, one row per "
+            "day over the trailing `days` (default 30, max 365), plus per-metric "
+            "stats: latest, min/max/avg, change over the window, the last-7-day "
+            "average and its difference from the trailing `baseline_days` "
+            "average (default 60 — the athlete's normal level; 0 skips it). Use "
+            "it for trends and for readiness (sleep, HRV, resting HR, stress, "
+            "load vs normal) instead of SQL. Metrics: "
+            + ", ".join(db.suggested_trend_metrics())
+            + ", or any other numeric daily_metrics column."
         ),
     )
-    def get_metric_trend(metric: str, days: int = 30) -> Any:
-        return db.metric_trend(metric, days)
+    def get_metric_trend(
+        metrics: Annotated[list[str], AsList], days: int = 30, baseline_days: int = 60
+    ) -> Any:
+        return db.metric_trend(metrics, days, baseline_days)
 
     @tool("Retrieving recent activities…")
     def get_recent_activities(
@@ -1737,46 +2067,58 @@ def _register_tools(
         return db.recent_activities(sport, days, limit, date_start, date_end)
 
     @tool("Analyzing the session…")
-    def get_activity_detail(activity_id: int | None = None, bucket_s: int = 60) -> Any:
-        """Return one activity in full: its summary, its laps (auto-laps or
-        manual lap presses, with pace/HR/cadence/power each) and its time
-        series averaged into ``bucket_s``-second buckets of elapsed time
-        (default 60; widened to at most 200 buckets). Omit ``activity_id`` for
-        the most recent activity. Use it for any question about how a single
-        session went — intervals, pacing, HR drift, fade — and use a smaller
-        ``bucket_s`` (e.g. 15) to resolve short efforts.
-        """
-        return db.activity_detail(activity_id, bucket_s)
+    def get_activity_detail(
+        activity_id: int | None = None,
+        bucket_s: int = 60,
+        from_s: int | None = None,
+        to_s: int | None = None,
+    ) -> Any:
+        """Return one activity in full: its summary, Garmin's time in each HR
+        zone (with the zone's lower bpm), its laps (auto-laps or manual lap
+        presses, with pace/HR/cadence/power each) and its time series averaged
+        into buckets of elapsed time. Use it for any question about how a
+        single session went — intervals, pacing, HR drift, fade, zones — before
+        reaching for activity_detail_series in SQL.
 
-    @tool("Validating chart…")
-    def chart(spec: str) -> Any:
-        """Validate a chart spec and return it ready to embed.
-
-        ``spec`` is a JSON object describing a Plotly figure:
-          {
-            "sql": "SELECT ...",             # read-only; returns the data
-            "traces": [{
-              "type": "line",                # line|scatter|area|bar|pie|histogram|box,
-                                             # or "go": any plotly.graph_objects class
-                                             # (Scattergl, Violin, Heatmap, ...)
-              "x": "<result column>",        # x / y / z name result columns
-              "y": "<numeric result column>",
-              "marker": {"color": "red"}     # any other key goes to the Plotly trace
-            }],
-            "layout": {"title": {"text": "..."}}   # optional Plotly layout
-          }
-        Any other trace argument can take column data as {"column": "<name>"}
-        (e.g. pie labels/values). Aggregate to at most ~200 points. The query is
-        run and the figure built to check the spec; on success the reply is
-        ``OK: <spec>`` — embed that spec verbatim in <chart> ... </chart>. The
-        data itself is never returned; the UI reruns the query to draw it.
+        Args:
+            activity_id: the activity; omit for the most recent one.
+            bucket_s: series bucket in seconds (default 60, widened to at most
+                200 buckets); smaller (e.g. 15) resolves short efforts.
+            from_s: start of a stretch to analyse, in seconds of elapsed time.
+                With from_s and/or to_s the series covers only that stretch and
+                a `window` summary is added (duration, km, pace, HR, cadence,
+                power, minutes per HR zone) — e.g. from_s=120, to_s=1800 for
+                minutes 2-30.
+            to_s: end of that stretch (default the end of the activity).
         """
-        try:
-            parsed = json.loads(spec)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"spec is not valid JSON: {exc}") from exc
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("sql"), str):
-            raise ValueError("spec must be a JSON object with a string 'sql' key")
+        return db.activity_detail(activity_id, bucket_s, from_s, to_s)
+
+    @tool("Validating chart…", retries=3)
+    def chart(
+        sql: str,
+        traces: Annotated[list[ChartTrace], Loose],
+        layout: Annotated[dict[str, Any] | None, Loose] = None,
+    ) -> Any:
+        """Validate a chart and return its spec ready to embed.
+
+        The query is run and the Plotly figure built to check it; on success
+        the reply is ``OK: <spec>`` — embed that spec verbatim in
+        <chart> ... </chart>. The data itself is never returned; the UI reruns
+        the query to draw it. Aggregate to at most ~200 points.
+
+        Args:
+            sql: read-only query returning the data.
+            traces: one entry per trace, naming result columns in x / y / z.
+                Any other Plotly trace argument can take column data as
+                {"column": "<name>"} (e.g. pie labels/values).
+            layout: optional Plotly layout, e.g. {"title": {"text": "..."}}.
+        """
+        parsed: dict[str, Any] = {
+            "sql": sql,
+            "traces": [t.model_dump(exclude_none=True) for t in traces],
+        }
+        if layout:
+            parsed["layout"] = layout
         result = db.run_sql(parsed["sql"])
         if result["truncated"]:
             raise ValueError(
@@ -1805,13 +2147,13 @@ def _register_tools(
             """Return daily Open-Meteo weather (min/max degC, precip mm, max wind
             km/h, WMO condition code).
 
-            ``date_start``/``date_end`` are inclusive YYYY-MM-DD bounds: a range
-            wholly before today is observed history, one from today on is the
-            forecast (up to 16 days); with neither, the forecast from today.
-            Coordinates default to the athlete's home; override with both
-            ``lat`` and ``lon``. Context only — never the source of an answer.
+            ``date_start``/``date_end`` are inclusive YYYY-MM-DD bounds, any
+            range up to 92 days long from the past to 16 days ahead (it may
+            span today); with neither, the forecast from today. Coordinates
+            default to the athlete's home; override with both ``lat`` and
+            ``lon``. Context only — never the source of an answer.
             """
-            return weather.query(date_start, date_end, lat, lon)
+            return weather.query(date_start, date_end, lat, lon, today=db.today())
 
 
     if memory is not None:
@@ -1863,109 +2205,13 @@ def _register_tools(
             return reply + _memory_fullness(total, memory.max_facts)
 
     if training is not None:
+        # Imported here: ``server`` imports this module, so it cannot be
+        # imported at load time (see ``training_tools``).
+        from .server.state.training_tools import training_tools
 
-        @tool("Consulting the training season…", name="training")
-        def training_tool(
-            action: str = "get",
-            spec: str | None = None,
-            day: str | None = None,
-            weeks: int = 1,
-            date_start: str | None = None,
-            date_end: str | None = None,
-            goal_id: int | None = None,
-            full: bool = False,
-            detail: bool = False,
-        ) -> Any:
-            """Read or edit the training season: goals -> periodized blocks ->
-            weekly targets -> dated workouts.
-
-            ``action="get"`` (default) returns an agenda for ``day`` (default
-            today): each goal with the blocks overlapping the window, plus a
-            ``weeks`` list with one entry per calendar week (Mon..Sun) holding
-            that week's per-goal ``targets`` (week target and planned/actual
-            ``coverage``), ``planned`` workouts and ``actual`` activities. The
-            window is ``weeks`` weeks from Monday of ``day``'s week, or an
-            explicit ``date_start``/``date_end``. ``goal_id`` focuses one goal;
-            ``detail=true`` keeps full workout descriptions; ``full=true`` adds
-            every block/week of each goal plus the resolved current block (use
-            it before a season-wide reshape). ``can_undo`` says whether the last
-            destructive edit can be rolled back. ``warnings`` lists runs in the
-            current and next week whose distance disagrees with what their
-            steps estimate: when present, tell the user and offer to fix them —
-            don't edit the plan unasked. Later weeks aren't checked (the
-            estimate uses today's paces, which improve with fitness).
-
-            ``action="apply"`` makes one ATOMIC edit (all or nothing). ``spec``
-            is JSON with a ``"workouts"`` and/or an ``"anchor"`` section, or
-            ``{"undo": true}`` to roll back the last destructive edit. The
-            result lists the changed ids plus ``weeks``: each touched week's
-            target, ``scheduled`` volume and ``delta`` — so no follow-up read is
-            needed. Before answering, fix every ``warnings`` entry (a run this
-            week or next whose distance disagrees with what its steps estimate;
-            later weeks are only checked once they come within range) and bring
-            every ``delta`` near 0 by adjusting workouts (never do the week sums
-            yourself).
-
-            ``duration_min`` is computed from the steps' total time — never
-            send it. A run's ``distance_km`` is yours to set, but it is checked
-            against its steps (time / pace; a step with an HR zone uses the
-            learned pace for that zone, listed in the agenda's ``zone_paces``):
-            a mismatch over 10% comes back as a warning. Omit it to have the
-            steps' estimate filled in.
-
-            "workouts": a list of entries. An entry with ``id`` is PATCHED (send
-            only what changes); one without creates. ``delete_ids`` deletes. To
-            move or copy workouts, read them first — never guess ids. Fields:
-            planned_date, activity_type (run/cycle/swim/strength/rest/other),
-            title, description (ONE short line, <= ~200 chars, about THIS
-            session), distance_km, intensity
-            (easy/moderate/hard/race_pace), target_pace_min_km (decimal min/km,
-            5.5 = 5:30), target_hr_zone, target_power_w, status
-            (planned/completed/partial/skipped), optional goal_id override
-            (workouts attach to the active block/goal by date). ``steps`` is
-            REQUIRED on every new workout except rest days (at least one; a
-            single steady step for a plain run): an ordered list of {kind
-            (warmup/steady/work/recovery/cooldown/rest), duration
-            ('15m'/'90s'/'1:30'), repeat?, label? (1-2 words, never digits or
-            times), intensity?, target_pace_min_km?, target_hr_zone?,
-            target_power_w?}. Every non-rest step of a RUN needs a
-            target_pace_min_km or a target_hr_zone ('Z2', 'Z1-Z2'): pace for
-            reps/race pace, HR zone for easy/steady running.
-
-            "anchor": ``goal_id`` patches that goal (omit to create one; a
-            blocks-only spec targets the sole goal); fields title, sport
-            (run/cycle/swim/strength/rest/other), start_date, target_date,
-            target_time, target_distance_km. ``blocks`` upserts blocks (with
-            ``id`` patches, without creates): name, focus, optional
-            start_date/end_date, target_weekly_km (baseline for weeks without
-            their own target — set it when weeks vary), and optional ``weeks``:
-            a per-week patch keyed by ``week_start`` — {week_start, distance_km,
-            duration_min, is_deload} writes only that week, a bare {week_start}
-            removes that week's target, ``weeks: []`` clears them all. Mark
-            recovery weeks ``is_deload: true``. ``delete_blocks`` /
-            ``delete_goal_ids`` delete (restorable with undo).
-
-            Titles, descriptions, step labels and block name/focus describe
-            that row only — never rules, preferences or reminders (durable
-            guidance belongs in ``memory``). Derive target paces/zones from
-            recent data (volume, HR zones, race predictions, VO2max). When the
-            user sets a new target, reshape the anchor AND re-derive the
-            near-term workouts in the same ``apply``.
-            """
-            if action == "apply":
-                if spec is None:
-                    raise ValueError("action 'apply' needs a 'spec' JSON string")
-                try:
-                    parsed = json.loads(spec)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"spec is not valid JSON: {exc}") from exc
-                return training.apply(parsed)
-            if action != "get":
-                raise ValueError("action must be 'get' or 'apply'")
-            return training.agenda(
-                day=day, weeks=weeks, date_start=date_start, date_end=date_end,
-                goal_id=goal_id, full=full, detail=detail,
-            )
+        read, apply = training_tools(training)
+        tool("Consulting the training season…", name="training")(read)
+        tool("Updating the training plan…", name="training_apply", retries=3)(apply)
 
 
 def build_agent(
@@ -1990,7 +2236,7 @@ def build_agent(
     selects ``openai`` (default, any OpenAI-compatible ``base_url``) or
     ``gemini``. ``memory`` adds the ``memory`` tool and injects the stored
     facts; ``principles`` injects the athlete's training principles (read-only);
-    ``training`` adds the ``training`` tool. ``charts`` is a per-request dict
+    ``training`` adds the ``training`` / ``training_apply`` tools. ``charts`` is a per-request dict
     the ``chart`` tool fills with ``{sql: plotly figure dict}`` so the caller
     can ship each validated figure with the answer.
     """
@@ -2010,7 +2256,9 @@ def build_agent(
     agent = Agent(
         model,
         instructions=_render_system_prompt(
-            _schema_text(db), has_training=training is not None
+            _schema_text(db),
+            common=_common_columns_text(db),
+            has_training=training is not None,
         ),
     )
     agent.instructions(lambda: _date_prompt(db))
@@ -2091,23 +2339,27 @@ def _build_agent(
     )
 
 
-def _load_excluded_types(db_url: str, user_id: int) -> str:
-    """The account's disabled data types (comma list) from the users table.
+def _load_account(db_url: str, user_id: int) -> tuple[str, timedelta | None]:
+    """The account's disabled data types (comma list) and UTC offset.
 
-    Reads as the writer role (``db_url``), which can SELECT ``users``; the
-    read-only agent role cannot. Returns '' when there is no DSN, no row, or a
-    query fails — the agent then simply sees every column.
+    Reads as the writer role (``db_url``), which can SELECT ``users`` and the
+    raw payloads the offset comes from; the read-only agent role cannot.
+    Returns ``("", None)`` when there is no DSN, no row, or a query fails — the
+    agent then simply sees every column and the machine's date.
     """
     if not db_url:
-        return ""
+        return "", None
+    from .fetcher import conn_utc_offset
+
     try:
         with psycopg.connect(db_url) as conn:
             row = conn.execute(
                 "SELECT excluded_data_types FROM users WHERE id = %s", (user_id,)
             ).fetchone()
-            return (row[0] or "") if row else ""
+            conn.execute("SELECT set_config('app.user_id', %s, true)", (str(user_id),))
+            return ((row[0] or "") if row else ""), conn_utc_offset(conn)
     except psycopg.Error:
-        return ""
+        return "", None
 
 
 def _open_readonly(cfg: dict[str, Any]) -> ReadOnlyDB:
@@ -2119,8 +2371,8 @@ def _open_readonly(cfg: dict[str, Any]) -> ReadOnlyDB:
             "Postgres is the only supported backend"
         )
     user_id = cfg.get("local_user_id") or 1
-    excluded = _load_excluded_types(cfg.get("db_url", ""), user_id)
-    return ReadOnlyDB(url, user_id=user_id, excluded_types=excluded)
+    excluded, offset = _load_account(cfg.get("db_url", ""), user_id)
+    return ReadOnlyDB(url, user_id=user_id, excluded_types=excluded, utc_offset=offset)
 
 
 def _result_usage(result: Any) -> Any:
@@ -2260,23 +2512,63 @@ def _messages_token_estimate(messages: Iterable[Any]) -> int:
 _PRUNE_OVER_CHARS = 350
 _PRUNED_CHARS = 250
 
+#: Rough token budget (see ``_messages_token_estimate``) for the stored
+#: conversation. Every model request re-sends it, so past this the oldest
+#: whole turns are dropped.
+_HISTORY_TOKEN_BUDGET = 30_000
+
+
+def _trim_to_budget(messages: list[Any], budget: int) -> list[Any]:
+    """Drop the oldest whole turns until ``messages`` fits ``budget`` tokens.
+
+    A turn starts at a request carrying the user's prompt, so the kept history
+    still opens with a user message and never splits a tool call from its
+    result. The newest turn is always kept, even when it alone is over budget.
+    """
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    starts = [
+        i for i, msg in enumerate(messages)
+        if isinstance(msg, ModelRequest)
+        and any(isinstance(p, UserPromptPart) for p in msg.parts)
+    ]
+    if not starts:
+        return messages
+    sizes = [_messages_token_estimate([msg]) for msg in messages]
+    tail = sum(sizes[starts[-1]:])
+    keep_from = starts[-1]
+    for start, nxt in zip(reversed(starts[:-1]), reversed(starts[1:])):
+        tail += sum(sizes[start:nxt])
+        if tail > budget:
+            break
+        keep_from = start
+    return messages[keep_from:] if keep_from else messages
+
 
 def _prune_session_messages(messages: list[Any]) -> list[Any]:
-    """Cut bulky tool results (SQL rows, schemas, agendas) in stored history.
+    """Slim the stored history that every later model request re-sends.
 
-    User prompts, assistant text and tool-call identities are kept intact; only
-    a long ``ToolReturnPart`` is replaced by its head plus a marker, so resumed
-    sessions stay light. The model re-queries when it needs the data again.
+    User prompts, assistant text and tool-call identities are kept intact; a
+    long ``ToolReturnPart`` (SQL rows, schemas, agendas) is replaced by its
+    head plus a marker, so resumed sessions stay light. The model re-queries
+    when it needs the data again.
 
-    A tool call the model wrote out as text is cut from assistant replies too
-    (see ``strip_leaked_tool_call``): left in the history it would be shown
-    again on reload and would teach the model to repeat the mistake.
+    The model's reasoning (``ThinkingPart``) is dropped: it only matters while
+    its own turn is still calling tools, yet pydantic-ai would send every past
+    turn's reasoning back to the provider on every request — most of the
+    history's tokens. A tool call the model wrote out as text is cut from
+    assistant replies too (see ``strip_leaked_tool_call``): left in the history
+    it would be shown again on reload and would teach the model to repeat the
+    mistake. Finally the oldest turns go once the whole is over
+    ``_HISTORY_TOKEN_BUDGET``.
 
     Idempotent, so it is also applied to a stored session when it is loaded.
     """
     from dataclasses import replace
 
-    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolReturnPart
+    from pydantic_ai.messages import (
+        ModelRequest, ModelResponse, TextPart, ThinkingPart, ToolReturnPart,
+    )
 
     def prune(part: Any) -> Any:
         if not isinstance(part, ToolReturnPart):
@@ -2296,12 +2588,16 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
         if isinstance(msg, ModelRequest):
             return replace(msg, parts=[prune(p) for p in msg.parts])
         if isinstance(msg, ModelResponse):
-            parts = [unleak(p) for p in msg.parts]
-            if any(new is not old for new, old in zip(parts, msg.parts)):
+            parts = [unleak(p) for p in msg.parts if not isinstance(p, ThinkingPart)]
+            if len(parts) != len(msg.parts) or any(
+                new is not old for new, old in zip(parts, msg.parts)
+            ):
                 return replace(msg, parts=parts)
         return msg
 
-    return [clean_message(msg) for msg in messages]
+    return _trim_to_budget(
+        [clean_message(msg) for msg in messages], _HISTORY_TOKEN_BUDGET
+    )
 
 
 def _open_state(cfg: dict[str, str]) -> tuple[ReadOnlyDB, Any, Any, int]:
@@ -2324,7 +2620,7 @@ def _cli_agent(cfg: dict[str, str], db: ReadOnlyDB, state: Any, training: Any, u
         db,
         memory=PgMemory(state, user_id),
         principles=PgPrinciples(state, user_id),
-        training=TrainingSeason(training, user_id),
+        training=TrainingSeason(training, user_id, today=db.today),
     )
 
 

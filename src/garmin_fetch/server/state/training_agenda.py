@@ -94,12 +94,11 @@ def _window(
     day: str, weeks: int | None, date_start: str | None, date_end: str | None
 ) -> tuple[str, str]:
     """The inclusive agenda window: an explicit range, or ``weeks`` calendar
-    weeks from Monday of ``day``'s week."""
+    weeks from Monday of ``day``'s week. A range wins over ``weeks`` — the
+    model routinely sends both, and the range is the more specific ask."""
     if (date_start is None) != (date_end is None):
         raise ValueError("pass both date_start and date_end, or neither")
     if date_start is not None:
-        if weeks not in (None, 1):
-            raise ValueError("pass either 'weeks' or a date_start/date_end range, not both")
         lo, hi = sorted((date.fromisoformat(date_start), date.fromisoformat(date_end)))
         return lo.isoformat(), hi.isoformat()
     span = max(1, min(int(weeks or 1), _MAX_WEEKS))
@@ -152,11 +151,15 @@ def build_agenda(
     goal_id: int | None = None,
     full: bool = False,
     detail: bool = False,
+    today: date | None = None,
 ) -> dict[str, Any]:
     """The windowed season agenda for one user (see the agent's ``training``
-    tool). ``store`` is a ``TrainingStore``. Raises ``ValueError`` on bad input."""
+    tool). ``store`` is a ``TrainingStore``; ``today`` is the user's date
+    (default: the machine's), the default ``day`` and the start of the
+    warnings window. Raises ``ValueError`` on bad input."""
     anchor, workouts_store = store.anchor, store.workouts
-    day = date.fromisoformat(day).isoformat() if day else date.today().isoformat()
+    today = today or date.today()
+    day = date.fromisoformat(day).isoformat() if day else today.isoformat()
     win_start, win_end = _window(day, weeks, date_start, date_end)
 
     goals = anchor.list_goals(user_id)
@@ -201,19 +204,19 @@ def build_agenda(
     paces = workouts_store.zone_paces(user_id)
     if paces:
         payload["zone_paces"] = _zone_pace_summary(paces)
-    warnings = _plan_warnings(planned, paces)
+    warnings = _plan_warnings(planned, paces, today)
     if warnings:
         payload["warnings"] = warnings
     return payload
 
 
 def _plan_warnings(
-    planned: list[dict[str, Any]], paces: dict[str, Any] | None,
+    planned: list[dict[str, Any]], paces: dict[str, Any] | None, today: date,
 ) -> list[str]:
     """The same run-distance check ``apply`` runs, over the part of the
     window inside :func:`check_window` (today through next week): still-planned
     runs whose distance disagrees with their steps."""
-    lo, hi = check_window()
+    lo, hi = check_window(today)
     out: list[str] = []
     for w in planned:
         if (

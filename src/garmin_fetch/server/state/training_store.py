@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ...db import open_pg_pool
 from .training_workouts import TrainingWorkoutStore
@@ -308,15 +308,27 @@ class TrainingSeason:
     The agent gets exactly one training tool; this facade exposes what that tool
     needs — the windowed agenda and one atomic season edit — without threading
     a user id through ``build_agent``.
+
+    ``today`` returns the user's calendar date (``ReadOnlyDB.today``): the
+    server runs in UTC, so without it "this week" would follow the server's
+    date.
     """
 
-    def __init__(self, store: TrainingStore, user_id: int) -> None:
+    def __init__(
+        self,
+        store: TrainingStore,
+        user_id: int,
+        *,
+        today: Callable[[], date] | None = None,
+    ) -> None:
         self._store = store
         self._user_id = user_id
+        self._today = today
 
     def agenda(self, **window: Any) -> dict[str, Any]:
         """See :func:`.training_agenda.build_agenda` for the arguments."""
-        return build_agenda(self._store, self._user_id, **window)
+        today = self._today() if self._today is not None else None
+        return build_agenda(self._store, self._user_id, today=today, **window)
 
     def apply(self, spec: dict[str, Any]) -> dict[str, Any]:
         return self._store.apply(self._user_id, spec)

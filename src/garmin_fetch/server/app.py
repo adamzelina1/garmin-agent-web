@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import asynccontextmanager, contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,7 @@ from ..chat_format import (
 )
 from ..config import load_config
 from ..db import ensure_schema, open_pg_pool
+from ..fetcher import conn_utc_offset
 from .auth import AuthError, AuthService, UserStore
 from .ratelimit import RateLimiter
 from .setup_db import agent_role_can_switch_user, ensure_roles
@@ -218,13 +220,17 @@ class TrainingAnchor(BaseModel):
 # -- App state ---------------------------------------------------------------
 
 def _readonly(
-    request: Request, user_id: int, excluded_types: str = ""
+    request: Request,
+    user_id: int,
+    excluded_types: str = "",
+    utc_offset: timedelta | None = None,
 ) -> ReadOnlyDB:
     """The agent's read-only handle for one user, on the shared agent pool.
 
     ``excluded_types`` hides columns the account can't have data for (disabled
     data types) so the agent's schema introspection stays lean and never costs
-    tokens on metrics it will only ever see as NULL.
+    tokens on metrics it will only ever see as NULL. ``utc_offset`` makes the
+    handle's ``today()`` the user's date rather than the (UTC) server's.
     """
     cfg = request.app.state.cfg
     return ReadOnlyDB(
@@ -232,6 +238,7 @@ def _readonly(
         user_id=user_id,
         excluded_types=excluded_types,
         pool=request.app.state.agent_pool,
+        utc_offset=utc_offset,
     )
 
 
@@ -883,9 +890,14 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         return _user_agent_cfg(request.app.state.cfg, user, auth)
 
     def _user_readonly(request: Request, user: dict) -> ReadOnlyDB:
+        """The agent's handle for one request, dated in the user's zone (the
+        offset needs the raw payloads, which only the app role can read)."""
+        with _user_conn(request, user["id"]) as conn:
+            offset = conn_utc_offset(conn)
         return _readonly(
             request, user["id"],
             excluded_types=user.get("excluded_data_types") or "",
+            utc_offset=offset,
         )
 
     def _user_agent(
@@ -904,7 +916,9 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
             db,
             memory=PgMemory(state, user["id"]),
             principles=PgPrinciples(state, user["id"]),
-            training=TrainingSeason(request.app.state.training, user["id"]),
+            training=TrainingSeason(
+                request.app.state.training, user["id"], today=db.today
+            ),
             charts=charts,
             on_status=on_status,
         )

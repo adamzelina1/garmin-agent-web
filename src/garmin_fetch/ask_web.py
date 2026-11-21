@@ -98,7 +98,7 @@ class ChatSession:
                 db,
                 memory=PgMemory(self._state, self._user_id),
                 principles=PgPrinciples(self._state, self._user_id),
-                training=TrainingSeason(self._training, self._user_id),
+                training=TrainingSeason(self._training, self._user_id, today=db.today),
             )
         return self._holder["agent"]
 
