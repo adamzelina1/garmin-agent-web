@@ -2505,7 +2505,7 @@ def _messages_token_estimate(messages: Iterable[Any]) -> int:
         return str(part)
 
     total = sum(len(text(p)) for msg in messages for p in getattr(msg, "parts", []))
-    return max(1, round(total / 4))
+    return max(1, round(total / 4)) if total else 0
 
 
 #: Stored tool results longer than this are cut to ``_PRUNED_CHARS``.

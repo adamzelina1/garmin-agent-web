@@ -1611,6 +1611,9 @@ function setAsking(on) {
   $("btn-compact").disabled = on;
 }
 
+// Shown in place of a compacted session's summary, live and on reload.
+const COMPACTED_NOTE = "Conversation compacted into a summary to cut the context size. Continue as normal.";
+
 function chatNote(text) {
   const n = document.createElement("div");
   n.className = "msg note";
@@ -4326,7 +4329,10 @@ function renderTextSettingSummaries() {
 async function loadHistory() {
   try {
     const data = await api("/ask/history", undefined, "GET");
-    for (const m of (data.history || [])) addMsg(m.role, m.content, m.chart_specs || [], m.chart_figures || []);
+    for (const m of (data.history || [])) {
+      if (m.role === "summary") { chatNote(COMPACTED_NOTE); continue; }
+      addMsg(m.role, m.content, m.chart_specs || [], m.chart_figures || []);
+    }
     updateTokens(data.tokens);
   } catch (e) { /* conversation history is best-effort on login */ }
 }
@@ -4519,7 +4525,7 @@ $("btn-compact").addEventListener("click", async () => {
       // The stored transcript is now a compact summary; show a notice instead of
       // the raw summary text so the chat reads cleanly.
       $("chat").innerHTML = "";
-      chatNote("Conversation compacted into a summary to cut the context size. Continue as normal.");
+      chatNote(COMPACTED_NOTE);
     }
     updateTokens(data.tokens);
   } catch (e) {

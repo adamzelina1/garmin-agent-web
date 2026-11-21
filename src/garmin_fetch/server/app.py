@@ -46,6 +46,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..ask import (
+    _SUMMARY_LABEL,
     ReadOnlyDB,
     _build_agent,
     _build_chart_figure,
@@ -1090,12 +1091,17 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         assistant messages keep the raw markdown (including <chart> blocks), so
         the same post-processing as the live ask path is applied here: charts
         are extracted to chart_specs (the client draws each via /ask/chart) and
-        plan dumps are replaced with the <plan_table /> marker."""
-        state: UserState = request.app.state.state
-        messages = state.get_session_messages(user["id"]) or []
+        plan dumps are replaced with the <plan_table /> marker. A compacted
+        session opens with its summary as a user message; it comes back as a
+        ``summary`` item so the client shows a note, not a message the user
+        never wrote. ``tokens`` counts what the next turn will actually send
+        (the slimmed session), like the live ask path."""
+        messages = _turn_history(request, user) or []
         history = messages_to_history(messages)
         for item in history:
-            if item.get("role") in ("assistant", "bot"):
+            if item.get("role") == "user" and item["content"].startswith(_SUMMARY_LABEL):
+                item["role"] = "summary"
+            elif item.get("role") in ("assistant", "bot"):
                 text, specs = extract_charts(item["content"])
                 item["content"] = replace_workout_dumps(text)
                 item["chart_specs"] = specs
@@ -1119,7 +1125,9 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         chat's Compact button — never automatically."""
         user_cfg = _require_llm(request, user)
         state: UserState = request.app.state.state
-        messages = state.get_session_messages(user["id"]) or []
+        # Slimmed first, as a turn would send it: the summary model has no use
+        # for past reasoning or full tool dumps.
+        messages = _turn_history(request, user) or []
         if not messages:
             return {"tokens": 0, "unchanged": True}
         db = _user_readonly(request, user)
