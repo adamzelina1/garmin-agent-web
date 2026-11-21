@@ -2512,39 +2512,6 @@ def _messages_token_estimate(messages: Iterable[Any]) -> int:
 _PRUNE_OVER_CHARS = 350
 _PRUNED_CHARS = 250
 
-#: Rough token budget (see ``_messages_token_estimate``) for the stored
-#: conversation. Every model request re-sends it, so past this the oldest
-#: whole turns are dropped.
-_HISTORY_TOKEN_BUDGET = 30_000
-
-
-def _trim_to_budget(messages: list[Any], budget: int) -> list[Any]:
-    """Drop the oldest whole turns until ``messages`` fits ``budget`` tokens.
-
-    A turn starts at a request carrying the user's prompt, so the kept history
-    still opens with a user message and never splits a tool call from its
-    result. The newest turn is always kept, even when it alone is over budget.
-    """
-    from pydantic_ai.messages import ModelRequest, UserPromptPart
-
-    starts = [
-        i for i, msg in enumerate(messages)
-        if isinstance(msg, ModelRequest)
-        and any(isinstance(p, UserPromptPart) for p in msg.parts)
-    ]
-    if not starts:
-        return messages
-    sizes = [_messages_token_estimate([msg]) for msg in messages]
-    tail = sum(sizes[starts[-1]:])
-    keep_from = starts[-1]
-    for start, nxt in zip(reversed(starts[:-1]), reversed(starts[1:])):
-        tail += sum(sizes[start:nxt])
-        if tail > budget:
-            break
-        keep_from = start
-    return messages[keep_from:] if keep_from else messages
-
-
 def _prune_session_messages(messages: list[Any]) -> list[Any]:
     """Slim the stored history that every later model request re-sends.
 
@@ -2559,8 +2526,7 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
     history's tokens. A tool call the model wrote out as text is cut from
     assistant replies too (see ``strip_leaked_tool_call``): left in the history
     it would be shown again on reload and would teach the model to repeat the
-    mistake. Finally the oldest turns go once the whole is over
-    ``_HISTORY_TOKEN_BUDGET``.
+    mistake.
 
     Idempotent, so it is also applied to a stored session when it is loaded.
     """
@@ -2595,9 +2561,7 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
                 return replace(msg, parts=parts)
         return msg
 
-    return _trim_to_budget(
-        [clean_message(msg) for msg in messages], _HISTORY_TOKEN_BUDGET
-    )
+    return [clean_message(msg) for msg in messages]
 
 
 def _open_state(cfg: dict[str, str]) -> tuple[ReadOnlyDB, Any, Any, int]:
