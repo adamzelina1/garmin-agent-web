@@ -10,7 +10,7 @@ puts a **read-only AI agent** on top of that data. The dashboard and the agent
 read the same derived metrics, so a chart on screen and an answer in chat always
 agree.
 
-![Chat with the agent: a dual-axis chart with a short analysis](images/chat.png)
+![Chat with the agent: weekly running km against overnight HRV as a dual-axis chart, with a three-bullet analysis](images/chat.png)
 
 ## Highlights
 
@@ -18,14 +18,20 @@ agree.
   across days, activities and lap splits, then reasons over what comes back.
   That covers lagged correlations ("does last night's HRV predict today's
   pace?"), root-causing a bad session from sleep, prior load and weather, and
-  spotting form breakdown under fatigue.
+  spotting form breakdown under fatigue. Charts are drawn inline, right where
+  the answer refers to them.
 - **Training load you can trust.** ACWR, a running-only ACWR (so cycling can't
   mask a running spike) and a pace-normalised cadence-drift score are computed
   once per sync and shared by the UI and the agent.
+- **Paces learned from your own runs.** Your running pace in each heart-rate
+  zone is estimated minute by minute from recent outdoor runs, relative to your
+  lactate-threshold pace, so it follows your fitness and the season. Planned
+  runs use it to estimate distance.
 - **A training plan you share with the AI.** Goals are split into periodized
-  blocks, then weekly targets, then dated workouts. You can drag workouts
-  between days, see the forecast on the calendar, or ask the agent to reshape
-  the week. One undo reverts the last destructive edit.
+  blocks, then weekly targets, then dated workouts built from structured steps.
+  You can drag workouts between days, see the forecast on the calendar, compare
+  planned with actual, or ask the agent to reshape the week. One undo reverts
+  the last destructive edit.
 - **Multi-user and isolated by design.** Every row carries a `user_id` and is
   protected by Postgres Row-Level Security. Garmin credentials are AES-GCM
   encrypted, and the agent connects through a SELECT-only role.
@@ -35,12 +41,12 @@ agree.
 
 <table>
   <tr>
-    <td><img src="images/today_tab_v2.png" alt="Today tab with ACWR and Running ACWR scorecards"></td>
-    <td><img src="images/training_plan_v4.png" alt="Training Plan calendar with weather and daily briefing"></td>
+    <td><img src="images/today.png" alt="Today tab: daily briefing with the workout's steps and weather, above the ACWR card and its history chart"></td>
+    <td><img src="images/training_plan.png" alt="Training Plan week: block progress, weekly distance target, workouts per day with weather, and planned versus actual"></td>
   </tr>
   <tr>
-    <td align="center"><b>Today</b>: ACWR and Running ACWR scorecards</td>
-    <td align="center"><b>Training Plan</b>: calendar, weather and briefing</td>
+    <td align="center"><b>Today</b>: briefing and ACWR</td>
+    <td align="center"><b>Training Plan</b>: the week, planned → actual</td>
   </tr>
 </table>
 
@@ -50,18 +56,23 @@ agree.
 Garmin Connect ─▶ sync worker ─▶ raw JSON (metrics, activities)   ◀── source of truth
                                       │
                                       ▼
-                                   parser ─▶ typed tables ─▶ derived_metrics (ACWR, run ACWR, drift)
+                                   parser ─▶ typed tables ─▶ derived_metrics (ACWR, run ACWR,
+                                                   │          drift, pace per HR zone)
                                                    │                 │
    browser (JS) ─▶ FastAPI + JWT ─▶ agent (garmin_readonly role) ◀───┘
                                      every table RLS-scoped by user_id
 ```
 
 1. **Sync.** The worker pulls daily metrics, activities (including per-second
-   detail and lap splits), profile data and an Open-Meteo forecast for
-   each account.
+   detail and lap splits), profile data and an Open-Meteo forecast for each
+   account. "Today" is the user's own day, taken from the UTC offset in their
+   data, not the server's clock. Activities in the recent window are compared
+   with Garmin's list on every sync, so edits are picked up and deletions
+   removed. Profile snapshots (zones, race predictions, gear, devices) refresh
+   once per day.
 2. **Store raw, then parse.** Raw JSON is kept as the source of truth, and
-   `parser.py` projects it into typed tables. `daily_metrics` grows new columns
-   as new fields appear.
+   `parser.py` projects it into typed tables in one transaction. `daily_metrics`
+   grows new columns as new fields appear.
 3. **Derive.** `derived.py` rebuilds `derived_metrics` wholesale after every
    sync.
 4. **Serve.** FastAPI serves the single-page UI and a JSON API. `/ask` streams
@@ -107,10 +118,12 @@ The UI has four tabs:
 
 | Tab | What's there |
 | --- | --- |
-| **Chat** | Streaming conversation with the agent, with inline charts. History persists per account and resumes on reload. Includes **New chat** and **Compact** controls and a live context-token meter. |
-| **Today** | Daily briefing, ACWR and Running ACWR scorecards. Click a card to see zones and history. |
-| **Training Plan** | Weekly calendar with weather, drag-and-drop workouts, weekly planned-vs-actual progress, goals and blocks. |
-| **Settings** | Sync controls (**Sync now**, **Sync + full re-parse**, auto-sync toggle) and per-account config: home city, excluded data types, sync start date (with **Detect from Garmin**), reasoning effort, training principles and agent memory. |
+| **Chat** | Streaming conversation with the agent, with charts drawn inline where the answer places them. The whole conversation is kept per account and resumes on reload; **Compact** replaces it with a summary (shown as a note) and **New chat** starts over. A live meter shows the context size. |
+| **Today** | Daily briefing (today's workout with its steps, and the weather), then cards for ACWR, Running ACWR and Pace by HR Zone. Open a card to see the breakdown and history. |
+| **Training Plan** | **Week** view: the current block's progress, the week's distance against its target, drag-and-drop workouts with the forecast, and a planned → actual row for completed sessions. **List** view: the next eight weeks. **Goals** edits goals, blocks and weekly targets. |
+| **Settings** | **Sync**: **Sync now**, **Sync + full re-parse**, the auto-sync toggle, the sync start date (with **Detect from Garmin**) and re-linking the Garmin login. **Preferences**: home city, excluded data types, agent reasoning effort, training principles and the agent's long-term memory. |
+
+![Pace by HR Zone card on the Today tab: learned pace for zones 1 to 5 with uncertainty and minutes of running behind each](images/zone_paces.png)
 
 ### Settings that apply retroactively
 
@@ -138,6 +151,7 @@ curl -s -X POST localhost:8000/sync       -H "$H"   # incremental sync
 curl -s -X POST localhost:8000/sync/full  -H "$H"   # sync + full re-parse from raw
 curl -s localhost:8000/acwr               -H "$H"   # ACWR series + today
 curl -s localhost:8000/run-acwr           -H "$H"   # running-only ACWR
+curl -s localhost:8000/zone-paces         -H "$H"   # learned pace per HR zone
 curl -s "localhost:8000/activities?from_date=2026-08-01&to_date=2026-08-31" -H "$H"
 curl -s "localhost:8000/weather?from_date=2026-08-24&to_date=2026-08-30"    -H "$H"
 curl -s -X POST localhost:8000/ask -H "$H" -H 'Content-Type: application/json' \
@@ -148,7 +162,7 @@ curl -s -X POST localhost:8000/ask -H "$H" -H 'Content-Type: application/json' \
 | --- | --- |
 | Auth & config | `POST /auth/register`, `POST /auth/register/mfa`, `POST /auth/login`, `POST /auth/garmin` (re-link the Garmin login), `GET /auth/me`, `GET`/`PUT /auth/config` |
 | Sync | `POST /sync`, `POST /sync/full`, `POST /sync/detect-start`, `GET /sync/status`, `POST /cron/sync` (uses `GARMIN_CRON_TOKEN`) |
-| Data | `GET /acwr`, `GET /run-acwr`, `GET /activities`, `GET /weather` |
+| Data | `GET /acwr`, `GET /run-acwr`, `GET /zone-paces`, `GET /activities`, `GET /weather` |
 | Training | `GET`/`POST /training/workouts`, `PATCH`/`DELETE /training/workouts/{id}`, `GET`/`POST /training/anchor`, `PATCH`/`DELETE /training/anchor/{goal_id}`, `POST /training/undo` |
 | Agent | `POST /ask` (SSE), `GET /ask/history`, `POST /ask/clear`, `POST /ask/compact`, `POST /ask/chart` |
 
@@ -182,16 +196,21 @@ The agent is built on Pydantic AI and is read-only at every layer:
 
 | Tool | Purpose |
 | --- | --- |
-| `table_schema`, `run_sql` | Inspect tables and run arbitrary read-only SQL |
-| `get_day_summary`, `get_metric_trend`, `get_recent_activities`, `get_activity_detail` | Fast helpers for common questions, no SQL needed |
-| `chart` | Returns a Plotly spec that the UI re-runs and renders |
+| `table_schema`, `run_sql` | Inspect one or more tables and run arbitrary read-only SQL |
+| `get_day_summary`, `get_recent_activities`, `get_activity_detail` | Fast helpers for common questions, no SQL needed |
+| `get_metric_trend` | Several daily metrics side by side, each with its last-7-day average against your normal level |
+| `chart` | Validates a Plotly spec against the query result and returns a chart id; the answer places it with `<chart id="…"/>` and the UI renders it there |
 | `weather` | Stored forecast and per-activity observed weather |
 | `memory` | Long-term notes about the user (never facts that the DB already holds) |
-| `training` | `get` returns the season with the resolved current block and week plus planned-vs-actual coverage. `apply` performs one atomic edit (or `undo`). |
+| `training` | Reads the season: goals, the resolved current block and week, planned-vs-actual coverage, and warnings for runs whose distance disagrees with their steps |
+| `training_apply` | One atomic, typed edit to the plan (or `undo`) |
 
-The agent never writes health data. Edits to the plan, memory and session go
-through the app's own stores. Tool outputs are trimmed before they are saved to
-history to keep context small.
+The system prompt carries the user's own "today" and their learned zone paces.
+The agent never writes health data: edits to the plan, memory and session go
+through the app's own stores. To keep context small, past reasoning is dropped
+from the stored session and tool outputs are trimmed before they are saved.
+Some models occasionally write a tool call into their reply as text; that
+markup is stripped and the model is sent back once to make the call properly.
 
 ## Derived metrics
 
@@ -207,6 +226,17 @@ history to keep context small.
 - **Cadence drift** (`run_cadence_drift`): a cadence z-score against your own
   cadence-vs-pace fit over the trailing 90 days. A negative score means
   overstriding or worse mechanics.
+- **Pace per HR zone** (`zone_pace.py`, `zone_pace_z1`…`z5`): each zone's pace
+  is modelled as a ratio to your current lactate-threshold pace. The prior is
+  Joe Friel's run pace zones; the evidence is one-minute windows from recent
+  outdoor runs, grouped by HR zone and weighted by recency (30-day half-life).
+  Warm-ups, stops and treadmill runs are left out, and a higher zone is never
+  slower than a lower one.
+
+Planned workouts use these values too. A workout's duration is the sum of its
+steps, and a run's distance is checked against an estimate built from each
+step's pace or zone pace: a missing distance is filled in, and a large mismatch
+comes back as a warning.
 
 ## Data model
 
@@ -226,12 +256,12 @@ Every data table is keyed by `(user_id, …)` and has `FORCE ROW LEVEL SECURITY`
 | `hr_zones`, `power_zones` | Per-sport zone ranges (and FTP) from the device profile |
 | `race_predictions` | Current 5k, 10k, half and full predictions |
 | `user_profile`, `gear`, `devices` | Profile snapshots, current gear with totals, current devices |
-| `derived_metrics` | `(calendar_date, metric)` rows for ACWR, run ACWR and cadence drift. Replaced each sync. |
+| `derived_metrics` | `(calendar_date, metric)` rows for ACWR, run ACWR, cadence drift and zone paces. Replaced each sync. |
 | `weather_forecast` | Stored daily Open-Meteo forecast, refreshed each sync |
 | `training_goal` | Goals (one per event) with sport, start date and target date |
 | `training_block` | Periodized phases of a goal, with name, focus, dates and baseline weekly km |
 | `training_week` | Per-week targets (distance, duration, deload flag) keyed by Monday |
-| `training_workout` | Dated workouts with a status (`planned`, `completed`, `partial` or `skipped`) and target pace, HR zone or power |
+| `training_workout` | Dated workouts with structured steps, a status (`planned`, `completed`, `partial` or `skipped`) and target pace, HR zone or power |
 | `user_state` | Agent memory, chat history, tool trace and the season undo snapshot |
 
 ## Configuration
@@ -291,8 +321,10 @@ src/garmin_fetch/
   derived.py        rebuilds derived_metrics
   workload.py       ACWR
   run_workload.py   running ACWR + cadence drift
+  zone_pace.py      learned pace per HR zone
   ask.py            the read-only agent and its tools
-  chat_format.py    answer/session shaping shared by the server and Gradio UI
+  tool_args.py      lenient argument types for the agent's tools
+  chat_format.py    answer/session shaping (charts, leaked tool calls) for server and Gradio UI
   ask_web.py        legacy Gradio UI (optional extra)
   trace.py          per-turn tool-call tracing
   config.py         .env loading
@@ -304,7 +336,7 @@ src/garmin_fetch/
     sync_worker.py  worker pool, APScheduler cron, backoff
     geocode.py      home city → lat/lon
     setup_db.py     role bootstrap
-    state/          agent memory/session/trace + training season store
+    state/          agent memory/session/trace, training season store + agent training tools
     static/         index.html (the whole frontend)
 docker/initdb/      role bootstrap for a fresh Postgres volume
 ```
