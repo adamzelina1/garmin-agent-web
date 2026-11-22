@@ -14,6 +14,8 @@ It also tracks gait degrading under fatigue as a separate, pace-normalised
 signal: for each run day, cadence is compared to the user's own cadence-vs-pace
 regression over the trailing ``GAIT_WINDOW_DAYS``, giving a z-score (negative =
 fewer steps/min than expected at that pace = overstriding / worse mechanics).
+Cadence and pace come from the running samples only, so walk breaks don't
+count as a form drop.
 
     run_cadence_drift = (cadence - predicted)/resid_sd   (null until ≥8 prior runs)
 
@@ -45,6 +47,14 @@ _CHRONIC_SPAN = 28
 #: pace-normalised cadence residual can be produced.
 GAIT_WINDOW_DAYS = 90
 MIN_GAIT_SAMPLES = 8
+
+#: Samples below this cadence (steps/min PER LEG) are walking, not running.
+#: Per-second data separates cleanly: walking sits at ~50-65, running at 75+.
+#: Walk breaks would otherwise drag a run's average cadence down far more than
+#: its average pace and read as "Breaking Down".
+WALK_CADENCE_PER_LEG = 70
+#: Minimum running time in the samples before they replace the summary averages.
+MIN_RUNNING_S = 300
 
 #: Derived-metric names -> the key each value is pivoted to on the per-day row.
 #: ACWR components only (these are emitted for every day of the continuous
@@ -208,15 +218,42 @@ def gait_category(drift: float | None) -> str | None:
 
 
 def fetch_running_activities(conn: Any) -> list[dict[str, Any]]:
-    """Running activities with the running-dynamics fields (RLS-bound).
+    """Activities with the running-dynamics fields (RLS-bound).
 
     Returns the curated summary columns needed for the gait drift: cadence,
-    speed (for pace), ground-contact time and distance, for running types only.
+    speed (for pace), ground-contact time and distance (``_aggregate_gait``
+    keeps the running types). Where the activity has per-second samples with
+    enough running in them, ``avg_cadence`` / ``avg_speed_kmh`` are the
+    time-weighted averages of the RUNNING samples only (cadence at or above
+    ``WALK_CADENCE_PER_LEG``), so walk breaks and stops don't count; otherwise
+    they are the summary's own averages.
     """
     rows = conn.execute(
-        "SELECT start_date, activity_type, distance_km, avg_speed_kmh, "
-        "avg_cadence, avg_ground_contact_time_ms "
-        "FROM activity_summaries ORDER BY start_date"
+        """
+        WITH s AS (
+          SELECT activity_id, cadence, speed_kmh,
+                 LEAST(LEAD(elapsed_s) OVER (PARTITION BY activity_id ORDER BY elapsed_s)
+                       - elapsed_s, 10) AS dt
+          FROM activity_detail_series
+        ),
+        running AS (
+          SELECT activity_id, SUM(dt) AS run_s,
+                 SUM(cadence * dt) / SUM(dt) AS cadence,
+                 SUM(speed_kmh * dt) / SUM(dt) AS speed_kmh
+          FROM s
+          WHERE cadence >= %(walk)s AND speed_kmh > 0 AND dt > 0
+          GROUP BY activity_id
+        )
+        SELECT a.start_date, a.activity_type, a.distance_km,
+               CASE WHEN r.run_s >= %(min_s)s THEN r.speed_kmh ELSE a.avg_speed_kmh END
+                 AS avg_speed_kmh,
+               CASE WHEN r.run_s >= %(min_s)s THEN r.cadence ELSE a.avg_cadence END
+                 AS avg_cadence,
+               a.avg_ground_contact_time_ms
+        FROM activity_summaries a LEFT JOIN running r USING (activity_id)
+        ORDER BY a.start_date
+        """,
+        {"walk": WALK_CADENCE_PER_LEG, "min_s": MIN_RUNNING_S},
     ).fetchall()
     return [dict(r) for r in rows]
 
