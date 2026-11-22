@@ -160,8 +160,7 @@ _TABLE_NOTES: dict[str, str] = {
         "one row per calendar_date (YYYY-MM-DD). The day's core health + "
         "activity scalars: sleep stages/score/duration, resting/max/min HR, HRV, "
         "stress, respiration, SpO2, steps, intensity minutes, body battery, "
-        "VO2max, lactate threshold, sweat loss, weight/body composition. Wide "
-        "table — never SELECT *; pick columns."
+        "VO2max, lactate threshold, sweat loss, weight/body composition"
     ),
     "activity_summaries": (
         "one row per activity: type, start time, duration/elapsed/moving, "
@@ -195,8 +194,7 @@ _TABLE_NOTES: dict[str, str] = {
     "devices": "one row per Garmin device (model name); current snapshot",
     "derived_metrics": (
         "TALL key/value table, one row per (calendar_date, metric), recomputed "
-        "each sync. Its ONLY data columns are value and qualifier: every name "
-        "below is a VALUE of the metric column, never a column of its own. "
+        "each sync (query it with the pivot in query rule 2). Metric names: "
         "'acwr' (ratio, qualifier Sweet Spot/Elevated/Danger/Detraining) plus "
         "its component rows 'acwr_acute_load' / 'acwr_chronic_load' / "
         "'acwr_daily_load'. RUNNING-SPECIFIC (running activities only, so "
@@ -208,11 +206,7 @@ _TABLE_NOTES: dict[str, str] = {
         "'run_cadence' (spm PER LEG; total both-feet = 2x) and 'run_gct_ms'. "
         "'zone_pace_z1'..'zone_pace_z5' (dated today): learned running pace "
         "per HR zone in decimal min/km, qualifier JSON with sd_s / minutes / "
-        "ratio to lactate-threshold pace. Put several metrics side by side "
-        "with one row per day: SELECT calendar_date, MAX(value) FILTER (WHERE "
-        "metric = 'run_acwr') AS run_acwr, MAX(value) FILTER (WHERE metric = "
-        "'run_acute_km') AS acute_km FROM derived_metrics WHERE metric IN "
-        "('run_acwr', 'run_acute_km') GROUP BY 1 ORDER BY 1"
+        "ratio to lactate-threshold pace"
     ),
     "training_workout": (
         "planned workouts; READ-ONLY via SQL — write only through "
@@ -412,15 +406,18 @@ Common columns (exact names — write SQL with these directly and call
 
 Query rules:
 1. PostgreSQL dialect. Never `SELECT *`; pick only the columns you need.
-2. Results are capped at 500 rows — aggregate (GROUP BY week/month/sport),
+2. `derived_metrics` has no per-metric columns: a name such as `run_acwr` is a
+   VALUE of `metric`. Pivot to one row per day:
+   `SELECT calendar_date, MAX(value) FILTER (WHERE metric = 'run_acwr') AS run_acwr,
+   MAX(value) FILTER (WHERE metric = 'run_acute_km') AS acute_km FROM derived_metrics
+   WHERE metric IN ('run_acwr', 'run_acute_km') GROUP BY 1 ORDER BY 1`.
+3. Results are capped at 500 rows — aggregate (GROUP BY week/month/sport),
    `ORDER BY` time, and `LIMIT` to probe a table's shape first.
-3. Almost any column may be NULL; aggregate over the rows you have and wrap
+4. Almost any column may be NULL; aggregate over the rows you have and wrap
    denominators in `NULLIF(col, 0)`.
-4. Date-like columns (`calendar_date`, `start_date`, `start_time_local`, ...) are
+5. Date-like columns (`calendar_date`, `start_date`, `start_time_local`, ...) are
    TEXT (`'YYYY-MM-DD'` / `'HH:MM'`). Cast with `::date` before `DATE_TRUNC` /
    `EXTRACT`, or compare them as strings.
-5. Measurements are `DOUBLE PRECISION`: cast before rounding
-   (`ROUND(AVG(heart_rate)::numeric, 1)`).
 6. Query freely: probing, correcting and follow-up queries are cheap and safe —
    accuracy matters more than the number of tool calls.
 
@@ -1469,11 +1466,21 @@ class ReadOnlyDB:
             cur = conn.cursor(row_factory=psycopg.rows.tuple_row)
             try:
                 cur.execute(statement)
+            except psycopg.errors.UndefinedColumn as exc:
+                missing = exc
             except psycopg.Error as exc:
                 # Not echoing the statement: the model has it in its own call.
                 raise QueryError(str(exc).strip()) from exc
-            columns = [d[0] for d in (cur.description or [])]
-            rows = cur.fetchmany(_MAX_ROWS + 1)
+            else:
+                missing = None
+                columns = [d[0] for d in (cur.description or [])]
+                rows = cur.fetchmany(_MAX_ROWS + 1)
+        if missing is not None:
+            # Outside the ``with``: the failed transaction is gone and the
+            # column lookup draws a fresh connection.
+            raise QueryError(
+                str(missing).strip() + self._columns_hint(statement)
+            ) from missing
         truncated = len(rows) > _MAX_ROWS
         rows = rows[:_MAX_ROWS]
         return {
@@ -1482,6 +1489,27 @@ class ReadOnlyDB:
             "truncated": truncated,
             "note": f"truncated to {_MAX_ROWS} rows" if truncated else f"{len(rows)} rows",
         }
+
+    def _columns_hint(self, statement: str) -> str:
+        """The real columns of every agent table ``statement`` names, appended
+        to an unknown-column error so the model fixes the query from the actual
+        names instead of guessing again (its most common SQL mistake)."""
+        lines: list[str] = []
+        for table in self.tables():
+            if not re.search(rf"\b{table}\b", statement, re.IGNORECASE):
+                continue
+            try:
+                names = [c["name"] for c in self.columns(table) if c["name"] != "user_id"]
+            except psycopg.Error:
+                continue
+            line = f"{table} columns: {', '.join(names)}"
+            if table == "derived_metrics":
+                line += (
+                    " — metric names such as 'run_acwr' are VALUES of `metric`, "
+                    "not columns: MAX(value) FILTER (WHERE metric = '...')"
+                )
+            lines.append(line)
+        return ("\n" + "\n".join(lines)) if lines else ""
 
     def close(self) -> None:
         """Release the handle's own pool (no-op if never opened or shared)."""

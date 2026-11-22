@@ -444,6 +444,8 @@ class PostgresBackend:
             statement = statement.strip()
             if statement:
                 conn.execute(statement)
+        for statement in _SQL_HELPERS:
+            conn.execute(statement)
         _ensure_rls(conn)
 
     def table_info(self, conn: Any, table: str) -> list[dict[str, Any]]:
@@ -475,6 +477,24 @@ class PostgresBackend:
 
     def adapt_sql(self, sql: str) -> str:
         return sql.replace("?", "%s")
+
+
+#: ``round`` / ``mod`` overloads for DOUBLE PRECISION. Stock Postgres only has
+#: ``round(numeric, int)``, so ``ROUND(AVG(x), 1)`` over a float column fails;
+#: that was the agent's most common SQL error, and the overloads make it
+#: simply work. Idempotent (CREATE OR REPLACE); executable by every role.
+_SQL_HELPERS = (
+    """
+    CREATE OR REPLACE FUNCTION public.round(double precision, integer)
+    RETURNS numeric LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS
+    $$ SELECT pg_catalog.round($1::numeric, $2) $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION public.mod(double precision, integer)
+    RETURNS numeric LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS
+    $$ SELECT pg_catalog.mod($1::numeric, $2::numeric) $$
+    """,
+)
 
 
 #: DSNs whose schema this process has already created. ``create_schema`` drops
