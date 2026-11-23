@@ -14,7 +14,7 @@ using ``from .state import ...``.
 
 from .training_anchor import TrainingAnchorStore
 from .training_rules import (
-    GARMIN_TYPE_MAP, goal_activities, goal_workouts, workout_in_goal,
+    GARMIN_TYPE_MAP, goal_activities, goal_workouts,
 )
 from .training_store import TrainingSeason, TrainingStore
 from .training_validation import (
@@ -27,5 +27,5 @@ __all__ = [
     "ACTIVITY_TYPES", "GARMIN_TYPE_MAP", "INTENSITIES", "PLAN_STATUSES",
     "PgMemory", "PgPrinciples", "STEP_KINDS", "TrainingAnchorStore",
     "TrainingSeason", "TrainingStore", "TrainingWorkoutStore", "UserState",
-    "goal_activities", "goal_workouts", "workout_in_goal",
+    "goal_activities", "goal_workouts",
 ]

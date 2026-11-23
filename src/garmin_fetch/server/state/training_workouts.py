@@ -7,16 +7,7 @@ from typing import Any
 
 from ...db import open_pg_pool
 from ...zone_pace import estimate_run_km, read_zone_paces, steps_minutes
-from .training_rules import (
-    _activity_matches,
-    _closest_activity,
-    check_window,
-    run_distance_warning,
-)
-
-
-def _in_window(day: str, window: tuple[str, str]) -> bool:
-    return window[0] <= day[:10] <= window[1]
+from .training_rules import _activity_matches, _closest_activity
 from .training_validation import (
     _build_set,
     _normalize_workout,
@@ -26,8 +17,8 @@ from .training_validation import (
     _workout_row,
 )
 
-#: Workout fields the step-derived duration and the run distance check depend
-#: on; a PATCH touching none of them leaves the stored totals alone.
+#: Workout fields the step-derived totals depend on; a PATCH touching none of
+#: them leaves the stored totals alone.
 _TOTALS_INPUTS = frozenset({"activity_type", "steps", "duration_min", "distance_km"})
 
 
@@ -102,14 +93,18 @@ class TrainingWorkoutStore:
             out.append(d)
         return out
 
-    def create(self, user_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    def get(self, user_id: int, workout_id: int) -> dict[str, Any] | None:
+        """One workout (None when the id is unknown)."""
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
-            return self._create(conn, user_id, data)
+            row = conn.execute(
+                "SELECT * FROM training_workout WHERE user_id = %s AND id = %s",
+                (user_id, workout_id),
+            ).fetchone()
+        return _workout_row(row) if row else None
 
     def _create(
         self, conn: Any, user_id: int, data: dict[str, Any],
-        warnings: list[str] | None = None,
     ) -> dict[str, Any]:
         fields = _normalize_workout(data)
         now = datetime.now(timezone.utc).isoformat()
@@ -117,8 +112,8 @@ class TrainingWorkoutStore:
             "INSERT INTO training_workout (user_id, planned_date, activity_type, "
             "title, description, duration_min, distance_km, intensity, "
             "target_pace_min_km, target_hr_zone, target_power_w, steps, status, "
-            "goal_id, created_at, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
             "%s, %s) RETURNING *",
             (
                 user_id, fields["planned_date"], fields["activity_type"],
@@ -127,33 +122,26 @@ class TrainingWorkoutStore:
                 fields.get("intensity"), fields.get("target_pace_min_km"),
                 fields.get("target_hr_zone"), fields.get("target_power_w"),
                 fields.get("steps"), fields.get("status") or "planned",
-                fields.get("goal_id"), now, now,
+                now, now,
             ),
         ).fetchone()
-        return _workout_row(self._derive_totals(conn, row, warnings))
+        return _workout_row(self._derive_totals(conn, row))
 
-    def _derive_totals(
-        self, conn: Any, row: Any, warnings: list[str] | None = None,
-    ) -> Any:
+    def _derive_totals(self, conn: Any, row: Any) -> Any:
         """Derive a workout's totals from its steps: ``duration_min`` is always
-        the steps' total time. A run's ``distance_km`` stays as supplied but is
-        checked against the steps' estimate (time / pace, HR-zone steps priced
-        at the learned zone pace): more than 10% (and 0.5 km) off adds a
-        warning when the run falls in :func:`check_window` (this week and
-        next); a missing distance is filled with the estimate. Returns the
-        (possibly re-read) row."""
+        the steps' total time, and a run's ``distance_km`` is always the steps'
+        estimate (time / pace, HR-zone steps priced at the learned zone pace) —
+        an estimate for display, never typed in or checked. Without learned
+        zone paces the supplied distance stays. Returns the (possibly
+        re-read) row."""
         steps = _parse_steps(row["steps"])
         if not steps:
             return row
-        totals = {"duration_min": steps_minutes(steps)}
+        totals: dict[str, Any] = {"duration_min": steps_minutes(steps)}
         if row["activity_type"] == "run":
             km = estimate_run_km(steps, read_zone_paces(conn))
-            if km is not None and row["distance_km"] is None:
+            if km is not None:
                 totals["distance_km"] = km
-            elif warnings is not None and _in_window(row["planned_date"], check_window()):
-                warning = run_distance_warning({**row, **totals}, km)
-                if warning:
-                    warnings.append(warning)
         changed = {k: v for k, v in totals.items() if row[k] != v}
         if not changed:
             return row
@@ -164,19 +152,8 @@ class TrainingWorkoutStore:
             (*changed.values(), row["user_id"], row["id"]),
         ).fetchone()
 
-    def update(
-        self, user_id: int, workout_id: int, data: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """PATCH a workout: only the supplied fields change (the UI's edit
-        modal and drag-and-drop, and the agent's upsert), so changing one field
-        never clears the others. None when the id is unknown."""
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return self._update(conn, user_id, workout_id, data)
-
     def _update(
         self, conn: Any, user_id: int, workout_id: int, data: dict[str, Any],
-        warnings: list[str] | None = None,
     ) -> dict[str, Any] | None:
         fields = _normalize_workout(data, partial=True)
         if not fields:
@@ -198,14 +175,8 @@ class TrainingWorkoutStore:
             if row and ("steps" in fields or "activity_type" in fields):
                 _require_steps(row["activity_type"], row["steps"])
             if row and _TOTALS_INPUTS & fields.keys():
-                row = self._derive_totals(conn, row, warnings)
+                row = self._derive_totals(conn, row)
         return _workout_row(row) if row else None
-
-    def zone_paces(self, user_id: int) -> dict[str, Any] | None:
-        """The learned pace per HR zone (see :mod:`garmin_fetch.zone_pace`)."""
-        with self._pool.connection() as conn:
-            self._set_user(conn, user_id)
-            return read_zone_paces(conn)
 
     def _delete(self, conn: Any, user_id: int, workout_id: int) -> str | None:
         """Delete one workout; returns its planned date (None if unknown)."""
@@ -231,9 +202,7 @@ class TrainingWorkoutStore:
         before a deletion, restorable with ``{"undo": true}``. Returns the
         counts plus the ids that changed (``added_ids``/``updated_ids``) so the
         caller never has to re-read to learn what it touched, plus ``dates``
-        (every planned date the edit touched, old and new) and ``warnings``
-        (runs whose distance disagrees with their steps, see
-        ``_derive_totals``).
+        (every planned date the edit touched, old and new).
         """
         if conn is not None:
             return self._apply(conn, user_id, spec)
@@ -248,7 +217,6 @@ class TrainingWorkoutStore:
         added_ids: list[int] = []
         updated_ids: list[int] = []
         dates: set[str] = set()
-        warnings: list[str] = []
         for wid in spec.get("delete_ids") or []:
             wid = _opt_int(wid, "delete_ids")
             if wid is None:
@@ -270,14 +238,14 @@ class TrainingWorkoutStore:
                     "WHERE user_id = %s AND id = %s",
                     (user_id, wid),
                 ).fetchone()
-                row = self._update(conn, user_id, wid, workout, warnings)
+                row = self._update(conn, user_id, wid, workout)
                 if row is None:
                     raise ValueError(f"workout id {wid} not found")
                 dates.update((old["planned_date"], row["planned_date"]))
                 updated += 1
                 updated_ids.append(wid)
                 continue
-            row = self._create(conn, user_id, workout, warnings)
+            row = self._create(conn, user_id, workout)
             dates.add(row["planned_date"])
             added += 1
             added_ids.append(row["id"])
@@ -293,7 +261,6 @@ class TrainingWorkoutStore:
             "added_ids": added_ids,
             "updated_ids": updated_ids,
             "dates": sorted(dates),
-            **({"warnings": warnings} if warnings else {}),
         }
 
     def activities(

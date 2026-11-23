@@ -19,7 +19,11 @@ from .run_workload import (
     to_gait_rows,
     to_metric_rows as run_rows,
 )
-from .zone_pace import compute_zone_paces, to_metric_rows as zone_pace_rows
+from .zone_pace import (
+    compute_zone_paces,
+    reprice_planned_runs,
+    to_metric_rows as zone_pace_rows,
+)
 from .workload import (
     compute_acwr,
     fetch_activity_loads,
@@ -34,9 +38,10 @@ def build_derived(db: Any, today: date | None = None) -> dict[str, int]:
     date (the server runs in UTC; default the machine's date). The cardio ACWR and running ACWR series
     always run from the first training/run day to today (rest days are stored
     with a null ratio once chronic load decays to zero); gait drift is stored
-    per run day; zone paces are one row per HR zone dated today. Returns
-    {"acwr": days, "running_acwr": days, "running_gait": days,
-    "zone_paces": zones, "derived": rows_written}.
+    per run day; zone paces are one row per HR zone dated today. Planned
+    runs' km are then re-priced at the new paces in the same transaction.
+    Returns {"acwr": days, "running_acwr": days, "running_gait": days,
+    "zone_paces": zones, "derived": rows_written, "repriced_runs": runs}.
     """
     built_at = datetime.now(UTC).isoformat()
 
@@ -57,11 +62,14 @@ def build_derived(db: Any, today: date | None = None) -> dict[str, int]:
     zone_rows = zone_pace_rows(compute_zone_paces(db.conn, today), built_at, today)
     rows.extend(zone_rows)
 
-    written = db.replace_derived_metrics(rows)
+    with db.batch():
+        written = db.replace_derived_metrics(rows)
+        repriced = reprice_planned_runs(db.conn, db.user_id)
     return {
         "acwr": len(acwr_days),
         "running_acwr": len(run_days),
         "running_gait": len(gait_days),
         "zone_paces": len(zone_rows),
         "derived": written,
+        "repriced_runs": repriced,
     }

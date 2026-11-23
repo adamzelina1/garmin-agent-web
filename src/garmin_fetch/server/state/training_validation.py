@@ -132,16 +132,6 @@ def _normalize_steps(value: Any) -> str | None:
         label = _text(raw.get("label"))
         if label:
             step["label"] = label[:_MAX_STEP_TEXT]
-        repeat = raw.get("repeat")
-        if repeat not in (None, "", 1):
-            try:
-                repeat = int(repeat)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"step {i} repeat must be an integer") from exc
-            if repeat < 1:
-                raise ValueError(f"step {i} repeat must be >= 1")
-            if repeat > 1:
-                step["repeat"] = repeat
         intensity = raw.get("intensity")
         if intensity not in (None, ""):
             intensity = str(intensity).strip().lower()
@@ -209,7 +199,7 @@ def _normalize_workout(
     keys = list(data) if partial else (
         "planned_date", "activity_type", "title", "description", "duration_min",
         "distance_km", "intensity", "target_pace_min_km", "target_hr_zone",
-        "target_power_w", "status", "goal_id", "steps",
+        "target_power_w", "status", "steps",
     )
     fields: dict[str, Any] = {}
     for key in keys:
@@ -251,8 +241,6 @@ def _normalize_workout(
             fields[key] = pace
         elif key == "target_power_w":
             fields[key] = _parse_opt_nonneg_int(value, "target_power_w")
-        elif key == "goal_id":
-            fields[key] = _opt_int(value, "goal_id")
         elif key == "steps":
             fields[key] = _normalize_steps(value)
         elif key == "status":
@@ -275,8 +263,8 @@ def _normalize_status(value: Any) -> str:
 
 
 def _parse_steps(raw: str | None) -> list[dict[str, Any]]:
-    """Decode the stored ``steps`` JSON column (canonical, from
-    :func:`_normalize_steps`) into a list."""
+    """Decode the stored ``steps`` JSON column into a list (one entry per
+    rep)."""
     return json.loads(raw) if raw else []
 
 
@@ -305,8 +293,6 @@ def _workout_row(row: Any) -> dict[str, Any]:
         "completed": status in ("completed", "partial"),
         "completed_activity_id": row["completed_activity_id"],
     }
-    if row.get("goal_id") is not None:
-        d["goal_id"] = row["goal_id"]
     return d
 
 
@@ -446,27 +432,27 @@ def _normalize_block(
 ) -> dict[str, Any]:
     """Validate/normalise one block dict; raises ``ValueError``.
 
-    Blocks are periodised phases of a goal: ``name``/``focus`` are free text,
-    and the dates are optional (a block may be undated). ``target_weekly_km``
-    is an optional baseline weekly distance. With ``partial`` only the keys
-    present in ``data`` are returned (absent columns keep their stored value).
+    Blocks are dated periodised phases of a goal: ``name``/``focus`` are free
+    text and ``start_date``/``end_date`` are required. With ``partial`` only
+    the keys present in ``data`` are returned (absent columns keep their
+    stored value), and a date may change but never be cleared.
     """
     keys = list(data) if partial else _BLOCK_TEXT_FIELDS + (
-        "goal_id", "start_date", "end_date", "target_weekly_km",
+        "goal_id", "start_date", "end_date",
     )
     fields: dict[str, Any] = {}
     for key in keys:
-        if key not in data:
+        if key not in data and not (key in ("start_date", "end_date") and not partial):
             continue
-        value = data[key]
+        value = data.get(key)
         if key in _BLOCK_TEXT_FIELDS:
             fields[key] = _text(value)
         elif key in ("start_date", "end_date"):
-            fields[key] = _parse_opt_date(value, key)
+            if value in (None, ""):
+                raise ValueError(f"a block needs both start_date and end_date ({key} missing)")
+            fields[key] = _parse_required_date(value, key)
         elif key == "goal_id":
             fields[key] = _opt_int(value, "goal_id")
-        elif key == "target_weekly_km":
-            fields[key] = _parse_opt_float(value, "target_weekly_km")
     return fields
 
 
@@ -476,13 +462,12 @@ def _normalize_week(
     """Validate/normalise one week-target dict.
 
     A week is one explicit calendar week of a block's progression (weeks do not
-    repeat): distance_km and/or duration_min plus an optional ``is_deload``
-    flag. If ``week_start`` is sent, it is validated as YYYY-MM-DD; otherwise
-    it is derived from the block start and the week's position in the list.
+    repeat): a ``duration_min`` target plus an optional ``is_deload`` flag
+    (targets are minutes only; km is just an estimate). If ``week_start`` is
+    sent, it is validated as YYYY-MM-DD; otherwise it is derived from the
+    block start and the week's position in the list.
     """
-    keys = list(data) if partial else (
-        "week_start", "distance_km", "duration_min", "is_deload",
-    )
+    keys = list(data) if partial else ("week_start", "duration_min", "is_deload")
     fields: dict[str, Any] = {}
     for key in keys:
         if key not in data:
@@ -493,8 +478,6 @@ def _normalize_week(
                 fields[key] = _parse_required_date(value, "week_start")
             else:
                 fields[key] = None
-        elif key == "distance_km":
-            fields[key] = _parse_opt_float(value, "distance_km")
         elif key == "duration_min":
             fields[key] = _parse_opt_nonneg_int(value, "duration_min")
         elif key == "is_deload":
@@ -541,7 +524,6 @@ def _block_row(row: Any) -> dict[str, Any]:
         "start_date": row["start_date"],
         "end_date": row["end_date"],
         "focus": row["focus"],
-        "target_weekly_km": row.get("target_weekly_km"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -551,7 +533,6 @@ def _week_row(row: Any) -> dict[str, Any]:
     """Shape one ``training_week`` row into API/agent JSON."""
     return {
         "week_start": row.get("week_start"),
-        "distance_km": row["distance_km"],
         "duration_min": row["duration_min"],
         "is_deload": row.get("is_deload"),
     }

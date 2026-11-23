@@ -132,15 +132,14 @@ class WorkoutStep(BaseModel):
     positive duration is required — use the friendly ``duration`` string
     (``"15m"``, ``"90s"``, ``"1:30"``) or a plain number of minutes, or
     ``duration_sec`` (whole seconds, the form steps are read back in).
-    ``repeat`` > 1 expands the step, and the optional targets mirror the flat
-    workout targets.
+    Intervals are written out step by step; the optional targets mirror the
+    flat workout targets.
     """
 
     kind: str = "steady"
     label: str | None = None
     duration: str | float | None = None
     duration_sec: float | None = None
-    repeat: int | None = None
     intensity: str | None = None
     target_pace_min_km: float | None = None
     target_hr_zone: str | None = None
@@ -163,7 +162,6 @@ class TrainingWorkout(BaseModel):
     target_power_w: int | None = None
     steps: list[WorkoutStep] | None = None
     status: str | None = None
-    goal_id: int | None = None
 
 
 class TrainingWorkoutPatch(BaseModel):
@@ -181,18 +179,16 @@ class TrainingWorkoutPatch(BaseModel):
     target_power_w: int | None = None
     steps: list[WorkoutStep] | None = None
     status: str | None = None
-    goal_id: int | None = None
 
 
 class TrainingWeek(BaseModel):
-    """One week target of a block.
+    """One week target of a block, in minutes.
 
     Weeks are patched by ``week_start`` (any date; snapped to its Monday): only
     the weeks sent are written, and a week sent with no targets is cleared.
     """
 
     week_start: str | None = None
-    distance_km: float | None = None
     duration_min: int | None = None
     is_deload: bool | None = None
 
@@ -203,7 +199,6 @@ class TrainingBlock(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     focus: str | None = None
-    target_weekly_km: float | None = None
     weeks: list[TrainingWeek] | None = None
 
 
@@ -646,15 +641,22 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         workouts: TrainingWorkoutStore = request.app.state.workouts
         return {"workouts": workouts.list(user["id"], from_date, to_date)}
 
+    def _apply(request: Request, user_id: int, spec: dict[str, Any]) -> dict[str, Any]:
+        """Every plan write goes through the one transactional writer (the
+        same path as the agent); a bad edit is a 400."""
+        training: TrainingStore = request.app.state.training
+        try:
+            return training.apply(user_id, spec)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.post("/training/workouts")
     def training_workout_create(
         body: TrainingWorkout, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
+        result = _apply(request, user["id"], {"workouts": [body.model_dump()]})
         workouts: TrainingWorkoutStore = request.app.state.workouts
-        try:
-            return workouts.create(user["id"], body.model_dump())
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        return workouts.get(user["id"], result["workouts"]["added_ids"][0])
 
     @app.post("/training/undo")
     def training_undo(
@@ -681,24 +683,17 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         moving a workout never clears its title, targets or goal/block link.
         """
         workouts: TrainingWorkoutStore = request.app.state.workouts
-        try:
-            row = workouts.update(
-                user["id"], workout_id, body.model_dump(exclude_unset=True)
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        if row is None:
+        if workouts.get(user["id"], workout_id) is None:
             raise HTTPException(404, "workout not found")
-        return row
+        data = body.model_dump(exclude_unset=True)
+        _apply(request, user["id"], {"workouts": [{**data, "id": workout_id}]})
+        return workouts.get(user["id"], workout_id)
 
     @app.delete("/training/workouts/{workout_id}")
     def training_workout_delete(
         workout_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        training: TrainingStore = request.app.state.training
-        result = training.apply(
-            user["id"], {"workouts": {"delete_ids": [workout_id]}}
-        )
+        result = _apply(request, user["id"], {"workouts": {"delete_ids": [workout_id]}})
         if not result["workouts"]["deleted"]:
             raise HTTPException(404, "workout not found")
         return {"status": "ok"}
@@ -786,13 +781,12 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     def training_anchor_create(
         body: TrainingAnchor, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        """Create a new long-term goal (appends it; never wipes other goals)."""
+        """Create the account's goal (an account has one; edit it instead)."""
         anchor: TrainingAnchorStore = request.app.state.anchor
-        try:
-            saved = anchor.create_goal(user["id"], body.model_dump(exclude_none=True))
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        return _goal_dump(anchor, user["id"], saved["id"])
+        if anchor.list_goals(user["id"]):
+            raise HTTPException(400, "this account already has a goal — edit it instead")
+        result = _apply(request, user["id"], {"anchor": body.model_dump(exclude_none=True)})
+        return _goal_dump(anchor, user["id"], result["anchor"]["goal_id"])
 
     @app.patch("/training/anchor/{goal_id}")
     def training_anchor_update(
@@ -808,24 +802,19 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         snapshotted for undo in the same transaction.
         """
         anchor: TrainingAnchorStore = request.app.state.anchor
-        training: TrainingStore = request.app.state.training
         if anchor.get_goal(user["id"], goal_id) is None:
             raise HTTPException(404, "goal not found")
-        data = body.model_dump(exclude_unset=True)
-        try:
-            training.apply(user["id"], {"anchor": {**data, "goal_id": goal_id}})
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        _apply(request, user["id"], {"anchor": body.model_dump(exclude_unset=True)})
         return _goal_dump(anchor, user["id"], goal_id)
 
     @app.delete("/training/anchor/{goal_id}")
     def training_anchor_delete(
         goal_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        training: TrainingStore = request.app.state.training
-        result = training.apply(
-            user["id"], {"anchor": {"delete_goal_ids": [goal_id]}}
-        )
+        anchor: TrainingAnchorStore = request.app.state.anchor
+        if anchor.get_goal(user["id"], goal_id) is None:
+            raise HTTPException(404, "goal not found")
+        result = _apply(request, user["id"], {"anchor": {"delete_goal": True}})
         if not result["anchor"]["deleted_goals"]:
             raise HTTPException(404, "goal not found")
         return {"status": "ok"}

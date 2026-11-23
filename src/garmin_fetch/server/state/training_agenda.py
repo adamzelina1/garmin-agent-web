@@ -1,8 +1,9 @@
-"""The agent's windowed view of the season: goals, blocks and one entry per
-calendar week with its targets, planned workouts and actual activities.
+"""The agent's windowed view of the season: the goal and its blocks, one
+entry per calendar week with its target, planned workouts and actual
+activities.
 
 Pure read composition over ``TrainingAnchorStore`` / ``TrainingWorkoutStore``;
-the goal/block/week resolution itself stays in ``TrainingAnchorStore``.
+the block/week resolution itself stays in ``TrainingAnchorStore``.
 """
 
 from __future__ import annotations
@@ -10,100 +11,82 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from ...zone_pace import estimate_run_km
-from .training_rules import (
-    _first_monday,
-    check_window,
-    goal_activities,
-    goal_workouts,
-    run_distance_warning,
-)
+from .training_rules import _covering_block, _first_monday
 
 #: Safety cap on the workouts returned in one agenda.
 _MAX_WORKOUTS = 200
 
-#: Description preview length when ``detail=False``: the text is kept (so no
-#: second round-trip) but capped so a long description never bloats the context.
-_DESC_PREVIEW_CHARS = 160
+#: Keys the agent never needs: bookkeeping, the one goal's id on every block,
+#: and ``completed`` (it restates ``status``).
+_DROP = ("created_at", "updated_at", "goal_id", "completed")
 
-#: Bookkeeping columns the agent never needs (they only cost tokens).
-_DROP = ("created_at", "updated_at")
-
-#: Longest window (in weeks) one agenda may span.
-_MAX_WEEKS = 26
+#: Workout summary fields that its steps already carry.
+_STEP_FIELDS = ("intensity", "target_pace_min_km", "target_hr_zone", "target_power_w")
 
 
 def _slim(row: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Drop bookkeeping keys from one row (None passes through)."""
+    """One row without bookkeeping keys or empty (None) values (None passes
+    through)."""
     if row is None:
         return None
-    return {k: v for k, v in row.items() if k not in _DROP}
+    return {k: v for k, v in row.items() if k not in _DROP and v is not None}
+
+
+def _workout(w: dict[str, Any]) -> dict[str, Any]:
+    """A planned workout; with steps, its targets live on the steps only.
+    A rest day is just its date, title and description, and a completed
+    workout points at its activity (listed in the week's ``actual``)."""
+    out = _slim(w) or {}
+    out.pop("actual", None)
+    if w["activity_type"] == "rest":
+        return {k: out[k] for k in (
+            "id", "planned_date", "activity_type", "title", "description", "status",
+        ) if k in out}
+    if w.get("steps"):
+        for key in _STEP_FIELDS:
+            out.pop(key, None)
+        out["steps"] = [_slim(step) for step in w["steps"]]
+    return out
+
+
+def _activity(a: dict[str, Any]) -> dict[str, Any]:
+    """A synced activity, in the plan's units (minutes, km to 0.1)."""
+    hours, km = a.get("duration_hours"), a.get("distance_km")
+    return _slim({
+        "activity_id": a["activity_id"],
+        "start_date": a["start_date"],
+        "activity_type": a["activity_type"],
+        "duration_min": round(hours * 60) if hours else None,
+        "distance_km": round(km, 1) if km else None,
+    }) or {}
 
 
 def _monday_iso(value: str) -> str:
     return _first_monday(date.fromisoformat(value)).isoformat()
 
 
-def _block_overlaps(block: dict[str, Any], win_start: str, win_end: str) -> bool:
-    """True when a block's dated range intersects the window; an undated or
-    half-open block always counts, so a phase is never hidden before it is dated."""
-    start, end = block.get("start_date"), block.get("end_date")
-    return (not start or start <= win_end) and (not end or end >= win_start)
-
-
-def _goal_header(
-    anchor: Any, user_id: int, goal: dict[str, Any], win_start: str, win_end: str
-) -> dict[str, Any]:
-    """One goal's header plus only the blocks that overlap the window."""
-    out = _slim(goal) or {}
-    out["blocks"] = [
-        {k: b.get(k) for k in
-         ("id", "name", "focus", "start_date", "end_date", "target_weekly_km")}
-        for b in anchor.list_blocks(user_id, goal["id"])
-        if _block_overlaps(b, win_start, win_end)
-    ]
-    return out
-
-
-def _full_goal(anchor: Any, user_id: int, goal_id: int, day: str) -> dict[str, Any] | None:
-    """The whole resolved goal (every block/week + the current block), slimmed
-    and with the weekly target flattened so the model never re-derives it."""
-    resolved = anchor.resolve_goal(user_id, goal_id, day)
-    if resolved is None:
-        return None
-    out = _slim(resolved["goal"]) or {}
-    out["blocks"] = [
-        {**(_slim(b) or {}), "weeks": [_slim(w) or {} for w in b.get("weeks", [])]}
-        for b in resolved["blocks"]
-    ]
-    out["current_block"] = _slim(resolved["current_block"])
-    out["week_number"] = resolved["week_number"]
-    target = resolved["weekly_target"]
-    out["weekly_target"] = None if target is None else {
-        "block_id": target["block"]["id"],
-        "block": target["block"]["name"],
-        "week_number": target.get("week_number"),
-        "week_count": target.get("week_count"),
-        "week": _slim(target["week"]),
-        "coverage": target.get("coverage"),
+def _goal(goal: dict[str, Any], blocks: list[dict[str, Any]], today: date) -> dict[str, Any]:
+    """The goal with every block of the season and which one is current."""
+    current = _covering_block(blocks, today)
+    return {
+        **(_slim(goal) or {}),
+        "blocks": [
+            {k: b[k] for k in ("id", "name", "focus", "start_date", "end_date") if b.get(k)}
+            for b in blocks
+        ],
+        "current_block_id": current["id"] if current else None,
     }
-    return out
 
 
-def _window(
-    day: str, weeks: int | None, date_start: str | None, date_end: str | None
-) -> tuple[str, str]:
-    """The inclusive agenda window: an explicit range, or ``weeks`` calendar
-    weeks from Monday of ``day``'s week. A range wins over ``weeks`` — the
-    model routinely sends both, and the range is the more specific ask."""
+def _window(today: date, date_start: str | None, date_end: str | None) -> tuple[str, str]:
+    """The inclusive agenda window: the explicit range, or this week."""
     if (date_start is None) != (date_end is None):
         raise ValueError("pass both date_start and date_end, or neither")
     if date_start is not None:
         lo, hi = sorted((date.fromisoformat(date_start), date.fromisoformat(date_end)))
         return lo.isoformat(), hi.isoformat()
-    span = max(1, min(int(weeks or 1), _MAX_WEEKS))
-    start = _first_monday(date.fromisoformat(day))
-    return start.isoformat(), (start + timedelta(days=7 * span - 1)).isoformat()
+    start = _first_monday(today)
+    return start.isoformat(), (start + timedelta(days=6)).isoformat()
 
 
 def _weeks(
@@ -114,27 +97,25 @@ def _weeks(
     targets: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """One entry per calendar week (Mon..Sun) of the window, grouping that
-    week's per-goal targets, planned workouts and actual activities."""
+    week's target, planned workouts and actual activities."""
+    by_target = {t.pop("week_start"): t for t in targets}
     by_week: dict[str, dict[str, list[dict[str, Any]]]] = {}
-
-    def bucket(week_start: str) -> dict[str, list[dict[str, Any]]]:
-        return by_week.setdefault(week_start, {"targets": [], "planned": [], "actual": []})
-
-    for t in targets:
-        bucket(t["week_start"])["targets"].append(t)
     for w in planned:
-        bucket(_monday_iso(w["planned_date"]))["planned"].append(w)
+        by_week.setdefault(_monday_iso(w["planned_date"]), {"planned": [], "actual": []})["planned"].append(w)
     for a in actual:
-        bucket(_monday_iso(a["start_date"]))["actual"].append(a)
+        by_week.setdefault(_monday_iso(a["start_date"]), {"planned": [], "actual": []})["actual"].append(a)
 
     out: list[dict[str, Any]] = []
     cur, end = _first_monday(date.fromisoformat(win_start)), date.fromisoformat(win_end)
     while cur <= end:
         ws = cur.isoformat()
+        group = by_week.get(ws, {"planned": [], "actual": []})
+        target = by_target.get(ws)
         out.append({
             "week_start": ws,
-            "week_end": (cur + timedelta(days=6)).isoformat(),
-            **by_week.get(ws, {"targets": [], "planned": [], "actual": []}),
+            "target": _slim(target),
+            "planned": [_workout(w) for w in group["planned"]],
+            "actual": [_activity(a) for a in group["actual"]],
         })
         cur += timedelta(days=7)
     return out
@@ -144,101 +125,39 @@ def build_agenda(
     store: Any,
     user_id: int,
     *,
-    day: str | None = None,
-    weeks: int | None = 1,
+    today: date,
     date_start: str | None = None,
     date_end: str | None = None,
-    goal_id: int | None = None,
     full: bool = False,
-    detail: bool = False,
-    today: date | None = None,
 ) -> dict[str, Any]:
     """The windowed season agenda for one user (see the agent's ``training``
-    tool). ``store`` is a ``TrainingStore``; ``today`` is the user's date
-    (default: the machine's), the default ``day`` and the start of the
-    warnings window. Raises ``ValueError`` on bad input."""
+    tool). ``store`` is a ``TrainingStore``; ``today`` is the user's date,
+    which picks the default window (this week) and the current block.
+    ``full`` adds ``season``: every week target of the season, in the same
+    shape as ``weeks[].target``. Raises ``ValueError`` on bad input."""
     anchor, workouts_store = store.anchor, store.workouts
-    today = today or date.today()
-    day = date.fromisoformat(day).isoformat() if day else today.isoformat()
-    win_start, win_end = _window(day, weeks, date_start, date_end)
+    win_start, win_end = _window(today, date_start, date_end)
 
     goals = anchor.list_goals(user_id)
-    if goal_id is not None:
-        goals = [g for g in goals if g["id"] == int(goal_id)]
-        if not goals:
-            raise ValueError(f"goal {goal_id} not found")
-
-    if full:
-        out_goals = [
-            g for g in (_full_goal(anchor, user_id, goal["id"], day) for goal in goals)
-            if g is not None
-        ]
-    else:
-        out_goals = [_goal_header(anchor, user_id, g, win_start, win_end) for g in goals]
-
+    blocks = anchor.list_blocks(user_id, goals[0]["id"]) if goals else []
     planned = workouts_store.list(user_id, win_start, win_end)
-    actual = workouts_store.activities(user_id, win_start, win_end)
-    if goal_id is not None:
-        goal = goals[0]
-        planned = goal_workouts(goal, anchor.list_blocks(user_id, goal["id"]), planned)
-        actual = goal_activities(goal, actual)
     total = len(planned)
-    planned = planned[:_MAX_WORKOUTS]
-    if not detail:
-        for w in planned:
-            desc = w.get("description")
-            if desc and len(desc) > _DESC_PREVIEW_CHARS:
-                w["description"] = desc[:_DESC_PREVIEW_CHARS].rstrip() + "…"
-    targets = anchor.coverage_range(user_id, win_start, win_end, goal_id)
-
-    week_list = _weeks(win_start, win_end, planned, actual, targets)
     payload: dict[str, Any] = {
-        "day": day,
-        "window": {"from_date": win_start, "to_date": win_end, "weeks": len(week_list)},
+        "today": today.isoformat(),
+        "window": {"from_date": win_start, "to_date": win_end},
         "can_undo": store.can_undo(user_id),
-        "goals": out_goals,
-        "weeks": week_list,
+        "goal": _goal(goals[0], blocks, today) if goals else None,
+        "weeks": _weeks(
+            win_start, win_end, planned[:_MAX_WORKOUTS],
+            workouts_store.activities(user_id, win_start, win_end),
+            anchor.coverage_range(user_id, win_start, win_end),
+        ),
     }
     if total > _MAX_WORKOUTS:
         payload["workouts_truncated"] = {"total": total, "shown": _MAX_WORKOUTS}
-    paces = workouts_store.zone_paces(user_id)
-    if paces:
-        payload["zone_paces"] = _zone_pace_summary(paces)
-    warnings = _plan_warnings(planned, paces, today)
-    if warnings:
-        payload["warnings"] = warnings
+    if full and blocks:
+        season = anchor.coverage_range(
+            user_id, min(b["start_date"] for b in blocks), max(b["end_date"] for b in blocks),
+        )
+        payload["season"] = [_slim(t) for t in season]
     return payload
-
-
-def _plan_warnings(
-    planned: list[dict[str, Any]], paces: dict[str, Any] | None, today: date,
-) -> list[str]:
-    """The same run-distance check ``apply`` runs, over the part of the
-    window inside :func:`check_window` (today through next week): still-planned
-    runs whose distance disagrees with their steps."""
-    lo, hi = check_window(today)
-    out: list[str] = []
-    for w in planned:
-        if (
-            w["activity_type"] == "run" and w["status"] == "planned"
-            and lo <= w["planned_date"] <= hi
-        ):
-            warning = run_distance_warning(w, estimate_run_km(w["steps"], paces))
-            if warning:
-                out.append(warning)
-    return out
-
-
-def _zone_pace_summary(paces: dict[str, Any]) -> dict[str, Any]:
-    """The learned run pace per HR zone, compact for the agent."""
-    zones = {}
-    for z, info in sorted(paces["zones"].items()):
-        lo, hi = info.get("hr_min"), info.get("hr_max")
-        bpm = f"{lo:g}-{hi:g}" if lo and hi else (f"<{hi + 1:g}" if hi else f">={lo:g}" if lo else None)
-        zones[f"Z{z}"] = {"bpm": bpm, "pace_min_km": round(info["pace_min_km"], 2)}
-    return {
-        "as_of": paces["as_of"],
-        "note": "learned easy-conditions pace per HR zone; run distance_km is "
-                "checked against the steps priced with these",
-        "zones": zones,
-    }

@@ -106,15 +106,16 @@ class TrainingStore:
             )
         if anchor_spec is not None and not isinstance(anchor_spec, dict):
             raise ValueError("'anchor' must be an object")
-        # Destructive = removes rows or overwrites weeks of an existing block.
+        # Destructive = removes rows or overwrites week targets.
         blocks = (anchor_spec or {}).get("blocks") or []
-        rewrites_weeks = any(
+        goal_weeks = (anchor_spec or {}).get("weeks") or []
+        rewrites_weeks = bool(goal_weeks) or any(
             isinstance(b, dict) and b.get("id") is not None and "weeks" in b
             for b in blocks
         )
         destructive = bool(
             (anchor_spec and (
-                anchor_spec.get("delete_goal_ids")
+                anchor_spec.get("delete_goal")
                 or anchor_spec.get("delete_blocks")
                 or rewrites_weeks
             ))
@@ -147,20 +148,21 @@ class TrainingStore:
         # the now-scheduled volume, so the caller sees a missed weekly target
         # immediately instead of summing workouts itself.
         dates = list(result.get("workouts", {}).pop("dates", []))
-        dates += [
-            w["week_start"] for b in blocks if isinstance(b, dict)
-            for w in (b.get("weeks") or []) if isinstance(w, dict) and w.get("week_start")
+        week_lists = [goal_weeks] + [
+            b.get("weeks") or [] for b in blocks if isinstance(b, dict)
         ]
-        warnings = result.get("workouts", {}).pop("warnings", [])
+        dates += [
+            str(w["week_start"]) for ws in week_lists for w in ws
+            if isinstance(w, dict) and w.get("week_start")
+        ]
         weeks = self._week_coverage(user_id, dates)
         if weeks:
             result["weeks"] = weeks
-        if warnings:
-            result["warnings"] = warnings
         return result
 
     def _week_coverage(self, user_id: int, dates: list[str]) -> list[dict[str, Any]]:
-        """Compact per-goal target/scheduled/delta for the weeks of ``dates``."""
+        """Compact target/scheduled/delta (minutes) plus the
+        estimated km for the weeks of ``dates``."""
         mondays = {_first_monday(date.fromisoformat(d[:10])).isoformat() for d in dates}
         if not mondays:
             return []
@@ -168,17 +170,13 @@ class TrainingStore:
         hi = (date.fromisoformat(hi) + timedelta(days=6)).isoformat()
         out = []
         for row in self.anchor.coverage_range(user_id, lo, hi):
-            cov = row["coverage"]
-            if row["week_start"] not in mondays or cov.get("target") is None:
-                continue
-            out.append({
-                "week_start": row["week_start"],
-                "goal_id": row["goal_id"],
-                "unit": cov["unit"],
-                "target": cov["target"],
-                "scheduled": cov["scheduled"],
-                "delta": cov["delta"],
-            })
+            if row["week_start"] in mondays and row["target_min"] is not None:
+                out.append({
+                    k: row[k] for k in (
+                        "week_start", "target_min", "scheduled_min",
+                        "delta_min", "change_pct", "est_km",
+                    )
+                })
         return out
 
     # -- one season-wide snapshot / undo --------------------------------------
@@ -251,26 +249,22 @@ class TrainingStore:
         for b in payload.get("blocks", []):
             conn.execute(
                 "INSERT INTO training_block (id, user_id, goal_id, name, "
-                "start_date, end_date, focus, target_weekly_km, "
-                "created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "start_date, end_date, focus, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     b.get("id"), user_id, b.get("goal_id"), b.get("name"),
                     b.get("start_date"), b.get("end_date"), b.get("focus"),
-                    b.get("target_weekly_km"),
                     b.get("created_at"), b.get("updated_at"),
                 ),
             )
         for w in payload.get("weeks", []):
             conn.execute(
                 "INSERT INTO training_week (id, user_id, block_id, week_start, "
-                "distance_km, duration_min, is_deload, "
-                "created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "duration_min, is_deload, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     w.get("id"), user_id, w.get("block_id"),
-                    w.get("week_start"),
-                    w.get("distance_km"), w.get("duration_min"),
+                    w.get("week_start"), w.get("duration_min"),
                     w.get("is_deload"),
                     w.get("created_at"), w.get("updated_at"),
                 ),
@@ -280,10 +274,9 @@ class TrainingStore:
                 "INSERT INTO training_workout (id, user_id, planned_date, "
                 "activity_type, title, description, duration_min, distance_km, "
                 "intensity, target_pace_min_km, target_hr_zone, target_power_w, "
-                "steps, status, completed_activity_id, goal_id, "
-                "created_at, updated_at) "
+                "steps, status, completed_activity_id, created_at, updated_at) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s, %s)",
+                "%s, %s, %s, %s)",
                 (
                     w.get("id"), user_id, w.get("planned_date"),
                     w.get("activity_type"), w.get("title"),
@@ -292,7 +285,6 @@ class TrainingStore:
                     w.get("target_pace_min_km"), w.get("target_hr_zone"),
                     w.get("target_power_w"), w.get("steps"), w.get("status"),
                     w.get("completed_activity_id"),
-                    w.get("goal_id"),
                     w.get("created_at"), w.get("updated_at"),
                 ),
             )
@@ -319,7 +311,7 @@ class TrainingSeason:
         store: TrainingStore,
         user_id: int,
         *,
-        today: Callable[[], date] | None = None,
+        today: Callable[[], date],
     ) -> None:
         self._store = store
         self._user_id = user_id
@@ -327,8 +319,7 @@ class TrainingSeason:
 
     def agenda(self, **window: Any) -> dict[str, Any]:
         """See :func:`.training_agenda.build_agenda` for the arguments."""
-        today = self._today() if self._today is not None else None
-        return build_agenda(self._store, self._user_id, today=today, **window)
+        return build_agenda(self._store, self._user_id, today=self._today(), **window)
 
     def apply(self, spec: dict[str, Any]) -> dict[str, Any]:
         return self._store.apply(self._user_id, spec)

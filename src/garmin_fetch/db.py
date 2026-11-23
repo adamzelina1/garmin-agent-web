@@ -309,7 +309,6 @@ CREATE TABLE IF NOT EXISTS training_workout (
     steps TEXT,
     status TEXT,
     completed_activity_id BIGINT,
-    goal_id BIGINT,
     created_at TEXT,
     updated_at TEXT
 );
@@ -339,7 +338,6 @@ CREATE TABLE IF NOT EXISTS training_block (
     start_date TEXT,
     end_date TEXT,
     focus TEXT,
-    target_weekly_km DOUBLE PRECISION,
     created_at TEXT,
     updated_at TEXT
 );
@@ -351,7 +349,6 @@ CREATE TABLE IF NOT EXISTS training_week (
     user_id BIGINT NOT NULL,
     block_id BIGINT NOT NULL,
     week_start TEXT,
-    distance_km DOUBLE PRECISION,
     duration_min INTEGER,
     is_deload BOOLEAN,
     created_at TEXT,

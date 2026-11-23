@@ -89,45 +89,23 @@ def _covering_block(
     )
 
 
-def _effective_week(
-    block: dict[str, Any], monday: str | None, stored: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """The target for one calendar week of a block.
-
-    The ONE place the block's ``target_weekly_km`` baseline applies. A stored
-    week row wins (a missing ``distance_km`` on it falls back to the baseline).
-    With no row, a dated block that spans ``monday`` and has a baseline yields a
-    synthetic week; otherwise None.
-    """
-    baseline = block.get("target_weekly_km")
-    if stored is not None:
-        week = dict(stored)
-        if week.get("distance_km") is None and baseline is not None:
-            week["distance_km"] = baseline
-        if week.get("is_deload") is None:
-            week["is_deload"] = False
-        return week
-    if baseline is None or not monday:
+def _effective_week(stored: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The target of one calendar week: its stored row (``is_deload``
+    defaulted to False), or None. Week targets are minutes only."""
+    if stored is None:
         return None
-    if not (block.get("start_date") and block.get("end_date")):
-        return None
-    first = _first_monday(date.fromisoformat(block["start_date"])).isoformat()
-    last = _first_monday(date.fromisoformat(block["end_date"])).isoformat()
-    if first <= monday <= last:
-        return {
-            "week_start": monday,
-            "distance_km": baseline,
-            "duration_min": None,
-            "is_deload": False,
-        }
-    return None
+    week = dict(stored)
+    if week.get("is_deload") is None:
+        week["is_deload"] = False
+    return week
 
 
 def _resolve_block_weeks(
     block: dict[str, Any], raw_weeks: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Every calendar-week target of a block: stored row or baseline for each
-    week of a dated block's span, plus any stored week outside that span."""
+    """Every calendar-week target of a block: the stored row (or an empty
+    week) for each week of a dated block's span, plus any stored week outside
+    that span."""
     by_start = {w["week_start"]: w for w in raw_weeks if w.get("week_start")}
     resolved: list[dict[str, Any]] = []
     count = _block_week_count(block)
@@ -136,74 +114,64 @@ def _resolve_block_weeks(
         for i in range(count):
             ws = (base + timedelta(days=7 * i)).isoformat()
             resolved.append(
-                _effective_week(block, ws, by_start.get(ws))
-                or {"week_start": ws, "distance_km": None,
-                    "duration_min": None, "is_deload": False}
+                _effective_week(by_start.get(ws))
+                or {"week_start": ws, "duration_min": None, "is_deload": False}
             )
     in_span = {w["week_start"] for w in resolved}
     for w in raw_weeks:
         if w.get("week_start") not in in_span:
-            resolved.append(_effective_week(block, w.get("week_start"), w))
+            resolved.append(_effective_week(w))
     return resolved
 
 
-def _coverage_entry(
-    week: dict[str, Any], week_start: str, week_end: str,
-    km: Any, mins: Any, actual_km: Any = 0, actual_min: Any = 0,
-) -> dict[str, Any]:
-    """Scheduled-vs-target coverage for one calendar week.
-
-    The week's target unit is km when it carries ``distance_km``, else minutes
-    when it carries ``duration_min`` (else no target). ``km``/``mins`` are the
-    pre-summed planned totals and ``actual_km``/``actual_min`` the pre-summed
-    synced-activity totals for the week, so callers can batch the SUMs.
-    """
-    if week.get("distance_km") is not None:
-        unit, target = "km", week["distance_km"]
-    elif week.get("duration_min") is not None:
-        unit, target = "min", week["duration_min"]
-    else:
-        unit, target = None, None
-    if unit == "km":
-        scheduled = round(float(km or 0), 2)
-        actual = round(float(actual_km or 0), 2)
-    elif unit == "min":
-        scheduled = int(mins or 0)
-        actual = int(actual_min or 0)
-    else:
-        scheduled = 0
-        actual = 0
+def _minutes_by_week(
+    weeks_by_block: dict[int, list[dict[str, Any]]],
+) -> dict[str, int]:
+    """Every stored week target of a goal (all blocks), keyed by Monday."""
     return {
-        "week_start": week_start,
-        "week_end": week_end,
-        "unit": unit,
-        "target": target,
-        "scheduled": scheduled,
-        "actual": actual,
-        "delta": round(scheduled - target, 2) if target is not None else None,
+        w["week_start"]: w["duration_min"]
+        for weeks in weeks_by_block.values() for w in weeks
+        if w.get("week_start") and w.get("duration_min")
     }
 
 
-def check_window(today: date | None = None) -> tuple[str, str]:
-    """The days the distance warnings cover: today through the end of next
-    week. Estimates use today's zone paces, which go stale as fitness
-    changes, so later weeks are only checked once they come into range."""
-    today = today or date.today()
-    end = _first_monday(today) + timedelta(days=13)
-    return today.isoformat(), end.isoformat()
-
-
-def run_distance_warning(workout: dict[str, Any], estimate_km: float | None) -> str | None:
-    """Warning when a run's distance is more than 10% (and 0.5 km) off what
-    its steps estimate; None when it agrees or can't be checked."""
-    km = workout.get("distance_km")
-    if estimate_km is None or km is None or abs(km - estimate_km) <= max(0.5, 0.1 * estimate_km):
+def _change_pct(minutes_by_week: dict[str, int], week_start: str) -> int | None:
+    """A week's target minutes vs the previous calendar week's (whole %,
+    across block boundaries); None unless both weeks have a target."""
+    prev = (date.fromisoformat(week_start) - timedelta(days=7)).isoformat()
+    cur, before = minutes_by_week.get(week_start), minutes_by_week.get(prev)
+    if not cur or not before:
         return None
-    return (
-        f"workout {workout['id']} ({workout['planned_date']}): distance_km {km:g} "
-        f"but its steps estimate {estimate_km:g} km ({workout.get('duration_min')} "
-        "min at the step paces / HR-zone paces) — fix the steps or the distance"
-    )
+    return round((cur - before) / before * 100)
+
+
+def _coverage_entry(
+    week: dict[str, Any], km: Any, mins: Any,
+    actual_km: Any = 0, actual_min: Any = 0, change_pct: int | None = None,
+) -> dict[str, Any]:
+    """One week's target vs its planned and synced volume — the shape the
+    plan tab, the agent's read and an edit result all use.
+
+    ``target_min`` is the week's ``duration_min``; ``delta_min`` is
+    scheduled minus target; ``change_pct`` is the target vs the previous
+    week's (see :func:`_change_pct`). ``est_km`` (the planned runs' estimated
+    km) and ``actual_km`` are for display only — km is never a target.
+    Zero km/actuals (an unbuilt or future week) are None. ``km``/``mins``
+    are the pre-summed planned totals and ``actual_km``/``actual_min`` the
+    synced-activity totals, so callers can batch the SUMs.
+    """
+    target = week.get("duration_min")
+    scheduled = int(round(float(mins or 0)))
+    return {
+        "target_min": target,
+        "scheduled_min": scheduled,
+        "delta_min": scheduled - target if target is not None else None,
+        "change_pct": change_pct,
+        "deload": True if week.get("is_deload") else None,
+        "est_km": round(float(km or 0), 1) or None,
+        "actual_min": int(round(float(actual_min or 0))) or None,
+        "actual_km": round(float(actual_km or 0), 1) or None,
+    }
 
 
 def _activity_matches(plan_type: str, garmin_type: str | None) -> bool:
@@ -230,9 +198,8 @@ def _workout_matches_sport(sport: str | None, activity_type: str | None) -> bool
 
     Both values come from :data:`ACTIVITY_TYPES` ("run", "cycle", "swim",
     "strength", "rest", "other"). A goal with no sport (or "other"/"rest")
-    matches all workout types. A workout with "rest" or "other" belongs to
-    the active phase regardless of sport. Otherwise the types must match
-    (or map via :data:`GARMIN_TYPE_MAP`).
+    matches all workout types, and a "rest"/"other" workout matches any
+    sport. Otherwise the types must match (or map via :data:`GARMIN_TYPE_MAP`).
     """
     if not sport or sport in ("other", "rest"):
         return True
@@ -244,41 +211,16 @@ def _workout_matches_sport(sport: str | None, activity_type: str | None) -> bool
     return allowed is not None and activity_type in allowed
 
 
-def workout_in_goal(
-    goal: dict[str, Any], blocks: list[dict[str, Any]], workout: dict[str, Any]
-) -> bool:
-    """The ONE rule for "does this planned workout belong to this goal".
-
-    An explicit ``goal_id`` decides. Otherwise the workout's type must fit the
-    goal's sport and its ``planned_date`` must fall inside one of the goal's
-    dated blocks or, failing that, the goal's own start..target window (open
-    bounds match). The store's coverage numbers and the agent's ``planned``
-    lists both go through this, so they cannot disagree.
-    """
-    gid = workout.get("goal_id")
-    if gid is not None:
-        return int(gid) == int(goal["id"])
-    if not _workout_matches_sport(goal.get("sport"), workout.get("activity_type")):
-        return False
-    day = workout.get("planned_date")
-    if not day:
-        return False
-    if any(
-        b.get("start_date") and b.get("end_date")
-        and b["start_date"] <= day <= b["end_date"]
-        for b in blocks
-    ):
-        return True
-    start, target = goal.get("start_date"), goal.get("target_date")
-    return (not start or start <= day) and (not target or day <= target)
-
-
 def goal_workouts(
-    goal: dict[str, Any], blocks: list[dict[str, Any]],
-    workouts: list[dict[str, Any]],
+    goal: dict[str, Any], workouts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """The workouts that belong to ``goal`` (see :func:`workout_in_goal`)."""
-    return [w for w in workouts if workout_in_goal(goal, blocks, w)]
+    """The planned workouts that count toward the (one) goal's weekly
+    volume: those whose type fits its sport. An account has one goal, so
+    there is nothing else to attribute."""
+    return [
+        w for w in workouts
+        if _workout_matches_sport(goal.get("sport"), w.get("activity_type"))
+    ]
 
 
 def goal_activities(
@@ -294,18 +236,10 @@ def goal_activities(
 def _closest_activity(
     candidates: list[dict[str, Any]], workout: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """Pick the candidate nearest the planned distance/duration."""
+    """Pick the candidate nearest the planned duration (the plan's unit;
+    a run's planned distance is only an estimate)."""
     if not candidates:
         return None
-    if len(candidates) == 1:
-        return candidates[0]
-    if workout.get("distance_km") is not None:
-        with_distance = [a for a in candidates if a.get("distance_km") is not None]
-        if with_distance:
-            return min(
-                with_distance,
-                key=lambda a: abs(workout["distance_km"] - a["distance_km"]),
-            )
     if workout.get("duration_min") is not None:
         with_duration = [a for a in candidates if a.get("duration_hours") is not None]
         if with_duration:

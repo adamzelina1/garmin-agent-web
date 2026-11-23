@@ -332,7 +332,12 @@
   .wp-row .wp-fill { position:absolute; left:0; top:0; bottom:0; border-radius:5px; }
   .wp-row .wp-fill.actual { background:var(--accent); }
   .wp-row .wp-pct { color:var(--muted); font-weight:700; white-space:nowrap; min-width:34px; text-align:right; }
-.wp-coverage { margin-top:4px; font-size:11.5px; color:var(--muted); }
+  .wp-stats { display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 18px; margin-bottom:8px;
+    font-size:12.5px; color:var(--muted); }
+  .wp-stats b { color:var(--text); font-weight:700; font-size:14px; }
+  .wp-stat.tag { padding:1px 8px; border-radius:10px; background:var(--surface-3); }
+  .wp-stat.tag b { font-size:11.5px; font-weight:600; }
+  .wp-warn { margin-top:6px; font-size:12px; color:#f59e0b; }
   .goal-head { display:flex; align-items:center; gap:10px; }
   .goal-head .goal-title { font-weight:700; font-size:15px; color:var(--text); white-space:nowrap;
                            text-overflow:ellipsis; overflow:hidden; }
@@ -351,7 +356,6 @@
                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .goal-active .ga-title b { color:var(--text); font-weight:700; }
   .goal-active .ga-week { color:var(--muted); font-weight:500; }
-  .goal-active .ga-target { flex:none; color:var(--muted); font-size:12px; font-weight:600; white-space:nowrap; }
   .micro-stepper { display:flex; gap:4px; margin-top:8px; align-items:flex-start; }
   .micro-stepper .ms-col { flex:1; min-width:0; }
   .micro-stepper .ms-seg { display:block; height:4px; border-radius:2px; background:rgba(255,255,255,.12);
@@ -540,7 +544,6 @@
   .week-row { display:flex; align-items:center; gap:6px; margin-top:6px; }
   .week-row input[type=number], .week-row input[type=text] { padding:4px 6px; font-size:12px; }
   .week-row .w-idx { width:44px; flex:none; }
-  .week-row .w-km { width:70px; flex:none; }
   .week-row .w-min { width:70px; flex:none; }
   .week-row .w-int { flex:1; min-width:70px; }
 .week-row .w-deload { display:flex; align-items:center; gap:4px; font-size:11px; color:var(--muted); flex:none; }
@@ -930,7 +933,7 @@
           <input type="number" id="pm-duration" min="0" placeholder="30">
         </div>
         <div>
-          <label title="Runs: leave empty to fill in the estimate from each step's pace or HR-zone pace">Distance (km)</label>
+          <label title="Runs: always estimated from the steps at your zone paces (anything typed here is replaced)">Distance (km)</label>
           <input type="number" id="pm-distance" min="0" step="any" placeholder="5.0">
         </div>
       </div>
@@ -1512,7 +1515,8 @@ function buildPlanTable(box, workouts) {
     tr.appendChild(mk(w.title || (w.activity_type === "rest" ? "Rest" : "")));
     tr.appendChild(mk(w.intensity || ""));
     tr.appendChild(mk(w.duration_min != null ? w.duration_min + " min" : ""));
-    tr.appendChild(mk(w.distance_km != null ? Number(w.distance_km) + " km" : ""));
+    tr.appendChild(mk(w.distance_km != null
+      ? (w.activity_type === "run" ? "~" : "") + Number(w.distance_km) + " km" : ""));
     tr.appendChild(mk(w.completed ? "yes" : ""));
     tbody.appendChild(tr);
   }
@@ -2112,6 +2116,8 @@ function renderAnchor(goals) {
   const box = $("plan-anchor");
   if (!box) return;
   planGoals = goals;
+  // An account has one goal: once it exists, it is edited, never added to.
+  $("goal-new").classList.toggle("hidden", goals.length > 0);
   renderGoalSelector();
   const g = selectedGoal();
   if (!g) {
@@ -2221,14 +2227,6 @@ function renderOneAnchor(container, anchor) {
       t.appendChild(wk);
     }
     headRow.appendChild(t);
-    const target = week ? (week.distance_km != null ? Number(week.distance_km) + " km"
-      : (week.duration_min != null ? Number(week.duration_min) + " min" : null)) : null;
-    if (target) {
-      const tg = document.createElement("div");
-      tg.className = "ga-target";
-      tg.textContent = "Target: " + target;
-      headRow.appendChild(tg);
-    }
     box.appendChild(headRow);
 
     const stepper = document.createElement("div");
@@ -2258,10 +2256,6 @@ function renderOneAnchor(container, anchor) {
     b.textContent = "Week " + weekNum + (totalWeeks ? " of " + totalWeeks : "");
     sub.appendChild(b);
     if (block && block.name) sub.appendChild(document.createTextNode(" · " + block.name));
-    const target = week.distance_km != null
-      ? Number(week.distance_km) + " km"
-      : (week.duration_min != null ? Number(week.duration_min) + " min" : null);
-    if (target) sub.appendChild(document.createTextNode(" · Target: " + target));
     box.appendChild(sub);
   }
 
@@ -2389,50 +2383,63 @@ function applyBlockHighlight() {
 // Renders the compact weekly target-vs-actual bar into the plan toolbar (right
 // above the calendar). The verbose legend/notes are gone — the toolbar is the
 // single source for this week's numbers.
+// A week's target change vs the previous week: "+5%", "−17%", "±0%".
+function fmtChangePct(p) {
+  return p > 0 ? "+" + p + "%" : p < 0 ? "−" + Math.abs(p) + "%" : "±0%";
+}
+
 function renderWeeklyProgressInto(host, goal) {
   if (!host || !goal) return;
   host.innerHTML = "";
   const tgt = goal.weekly_target;
   if (!tgt || !tgt.week) return;
   const week = tgt.week;
-  const cov = tgt.coverage || null;
-  const haveKm = week.distance_km != null;
-  const haveMin = week.duration_min != null;
-  const unit = (cov && cov.unit) ? cov.unit : (haveKm ? "km" : "min");
-
-  // All numbers come from the server's goal-scoped coverage: actual = synced
-  // activities for the goal's sport, scheduled = planned workouts for the goal,
-  // target = the block week's target.
+  // All numbers come from the server's coverage: actual = synced activities
+  // of the goal's sport, scheduled = planned workouts, target = the week's
+  // target. Volume is planned in minutes; km is only an estimate.
+  const cov = tgt.coverage || {};
   const rounded = (n) => Math.round(n * 10) / 10;
-  const actual = (cov && cov.actual != null) ? Number(cov.actual) : 0;
-  const scheduled = (cov && cov.scheduled != null) ? Number(cov.scheduled) : 0;
-  const weekTarget = (cov && cov.target != null)
-    ? Number(cov.target)
-    : (haveKm ? week.distance_km : (haveMin ? week.duration_min : null));
-  const denom = scheduled > 0 ? scheduled : weekTarget;
-  const pct = denom ? Math.min(100, Math.round((actual / denom) * 100)) : 0;
+  const target = cov.target_min != null ? Number(cov.target_min) : week.duration_min;
+  const done = Number(cov.actual_min || 0);
+  const total = target || Number(cov.scheduled_min || 0);
+  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  // The week at a glance: target, estimated km, change vs last week, deload.
+  const stats = document.createElement("div");
+  stats.className = "wp-stats";
+  const stat = (strong, rest, cls) => {
+    const el = document.createElement("span");
+    el.className = "wp-stat" + (cls ? " " + cls : "");
+    const b = document.createElement("b");
+    b.textContent = strong;
+    el.appendChild(b);
+    if (rest) el.appendChild(document.createTextNode(rest));
+    stats.appendChild(el);
+  };
+  if (target != null) stat(String(target), " min this week");
+  if (cov.est_km) stat("~" + rounded(cov.est_km), " km");
+  if (cov.change_pct != null) stat(fmtChangePct(cov.change_pct), " vs last week");
+  if (cov.deload) stat("Deload", "", "tag");
+  host.appendChild(stats);
 
   const row = document.createElement("div");
   row.className = "wp-row wp-compact";
-
   const barRow = document.createElement("div");
   barRow.className = "wp-bar-row";
   const label = document.createElement("span");
   label.className = "wp-num";
-  const actualB = document.createElement("b");
-  actualB.textContent = rounded(actual);
-  label.appendChild(actualB);
-  label.appendChild(document.createTextNode(" / " + (denom != null ? rounded(denom) : "–") + " " + unit));
+  const doneB = document.createElement("b");
+  doneB.textContent = Math.round(done);
+  label.appendChild(doneB);
+  label.appendChild(document.createTextNode(" of " + (total || "–") + " min done"));
   barRow.appendChild(label);
-
   const track = document.createElement("span");
   track.className = "wp-track";
-  const actualFill = document.createElement("span");
-  actualFill.className = "wp-fill actual";
-  actualFill.style.width = pct + "%";
-  track.appendChild(actualFill);
+  const fill = document.createElement("span");
+  fill.className = "wp-fill actual";
+  fill.style.width = pct + "%";
+  track.appendChild(fill);
   barRow.appendChild(track);
-
   const pctEl = document.createElement("span");
   pctEl.className = "wp-pct";
   pctEl.textContent = pct + "%";
@@ -2440,14 +2447,13 @@ function renderWeeklyProgressInto(host, goal) {
   row.appendChild(barRow);
   host.appendChild(row);
 
-  // Reconciliation line: does the week's calendar match the anchor's target?
-  if (cov && cov.target != null && cov.delta != null) {
-    const c = document.createElement("div");
-    c.className = "wp-coverage";
-    const sign = cov.delta > 0 ? "+" : "";
-    c.textContent = "Scheduled " + rounded(cov.scheduled) + " vs target "
-      + rounded(cov.target) + " " + unit + " (" + sign + rounded(cov.delta) + ")";
-    host.appendChild(c);
+  // Only when the planned workouts don't add up to the week's target.
+  if (cov.delta_min) {
+    const warn = document.createElement("div");
+    warn.className = "wp-warn";
+    warn.textContent = "Workouts add up to " + cov.scheduled_min + " min — "
+      + Math.abs(cov.delta_min) + " min " + (cov.delta_min > 0 ? "over" : "under") + " the target.";
+    host.appendChild(warn);
   }
 }
 
@@ -2538,7 +2544,6 @@ function renderBlockDetail(container, b) {
   if (b.start_date && b.end_date) meta.push(b.start_date + " → " + b.end_date);
   else if (b.start_date) meta.push("from " + b.start_date);
   else if (b.end_date) meta.push("to " + b.end_date);
-  if (b.target_weekly_km != null) meta.push(b.target_weekly_km + " km/wk target");
   if (meta.length) {
     const m = document.createElement("div");
     m.className = "pd-meta";
@@ -2551,7 +2556,7 @@ function renderBlockDetail(container, b) {
     f.textContent = b.focus;
     container.appendChild(f);
   }
-  const hasAnyTarget = b.weeks && b.weeks.some((x) => x.distance_km != null || x.duration_min != null || x.is_deload);
+  const hasAnyTarget = b.weeks && b.weeks.some((x) => x.duration_min != null || x.is_deload);
   if (b.weeks && b.weeks.length && hasAnyTarget) {
     const w = document.createElement("div");
     w.className = "pd-weeks";
@@ -2564,9 +2569,9 @@ function renderBlockDetail(container, b) {
       row.className = "pd-week";
       const head = document.createElement("div");
       head.className = "pd-week-head";
-      const d = x.distance_km != null ? x.distance_km + "km"
-        : (x.duration_min != null ? x.duration_min + "min" : "");
-      const bits = [d, x.is_deload ? "deload" : ""].filter(Boolean).join(" ");
+      const d = x.duration_min != null ? x.duration_min + "min" : "";
+      const ch = x.change_pct != null ? "(" + fmtChangePct(x.change_pct) + ")" : "";
+      const bits = [d, ch, x.is_deload ? "deload" : ""].filter(Boolean).join(" ");
       head.textContent = "W" + (wi + 1) + (bits ? " · " + bits : "");
       row.appendChild(head);
       w.appendChild(row);
@@ -2928,13 +2933,17 @@ function workoutMeta(w) {
   const parts = [];
   // Zero-valued fields (0 km on a trainer ride, 0 min on a lift) are database
   // filler — drop them instead of leaking "0 km · 0 min" into the card.
-  if (w.distance_km != null && Number(w.distance_km) > 0) {
-    parts.push({ v: String(Number(w.distance_km)), u: "km" });
-  }
+  // Minutes are the plan; a run's km is only an estimate from its steps.
   if (w.duration_min != null && Number(w.duration_min) > 0) {
     parts.push({ v: String(Number(w.duration_min)), u: "min" });
   }
-  if (w.intensity) parts.push({ v: String(w.intensity).replace(/_/g, " "), u: "" });
+  if (w.distance_km != null && Number(w.distance_km) > 0) {
+    const est = w.activity_type === "run" ? "~" : "";
+    parts.push({ v: est + String(Number(w.distance_km)), u: "km" });
+  }
+  // The zone/pace/power target already says how hard; intensity only fills in.
+  const hasTarget = w.target_hr_zone || w.target_pace_min_km != null || w.target_power_w != null;
+  if (w.intensity && !hasTarget) parts.push({ v: String(w.intensity).replace(/_/g, " "), u: "" });
   return parts;
 }
 
@@ -2984,7 +2993,7 @@ function fmtHrZone(v) {
 }
 
 // Structured-workout helpers: format a step duration (90s -> "1:30"), sum a
-// step list's effective time (repeat-aware), and build one compact chip.
+// step list's total time, and build one compact chip.
 function fmtStepDuration(sec) {
   sec = Math.round(Number(sec) || 0);
   if (sec < 60) return sec + "s";
@@ -2994,7 +3003,7 @@ function fmtStepDuration(sec) {
 }
 
 function stepTotalSec(steps) {
-  return (steps || []).reduce((a, s) => a + (Number(s.duration_sec) || 0) * (Number(s.repeat) || 1), 0);
+  return (steps || []).reduce((a, s) => a + (Number(s.duration_sec) || 0), 0);
 }
 
 function fmtTotalMin(sec) {
@@ -3003,7 +3012,7 @@ function fmtTotalMin(sec) {
 
 function stepName(s) {
   const meta = STEP_KIND_MAP[s.kind];
-  return (s.repeat && s.repeat > 1 ? s.repeat + "× " : "") + (s.label || meta.label);
+  return s.label || meta.label;
 }
 
 function stepTargetsText(s) {
@@ -3192,8 +3201,8 @@ function workoutCard(w) {
   const m = document.createElement("div");
   m.className = "pc-meta";
   const metrics = workoutMeta(w).concat(w.activity_type === "rest" ? [] : workoutTargets(w));
-  if (hasSteps) {
-    metrics.push({ v: String(w.steps.length), u: w.steps.length > 1 ? "steps" : "step",
+  if (hasSteps && w.steps.length > 1) {
+    metrics.push({ v: String(w.steps.length), u: "steps",
                    title: "Structured workout — hover for the splits" });
   }
   for (const part of metrics) m.appendChild(metricNode(part));
@@ -3402,7 +3411,6 @@ function addStepRow(step) {
   stepInput(row, "st-label", "text", "label", s.label || "");
   stepInput(row, "st-min", "number", "min", sec != null ? Math.floor(sec / 60) : "");
   stepInput(row, "st-sec", "number", "sec", sec != null ? sec % 60 : "");
-  stepInput(row, "st-repeat", "number", "×", s.repeat > 1 ? s.repeat : "");
 
   const intensity = document.createElement("select");
   intensity.className = "st-intensity";
@@ -3447,7 +3455,6 @@ function collectSteps() {
     if (duration_sec <= 0) return;
     const step = { kind: val(".st-kind") || "steady", duration_sec };
     const label = val(".st-label"); if (label) step.label = label;
-    const repeat = Number(val(".st-repeat") || 0); if (repeat > 1) step.repeat = Math.round(repeat);
     const intensity = val(".st-intensity"); if (intensity) step.intensity = intensity;
     const pace = val(".st-pace"); if (pace !== "") step.target_pace_min_km = Number(pace);
     const hr = val(".st-hr"); if (hr) step.target_hr_zone = hr;
@@ -3744,9 +3751,6 @@ function blockEditor(block, bi) {
   card.appendChild(goalRow(
     blockField("Start", "start_date", block, { type: "date" }, () => fitWeeks(block)),
     blockField("End", "end_date", block, { type: "date" }, () => fitWeeks(block))));
-  card.appendChild(goalRow(
-    blockField("Target weekly km", "target_weekly_km", block, { type: "number", step: "any", min: "0", placeholder: "50" })));
-
   const dated = block.start_date && block.end_date && block.end_date >= block.start_date;
   const wh = document.createElement("div");
   wh.className = "block-head-row";
@@ -3787,9 +3791,6 @@ function weekRow(block, week, wi) {
     });
     return inp;
   };
-  const km = num("w-km", "distance_km", { step: "any", min: "0" });
-  km.placeholder = block.target_weekly_km != null ? String(block.target_weekly_km) : "km";
-  row.appendChild(km);
   const mn = num("w-min", "duration_min", { min: "0" });
   mn.placeholder = "min";
   row.appendChild(mn);
@@ -3827,7 +3828,6 @@ async function saveGoal() {
         focus: b.focus || null,
         start_date: b.start_date || null,
         end_date: b.end_date || null,
-        target_weekly_km: b.target_weekly_km == null || b.target_weekly_km === "" ? null : Number(b.target_weekly_km),
       };
       // Undated blocks cannot carry week targets, so only a dated block sends
       // its weeks. The server patches by week_start, so EVERY week is sent: one
@@ -3837,11 +3837,8 @@ async function saveGoal() {
         entry.weeks = (b.weeks || [])
           .map((w, wi) => {
             const ws = w.week_start || fmt(new Date(base.getTime() + wi * 7 * 86400000));
-            const hasExplicitKm = w.distance_km != null && w.distance_km !== ""
-              && (b.target_weekly_km == null || Number(w.distance_km) !== Number(b.target_weekly_km) || w.is_deload);
             return {
               week_start: ws,
-              distance_km: hasExplicitKm ? Number(w.distance_km) : null,
               duration_min: w.duration_min == null || w.duration_min === "" ? null : Number(w.duration_min),
               is_deload: !!w.is_deload,
             };

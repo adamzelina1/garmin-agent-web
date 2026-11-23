@@ -333,10 +333,10 @@ def _step_pace(step: dict[str, Any], paces: dict[str, Any] | None) -> float | No
 
 
 def steps_minutes(steps: list[dict[str, Any]]) -> int | None:
-    """Total planned time of the steps (repeats included), whole minutes."""
+    """Total planned time of the steps (one entry per rep), whole minutes."""
     if not steps:
         return None
-    return round(sum(s["duration_sec"] * (s.get("repeat") or 1) for s in steps) / 60)
+    return round(sum(s["duration_sec"] for s in steps) / 60)
 
 
 def estimate_run_km(
@@ -355,5 +355,34 @@ def estimate_run_km(
         pace = _step_pace(step, paces)
         if not pace:
             return None
-        km += step["duration_sec"] * (step.get("repeat") or 1) / 60.0 / pace
+        km += step["duration_sec"] / 60.0 / pace
     return round(km, 1) if steps else None
+
+
+def reprice_planned_runs(conn: Any, user_id: int) -> int:
+    """Re-estimate ``distance_km`` of every still-planned run from its steps
+    at the current zone paces, so the km follow the paces as they change.
+    Completed and skipped runs keep the estimate they were planned with.
+    ``conn`` must be RLS-bound to the user; the caller commits. Returns the
+    number of runs whose estimate changed."""
+    paces = read_zone_paces(conn)
+    if not paces:
+        return 0
+    rows = conn.execute(
+        "SELECT id, distance_km, steps FROM training_workout "
+        "WHERE user_id = %s AND activity_type = 'run' AND steps IS NOT NULL "
+        "AND (status IS NULL OR status = 'planned')",
+        (user_id,),
+    ).fetchall()
+    updates = []
+    for r in rows:
+        km = estimate_run_km(json.loads(r["steps"]), paces)
+        if km is not None and km != r["distance_km"]:
+            updates.append((km, user_id, r["id"]))
+    if updates:
+        conn.cursor().executemany(
+            "UPDATE training_workout SET distance_km = %s "
+            "WHERE user_id = %s AND id = %s",
+            updates,
+        )
+    return len(updates)

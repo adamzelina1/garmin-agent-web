@@ -212,26 +212,24 @@ _TABLE_NOTES: dict[str, str] = {
     ),
     "training_workout": (
         "planned workouts; READ-ONLY via SQL — write only through "
-        "training_apply. planned_date and activity_type associate workouts to the active "
-        "block and goal (goal_id is an optional manual override). status is "
+        "training_apply. planned_date places a workout in its block and week. status is "
         "planned/completed/partial/skipped; target_* columns hold the prescribed pace/HR-zone/power"
     ),
     "training_goal": (
-        "one row per long-term goal/target (an event such as a marathon or a "
-        "half-marathon) over [start_date, target_date]; an account may hold many. read-only via "
+        "the account's ONE long-term goal (an event such as a marathon) over "
+        "[start_date, target_date]; the whole season hangs off it. read-only via "
         "SQL — write only through training_apply. sport is "
         "run/cycle/swim/strength/rest/other"
     ),
     "training_block": (
         "one row per periodized phase of a goal: name/focus are free text, "
-        "start_date/end_date define the span (ordered chronologically by start_date), "
-        "target_weekly_km provides an optional baseline weekly volume for weeks in this phase; "
+        "start_date/end_date define the span (ordered chronologically by start_date); "
         "read-only via SQL — write only through training_apply"
     ),
     "training_week": (
-        "one row per (block_id, week_start): explicit targets for one calendar "
-        "week (Mon..Sun) of a block — distance_km and/or duration_min, optional "
-        "is_deload flag; falls back to block's target_weekly_km when distance_km is NULL. "
+        "one row per (block_id, week_start): the target for one calendar "
+        "week (Mon..Sun) of a block — duration_min (minutes; the only volume "
+        "target) and an optional is_deload flag. "
         "read-only via SQL — write only through training_apply"
     ),
     "weather_forecast": (
@@ -333,7 +331,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
     "training_workout": {
         "activity_type": "run/cycle/swim/strength/rest/other",
         "duration_min": "planned minutes (computed from steps)",
-        "distance_km": "planned km",
+        "distance_km": "planned km; for a run an ESTIMATE from its steps at the learned zone paces",
         "target_pace_min_km": "prescribed running pace as DECIMAL min/km (5.5 = 5:30)",
         "target_hr_zone": "prescribed HR zone/target, free text (e.g. 'Z2' or '140-150')",
         "target_power_w": "prescribed power in watts (int)",
@@ -343,14 +341,14 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
             "recovery/cool-down, intervals, strides, ...); at least one for "
             "every non-rest workout (NULL only on rest days); stored as "
             "{kind: warmup/steady/work/recovery/cooldown/rest, duration_sec, "
-            "repeat?, label?, intensity?, target_pace_min_km?, target_hr_zone?, "
+            "label?, intensity?, target_pace_min_km?, target_hr_zone?, "
             "target_power_w?}; label is a short segment name (no duration/rep). "
+            "Intervals are written out one step per rep. "
             "When WRITING via training_apply pass a friendly `duration` "
             "string ('15m', '90s', '1:30') instead of seconds; NULL/[] only for "
             "a single continuous effort"
         ),
         "status": "planned/completed/partial/skipped; 'partial' and 'completed' both count as done",
-        "goal_id": "training_goal.id the workout optionally overrides to (usually resolved automatically by planned_date)",
         "completed_activity_id": (
             "activity_summaries.activity_id that satisfied it — join for actual stats"
         ),
@@ -364,14 +362,12 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
     "training_block": {
         "name": "free text phase label (Base/Build/Peak/Taper or any custom name)",
         "focus": "free text training focus",
-        "start_date": "YYYY-MM-DD, may be NULL (undated block, which cannot carry week targets)",
-        "end_date": "YYYY-MM-DD, may be NULL (undated block); must be on/after start_date",
-        "target_weekly_km": "optional baseline weekly km for weeks in this block",
+        "start_date": "YYYY-MM-DD (required)",
+        "end_date": "YYYY-MM-DD (required); on/after start_date",
     },
     "training_week": {
-        "week_start": "Monday of this calendar week (YYYY-MM-DD); derived from the block start + the week's position",
-        "distance_km": "target km for this week (NULL if only time is tracked)",
-        "duration_min": "target minutes for this week; careful about per-week totals vs a single session",
+        "week_start": "Monday of this calendar week (YYYY-MM-DD)",
+        "duration_min": "target total minutes for this week (the weekly volume target)",
         "is_deload": "true when this week is a planned recovery/deload week",
     },
     "weather_forecast": {
