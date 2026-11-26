@@ -86,10 +86,12 @@ class _Training(Protocol):
     def apply(self, spec: dict[str, Any]) -> dict[str, Any]: ...
 
 
-#: Guard a statement is a read-only query and not a write. (No REPLACE:
+#: Guard a statement is a read-only query and not a write. Leading parentheses
+#: are allowed — ``(SELECT … LIMIT 8) UNION ALL (SELECT …)`` is a query, and
+#: Postgres only parses a parenthesised statement as one. (No REPLACE:
 #: Postgres has no such statement, and the word blocked the harmless
 #: ``replace()`` string function.)
-_SELECT_PREFIX = re.compile(r"^\s*(?:SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
+_SELECT_PREFIX = re.compile(r"^[\s(]*(?:SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
 _WRITE_WORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|REINDEX|VACUUM|"
     r"TRIGGER)\b",
