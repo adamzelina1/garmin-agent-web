@@ -17,14 +17,14 @@ uv run garmin-ask "avg sleep last week?"   # ask the agent locally (also: garmin
 uv add <pkg>                         # add a dependency
 ```
 
-There is no test suite and no linter configured. The project is deliberately test-free — use ephemeral one-off scripts in the scratchpad if you need to verify something. There is also deliberately **no migration/backfill logic**; `create_schema` is idempotent and that is all.
+There is no test suite and no linter configured. The project is deliberately test-free — use ephemeral one-off scripts in the scratchpad if you need to verify something. There is also deliberately **no migration/backfill logic in the codebase**; `create_schema` is idempotent and that is all. When a change leaves old data behind, clean it up with a temporary one-time script (scratchpad, run once, never committed).
 
 ## No Legacy Guards or Backward-Compatibility Shims
 
 - Always write code that reflects the current, canonical state of the codebase.
 - Assume a clean cutover for all changes: update all callers, types, and references directly, and delete superseded code cleanly.
 - Never add defensive fallbacks, adapters, dual-format checks, or migration guards for previous code behavior or old data shapes (e.g., avoid `newProp ?? oldProp`, deprecated parameter overloads, or runtime checks for legacy formats).
-- Only write migration or backward-compatibility logic if I explicitly ask for it.
+- Only write migration or backward-compatibility logic into the codebase if I explicitly ask for it. A temporary one-time script that migrates or cleans up existing data is fine and expected: propose it with the change, then run it once outside the codebase.
 
 ## Reading the database (important)
 
