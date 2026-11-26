@@ -1463,7 +1463,7 @@ function buildPlanTable(box, workouts) {
     tr.appendChild(mk(w.duration_min != null ? w.duration_min + " min" : ""));
     tr.appendChild(mk(w.distance_km != null
       ? (w.activity_type === "run" ? "~" : "") + Number(w.distance_km) + " km" : ""));
-    tr.appendChild(mk(w.completed ? "yes" : ""));
+    tr.appendChild(mk(isDone(w) ? "yes" : ""));
     tbody.appendChild(tr);
   }
   tbl.appendChild(tbody);
@@ -1811,6 +1811,8 @@ async function pollStatus() {
 }
 
 const PLAN_TYPES = ["run", "cycle", "swim", "strength", "other"];
+// A workout counts as done when it is completed or partially completed.
+const isDone = (w) => w.status === "completed" || w.status === "partial";
 const PLAN_COLORS = { run:"#e07a45", cycle:"#3fb6a8", swim:"#06b6d4",
                       strength:"#a855f7", other:"#eab308" };
 // Structured-workout step roles, shared by the editor and the card chips.
@@ -2006,7 +2008,7 @@ function renderPlanList(workouts) {
     head.appendChild(range);
     const stat = document.createElement("span");
     stat.className = "pl-stat";
-    const done = rows.filter((w) => w.completed).length;
+    const done = rows.filter(isDone).length;
     stat.textContent = rows.length
       ? done + "/" + rows.length + " done"
       : "no workouts";
@@ -2015,7 +2017,7 @@ function renderPlanList(workouts) {
     for (const w of rows) {
       const row = document.createElement("div");
       row.className = "pl-row"
-        + (w.completed ? " done" : "")
+        + (isDone(w) ? " done" : "")
         + (w.status === "skipped" ? " skipped" : "");
       const date = document.createElement("span");
       date.className = "pl-date";
@@ -2479,7 +2481,7 @@ async function loadBriefing() {
       name.className = "bf-wname";
       name.textContent = w.title || "Workout";
       const metaParts = workoutMeta(w);
-      if (w.completed) metaParts.push({ v: "done", u: "" });
+      if (isDone(w)) metaParts.push({ v: "done", u: "" });
       info.appendChild(name);
       if (metaParts.length) {
         const m = document.createElement("div");
@@ -2589,7 +2591,7 @@ function renderPlan(workouts) {
     // Completed and empty (rest) past days are "spent" — fade them so Today and
     // upcoming key sessions carry the visual weight.
     const lowPriority = dayWorkouts.length
-      ? dayWorkouts.every((w) => w.completed)
+      ? dayWorkouts.every(isDone)
       : iso < today;
     if (lowPriority && iso !== today) day.classList.add("dim");
     const list = document.createElement("div");
@@ -2861,9 +2863,9 @@ function workoutCard(w) {
   const color = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
   const card = document.createElement("div");
   card.className = "plan-card"
-    + (w.completed ? " done" : "")
+    + (isDone(w) ? " done" : "")
     + (w.status === "skipped" ? " skipped" : "");
-  card.style.borderLeftColor = w.completed ? "#22c55e" : color;
+  card.style.borderLeftColor = isDone(w) ? "#22c55e" : color;
   const hasSteps = !!(w.steps && w.steps.length);
   if ((w.description && w.description.trim()) || hasSteps) {
     card.addEventListener("mouseenter", () => showCardTip(card, workoutTipNode(w)));
@@ -2875,7 +2877,7 @@ function workoutCard(w) {
   t.textContent = w.activity_type;
   t.style.color = color;
   head.appendChild(t);
-  if (w.completed) {
+  if (isDone(w)) {
     const done = document.createElement("span");
     done.className = "pc-done";
     done.textContent = w.status === "partial" ? "Partial" : "Done";

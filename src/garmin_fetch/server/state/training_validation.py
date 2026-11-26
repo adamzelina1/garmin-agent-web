@@ -254,13 +254,9 @@ def _parse_steps(raw: str | None) -> list[dict[str, Any]]:
 
 def _workout_row(row: Any) -> dict[str, Any]:
     """Shape one DB row into the JSON the API/agent/tab all consume.
-
-    ``status`` is the authoritative lifecycle value and the only one written;
-    ``completed`` is derived from it for the UI/legacy callers, so the two can
-    never disagree.
-    """
-    status = row["status"]
-    d = {
+    ``status`` is the lifecycle value ('completed' and 'partial' both count
+    as done)."""
+    return {
         "id": row["id"],
         "planned_date": row["planned_date"],
         "activity_type": row["activity_type"],
@@ -270,12 +266,10 @@ def _workout_row(row: Any) -> dict[str, Any]:
         "distance_km": row["distance_km"],
         "intensity": row["intensity"],
         "target_hr_zone": row["target_hr_zone"],
-        "steps": _parse_steps(row.get("steps")),
-        "status": status,
-        "completed": status in ("completed", "partial"),
+        "steps": _parse_steps(row["steps"]),
+        "status": row["status"],
         "completed_activity_id": row["completed_activity_id"],
     }
-    return d
 
 
 def _parse_required_date(value: Any, label: str) -> str:

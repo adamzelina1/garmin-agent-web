@@ -336,7 +336,7 @@ class AuthService:
 
         cred_enc = self.encryptor.encrypt(garmin_password)
         if existing:
-            # Legacy unconfirmed account (abandoned MFA attempt): adopt it.
+            # An unconfirmed account (a signup abandoned at the MFA step): adopt it.
             user_id = existing["id"]
             self.store.reset_signup(
                 user_id,
@@ -524,8 +524,6 @@ class AuthService:
         user = self.store.get(user_id) or {}
         return {
             "llm_configured": self.user_llm_configured(user),
-            "home_lat": user.get("home_lat") or "",
-            "home_lon": user.get("home_lon") or "",
             "home_city": user.get("home_city") or "",
             "home_country": user.get("home_country") or "",
             "excluded_data_types": [
@@ -545,8 +543,6 @@ class AuthService:
         self,
         user_id: int,
         *,
-        home_lat: str | None = None,
-        home_lon: str | None = None,
         home_city: str | None = None,
         home_country: str | None = None,
         excluded_data_types: list[str] | None = None,
@@ -593,12 +589,10 @@ class AuthService:
                 effective_start = cleaned
             else:
                 effective_start = ""
-        # A home location may be given either as raw lat/lon (existing clients)
-        # or as a city + country, which we geocode to coordinates. City/country
-        # wins when both are supplied so the UI only ever asks for a place name.
-        # A blank city is treated as "leave unchanged" so a partial save never
-        # wipes an existing location; the raw lat/lon path stays for legacy.
-        resolved_lat, resolved_lon = home_lat, home_lon
+        # A home location is a city + country, geocoded to coordinates. A
+        # blank city leaves the stored location unchanged, so a partial save
+        # never wipes it.
+        resolved_lat = resolved_lon = None
         resolved_city, resolved_country = home_city, home_country
         if home_city is not None or home_country is not None:
             from .geocode import GeocodeError, geocode

@@ -168,14 +168,15 @@ curl -s -X POST localhost:8000/ask -H "$H" -H 'Content-Type: application/json' \
 
 ### CLI
 
-These single-user tools act on the account set by `GARMIN_LOCAL_USER_ID`.
+These single-user tools act on the account set by `GARMIN_LOCAL_USER_ID`, with
+the Garmin login, start date, home location and excluded data types it has in
+Settings; a CLI sync is the same sync the server runs.
 
 ```sh
 uv run garmin-fetch                        # incremental sync of all types
 uv run garmin-fetch --parse --full         # full re-parse of stored raw data
 uv run garmin-fetch --range 2026-01-01 2026-02-01 --type sleep
 uv run garmin-ask "avg sleep last week?"   # ask the agent from the terminal
-uv run garmin-ask-web                      # legacy Gradio chat UI (uv sync --extra gradio-ui)
 uv run garmin-trace                        # inspect the agent's tool-call trace
 uv run garmin-trace --failures --all-users --since 2026-11-01   # where the agent struggles with its tools
 ```
@@ -279,8 +280,7 @@ Per-account settings live in the `users` table and are edited from the UI.
 | `GARMIN_FETCH_SLEEP_SEC` | Delay between Garmin API calls (`2` is a good value for backfills) |
 | `GARMIN_AUTO_SYNC` | Default for the per-account auto-sync toggle (off unless set) |
 | `GARMIN_ACTIVITY_FREEZE_DAYS` | Trailing days re-scanned for late activity uploads |
-| `GARMIN_LOCAL_USER_ID` | Account used by the CLI tools |
-| `GARMIN_EMAIL`, `GARMIN_PASSWORD`, `GARMIN_TOKENS_PATH`, `GARMIN_HOME_LAT`, `GARMIN_HOME_LON` | CLI only (the server keeps these per account): Garmin login, token cache and the home location for weather |
+| `GARMIN_LOCAL_USER_ID` | Account the CLI tools act on, with its stored Garmin login and settings |
 | `GARMIN_START_DATE` | Default first day to back-fill; each account can set its own |
 | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | Server-wide LLM. `openai` covers any OpenAI-compatible endpoint, including Ollama; `gemini` is also supported. |
 | `LLM_REASONING_EFFORT` | Default reasoning effort (`low`, `medium` or `high`), which each account can override |
@@ -325,8 +325,7 @@ src/garmin_fetch/
   zone_pace.py      learned pace per HR zone
   ask.py            the read-only agent and its tools
   tool_args.py      lenient argument types for the agent's tools
-  chat_format.py    answer/session shaping (charts, leaked tool calls) for server and Gradio UI
-  ask_web.py        legacy Gradio UI (optional extra)
+  chat_format.py    answer/session shaping (charts, leaked tool calls)
   trace.py          per-turn tool-call tracing + failure summary
   config.py         .env loading
   server/

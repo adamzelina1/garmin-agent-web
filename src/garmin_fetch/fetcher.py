@@ -58,12 +58,6 @@ def _is_rate_limited(exc: BaseException) -> bool:
     return bool(_RATE_LIMIT_HINT.search(str(exc)))
 
 
-def _open_db(config: dict[str, str], user_id: int | None = None) -> Database:
-    """Open the per-user database (Postgres via GARMIN_DB_URL)."""
-    uid = user_id or config.get("local_user_id") or 1
-    return Database.from_url(config["db_url"], user_id=uid)
-
-
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -688,8 +682,9 @@ def refresh_weather_forecast(db: Database, lat: float, lon: float) -> int:
 
 def sync_data(
     *,
-    user_id: int = 1,
-    config: dict[str, str] | None = None,
+    config: dict[str, Any],
+    db: Database,
+    fetcher: DataFetcher,
     types: list[DataType] | None = None,
     start: date | None = None,
     end: date | None = None,
@@ -698,13 +693,13 @@ def sync_data(
     refresh_profile: bool = False,
     parse: bool = True,
     full_reparse: bool = False,
-    db: Database | None = None,
-    fetcher: DataFetcher | None = None,
 ) -> dict[str, int]:
     """Incremental sync of one or more data types from Garmin into Postgres.
 
-    Runs for a single ``user_id``: every row is written with that account and
-    the connection applies ``SET app.user_id`` so RLS scopes all writes. For
+    Runs for the one account ``db`` is bound to (RLS scopes all writes), with
+    ``fetcher`` logged in as that account's Garmin user and ``config`` the
+    server config with the account's own start date / excluded types (see
+    ``SyncManager.sync_user``, the only caller). For
     each type, fetches every missing date from the resolved start date to
     ``end`` (default: the user's today, see ``user_utc_offset``). If
     ``include_activities`` (default True), also syncs activities for the
@@ -721,16 +716,7 @@ def sync_data(
     from raw, ignoring the incremental ``parsed_at`` markers — useful after a
     parser bug fix to rebuild the typed tables.
 
-    ``config`` defaults to ``load_config()``. Pass ``db``/``fetcher`` to drive
-    the sync from the server layer with per-user credentials (already bound to
-    the account); otherwise they are built from ``config``.
     """
-    config = config or load_config()
-    db = db or _open_db(config, user_id)
-    fetcher = fetcher or DataFetcher(
-        config["email"], config["password"], config["tokens_path"],
-        sleep_sec=config.get("fetch_sleep_sec", 0.0),
-    )
     offset = user_utc_offset(db)
     today = user_today(offset)
     end = end or today
@@ -1083,9 +1069,10 @@ def main() -> None:
         + ["activities", "profile", "race_predictions", "gear"]
     )
     parser = argparse.ArgumentParser(
-        description="Fetch daily Garmin Connect data into Postgres. By default "
+        description="Fetch daily Garmin Connect data into Postgres for the "
+        "GARMIN_LOCAL_USER_ID account, with its stored Garmin login. By default "
         "incrementally syncs all registered data types and activities "
-        "(backfill from GARMIN_START_DATE to today, skipping stored data)."
+        "(backfill from the account's start date to today, skipping stored data)."
     )
     parser.add_argument(
         "--type", dest="types", action="append", metavar="NAME",
@@ -1163,7 +1150,7 @@ def main() -> None:
                 f"Unknown parse type(s): {', '.join(unknown)}. Options: {options}"
             )
         cfg = load_config()
-        db = _open_db(cfg, cfg["local_user_id"])
+        db = Database.from_url(cfg["db_url"], user_id=cfg["local_user_id"])
         try:
             counts: dict[str, int] = {}
             force = args.full
@@ -1209,23 +1196,29 @@ def main() -> None:
     # default list here would bypass the exclusion config.
     types = resolve_types(type_names) if type_names else None
 
-    include_activities = want_activities or not type_names or want_profile
-    uid = (load_config().get("local_user_id") or 1)
-    if args.range:
-        counts = sync_data(
-            user_id=uid,
-            types=types, start=args.range[0], end=args.range[1],
-            include_activities=include_activities,
+    # The same path as the server's sync: the account's stored (encrypted)
+    # Garmin login, start date and excluded types, its backoff and status.
+    from .server.sync_worker import SyncManager
+
+    cfg = load_config()
+    manager = SyncManager(cfg)
+    try:
+        counts = manager.sync_user(
+            cfg["local_user_id"],
+            types=types,
+            start=args.range[0] if args.range else None,
+            end=args.range[1] if args.range else None,
+            include_activities=want_activities or not type_names or want_profile,
             include_profile=want_profile or not type_names,
             refresh_profile=want_profile,
         )
-    else:
-        counts = sync_data(
-            user_id=uid,
-            types=types,
-            include_activities=include_activities,
-            include_profile=want_profile or not type_names,
-            refresh_profile=want_profile,
+    finally:
+        manager.shutdown()
+    if counts is None:
+        raise SystemExit(
+            "sync skipped or failed for this account (inactive, rate-limited, "
+            "or Garmin refused the login); see the log above and the account's "
+            "sync status in Settings"
         )
 
     total = sum(counts.values())

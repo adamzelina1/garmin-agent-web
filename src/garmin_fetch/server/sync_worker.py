@@ -122,9 +122,15 @@ class SyncManager:
                 self._running.discard(user_id)
 
     def sync_user(
-        self, user_id: int, *, force_reparse: bool = False
+        self, user_id: int, *, force_reparse: bool = False, **options: Any
     ) -> dict[str, int] | None:
-        """Run a full sync for one account using its stored, decrypted creds."""
+        """Run a sync for one account using its stored, decrypted creds.
+
+        ``options`` pass through to ``sync_data`` (``types``, ``start``/``end``,
+        ``include_activities``, ``include_profile``, ``refresh_profile``): the
+        CLI's ``--type``/``--range`` syncs go through here too, so they log in,
+        save tokens and record status exactly like a server sync. Returns the
+        counts, or None when the account is skipped or the sync failed."""
         user = self.store.get(user_id)
         if not user or not user["active"]:
             logger.info("skipping sync for inactive user %s", user_id)
@@ -145,7 +151,7 @@ class SyncManager:
         try:
             counts = sync_data(
                 config=sync_cfg, db=db, fetcher=fetcher,
-                full_reparse=force_reparse,
+                full_reparse=force_reparse, **options,
             )
             self._save_tokens(user, fetcher, token_string)
             self.store.confirm(user_id)  # Garmin bind now known-good

@@ -15,10 +15,7 @@ def load_config() -> dict[str, str]:
     """
     load_dotenv(PROJECT_ROOT / ".env")
 
-    email = os.getenv("GARMIN_EMAIL", "")
-    password = os.getenv("GARMIN_PASSWORD", "")
     db_url = os.getenv("GARMIN_DB_URL", "")
-    tokens_path = os.getenv("GARMIN_TOKENS_PATH", "")
     start_date = os.getenv("GARMIN_START_DATE", "")
     activity_freeze_days = os.getenv("GARMIN_ACTIVITY_FREEZE_DAYS", "7")
     llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -27,23 +24,9 @@ def load_config() -> dict[str, str]:
     llm_provider = os.getenv("LLM_PROVIDER", "openai")
     llm_reasoning_effort = os.getenv("LLM_REASONING_EFFORT", "high")
 
-    weather_home_lat = os.getenv("GARMIN_HOME_LAT", "")
-    weather_home_lon = os.getenv("GARMIN_HOME_LON", "")
-
-    def _optional_float(name: str, value: str) -> str:
-        if value:
-            try:
-                float(value)
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"{name} must be a decimal number (or empty) in .env"
-                ) from exc
-        return value
-
-    weather_home_lat = _optional_float("GARMIN_HOME_LAT", weather_home_lat)
-    weather_home_lon = _optional_float("GARMIN_HOME_LON", weather_home_lon)
-
-    # --- Server / multi-user (Phase 3) ---------------------------------------
+    # Per-account settings (Garmin login, home location, start date override,
+    # excluded types) live in the ``users`` table; the CLI tools read the
+    # GARMIN_LOCAL_USER_ID account's row like the server does.
     readonly_db_url = os.getenv("GARMIN_READONLY_DB_URL", "")
     admin_db_url = os.getenv("GARMIN_ADMIN_DB_URL", "")
     enc_key = os.getenv("GARMIN_ENC_KEY", "")
@@ -93,10 +76,7 @@ def load_config() -> dict[str, str]:
         raise RuntimeError("GARMIN_ACTIVITY_FREEZE_DAYS must be >= 0 in .env")
 
     return {
-        "email": email,
-        "password": password,
         "db_url": db_url,
-        "tokens_path": tokens_path,
         "start_date": start_date,
         "activity_freeze_days": freeze_days,
         "llm_model": llm_model,
@@ -104,8 +84,6 @@ def load_config() -> dict[str, str]:
         "llm_api_key": llm_api_key,
         "llm_provider": llm_provider,
         "llm_reasoning_effort": llm_reasoning_effort,
-        "weather_home_lat": weather_home_lat,
-        "weather_home_lon": weather_home_lon,
         "readonly_db_url": readonly_db_url,
         "admin_db_url": admin_db_url,
         "enc_key": enc_key,

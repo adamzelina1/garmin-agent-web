@@ -7,8 +7,7 @@ aim is an inspectable record for tuning the tools — what the model asked for
 and what each tool actually returned.
 
 Turns are stored per user in Postgres (the ``user_state`` table's ``trace``
-key); ``garmin-trace`` prints that transcript. A legacy ``--file`` reads an old
-``ask_trace.jsonl`` instead. ``garmin-trace --failures`` instead summarises
+key); ``garmin-trace`` prints that transcript. ``garmin-trace --failures`` summarises
 where the agent struggles with its tools: every failed tool call (an
 ``ERROR:`` return, a non-success outcome or a schema retry) grouped by tool
 and normalised message, with how often the agent never recovered.
@@ -23,7 +22,6 @@ import re
 import sys
 from collections import Counter, defaultdict, deque
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 #: Hard cap for a single tool-return/content payload stored in a trace record.
@@ -146,24 +144,6 @@ def build_trace_record(
     if (usage_summary := _usage_summary(usage)) is not None:
         record["usage"] = usage_summary
     return record
-
-
-def _iter_records(path: str) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return records
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            records.append(data)
-    return records
 
 
 def _db_records(all_users: bool = False) -> list[dict[str, Any]]:
@@ -439,12 +419,6 @@ def main(argv: list[str] | None = None) -> int:
         "for GARMIN_LOCAL_USER_ID).",
     )
     parser.add_argument(
-        "--file",
-        metavar="PATH",
-        default=None,
-        help="read a legacy JSONL trace file instead of the database",
-    )
-    parser.add_argument(
         "--tail", type=int, default=0,
         help="print only the last N turns (0 = all)",
     )
@@ -478,10 +452,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _utf8_console()
-    if args.file:
-        records = _iter_records(args.file)
-    else:
-        records = _db_records(all_users=args.all_users)
+    records = _db_records(all_users=args.all_users)
     if args.since:
         records = [r for r in records if r.get("ts", "")[:10] >= args.since]
     if args.tool:

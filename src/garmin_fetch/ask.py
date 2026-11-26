@@ -551,10 +551,10 @@ _CHART_TYPES = (
     "line", "scatter", "area", "bar", "pie", "histogram", "box",
 )
 
-#: Legacy trace aliases mapped to plotly.graph_objects classes, with the default
-#: styling the old hand-built builder chose. New specs may pass any Plotly trace
-#: class via the "go" key; these aliases just keep the compact shorthand working.
-_LEGACY_TRACES: dict[str, dict[str, Any]] = {
+#: The chart tool's ``type`` shorthand (what the agent usually writes), mapped
+#: to its plotly.graph_objects class and default styling. Any other Plotly
+#: trace class can be named via the ``go`` key instead.
+_TRACE_SHORTHANDS: dict[str, dict[str, Any]] = {
     "line": {"go": "Scatter", "defaults": {"mode": "lines+markers"}},
     "scatter": {"go": "Scatter", "defaults": {"mode": "markers"}},
     "area": {"go": "Scatter", "defaults": {"mode": "lines", "fill": "tozeroy"}},
@@ -640,7 +640,7 @@ def _chart_spec_error(spec: dict[str, Any], result: dict[str, Any]) -> str | Non
         name = tr.get("go") if isinstance(tr.get("go"), str) else tr.get("type")
         if not isinstance(name, str) or not name:
             return f"ERROR: trace {i} needs a 'go' or a 'type' name"
-        if name not in _LEGACY_TRACES and _go_class_name(go, name) is None:
+        if name not in _TRACE_SHORTHANDS and _go_class_name(go, name) is None:
             return (
                 f"ERROR: trace {i} class {name!r} is not a valid chart type. "
                 f"Use one of: {', '.join(_CHART_TYPES)} "
@@ -696,12 +696,12 @@ def _build_chart_figure(
     traces: list[Any] = []
     for tr in spec["traces"]:
         if isinstance(tr.get("go"), str):
-            legacy = None
+            shorthand = None
             go_name = tr["go"]
         else:
             name = tr.get("type")
-            legacy = _LEGACY_TRACES.get(name) if isinstance(name, str) else None
-            go_name = name if legacy is None else legacy["go"]
+            shorthand = _TRACE_SHORTHANDS.get(name) if isinstance(name, str) else None
+            go_name = name if shorthand is None else shorthand["go"]
         kwargs: dict[str, Any] = {}
         for key, value in tr.items():
             if key in ("type", "go"):
@@ -710,10 +710,10 @@ def _build_chart_figure(
                 kwargs[key] = _data(value)
             else:
                 kwargs[key] = _resolve(value)
-        if legacy is not None:
-            for key, value in legacy.get("defaults", {}).items():
+        if shorthand is not None:
+            for key, value in shorthand.get("defaults", {}).items():
                 kwargs.setdefault(key, value)
-            if legacy["go"] == "Pie":
+            if shorthand["go"] == "Pie":
                 if "labels" not in kwargs and "x" in kwargs:
                     kwargs["labels"] = kwargs.pop("x")
                 if "values" not in kwargs and "y" in kwargs:
@@ -1559,8 +1559,7 @@ class Weather:
             if self._default_lat is None or self._default_lon is None:
                 raise ValueError(
                     "no home location: the athlete sets their home city in "
-                    "Settings (the CLI reads GARMIN_HOME_LAT/GARMIN_HOME_LON); "
-                    "or pass explicit lat and lon"
+                    "Settings; or pass explicit lat and lon"
                 )
             return float(self._default_lat), float(self._default_lon)
         if lat is None or lon is None:
@@ -2366,40 +2365,51 @@ def _build_agent(
     )
 
 
-def _load_account(db_url: str, user_id: int) -> tuple[str, timedelta | None]:
-    """The account's disabled data types (comma list) and UTC offset.
+def account_agent_cfg(cfg: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
+    """``cfg`` with one account's own agent settings from its ``users`` row:
+    the home location the weather tool defaults to and the reasoning-effort
+    override. The LLM provider itself is server-wide, never per account. The
+    server and the CLI both build the agent's config through this."""
+    return {
+        **cfg,
+        "llm_reasoning_effort": account.get("reasoning_effort") or cfg.get("llm_reasoning_effort") or "",
+        "weather_home_lat": account.get("home_lat") or "",
+        "weather_home_lon": account.get("home_lon") or "",
+    }
 
-    Reads as the writer role (``db_url``), which can SELECT ``users`` and the
-    raw payloads the offset comes from; the read-only agent role cannot.
-    Returns ``("", None)`` when there is no DSN, no row, or a query fails — the
-    agent then simply sees every column and the machine's date.
-    """
-    if not db_url:
-        return "", None
+
+def _load_account(db_url: str, user_id: int) -> tuple[dict[str, Any], timedelta | None]:
+    """The CLI account's ``users`` row (excluded data types, home location,
+    reasoning effort) and its UTC offset, read as the writer role: the
+    read-only agent role can read neither ``users`` nor the raw payloads the
+    offset comes from."""
     from .fetcher import conn_utc_offset
 
-    try:
-        with psycopg.connect(db_url) as conn:
-            row = conn.execute(
-                "SELECT excluded_data_types FROM users WHERE id = %s", (user_id,)
-            ).fetchone()
-            conn.execute("SELECT set_config('app.user_id', %s, true)", (str(user_id),))
-            return ((row[0] or "") if row else ""), conn_utc_offset(conn)
-    except psycopg.Error:
-        return "", None
+    with psycopg.connect(db_url) as conn:
+        cur = conn.execute(
+            "SELECT excluded_data_types, home_lat, home_lon, reasoning_effort "
+            "FROM users WHERE id = %s", (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(f"no account with id {user_id} (GARMIN_LOCAL_USER_ID)")
+        account = dict(zip((d.name for d in cur.description), row))
+        conn.execute("SELECT set_config('app.user_id', %s, true)", (str(user_id),))
+        return account, conn_utc_offset(conn)
 
 
-def _open_readonly(cfg: dict[str, Any]) -> ReadOnlyDB:
-    """Read-only handle for the configured backend (read-only PG role)."""
+def _open_readonly(cfg: dict[str, Any], account: dict[str, Any], offset: timedelta | None) -> ReadOnlyDB:
+    """The CLI account's read-only handle (the read-only PG role)."""
     url = cfg.get("readonly_db_url") or cfg.get("db_url")
     if not url:
         raise RuntimeError(
             "GARMIN_DB_URL (or GARMIN_READONLY_DB_URL) must be set — "
             "Postgres is the only supported backend"
         )
-    user_id = cfg.get("local_user_id") or 1
-    excluded, offset = _load_account(cfg.get("db_url", ""), user_id)
-    return ReadOnlyDB(url, user_id=user_id, excluded_types=excluded, utc_offset=offset)
+    return ReadOnlyDB(
+        url, user_id=cfg["local_user_id"],
+        excluded_types=account.get("excluded_data_types") or "", utc_offset=offset,
+    )
 
 
 def _result_usage(result: Any) -> Any:
@@ -2656,23 +2666,27 @@ def _prune_session_messages(messages: list[Any]) -> list[Any]:
     return [clean_message(msg) for msg in messages]
 
 
-def _open_state(cfg: dict[str, str]) -> tuple[ReadOnlyDB, Any, Any, int]:
-    """The CLI's read-only handle, user state, training store and user id."""
+def _open_state(cfg: dict[str, Any]) -> tuple[ReadOnlyDB, Any, Any, int, dict[str, Any]]:
+    """The CLI account's read-only handle, user state, training store, user
+    id and agent config (``account_agent_cfg``), all for ``GARMIN_LOCAL_USER_ID``."""
     from .server.state import TrainingStore, UserState
 
+    user_id = cfg["local_user_id"]
+    account, offset = _load_account(cfg["db_url"], user_id)
     return (
-        _open_readonly(cfg),
+        _open_readonly(cfg, account, offset),
         UserState(cfg["db_url"]),
         TrainingStore(cfg["db_url"]),
-        cfg.get("local_user_id") or 1,
+        user_id,
+        account_agent_cfg(cfg, account),
     )
 
 
-def _cli_agent(cfg: dict[str, str], db: ReadOnlyDB, state: Any, training: Any, user_id: int) -> Any:
+def _cli_agent(agent_cfg: dict[str, Any], db: ReadOnlyDB, state: Any, training: Any, user_id: int) -> Any:
     from .server.state import PgMemory, PgPrinciples, TrainingSeason
 
     return _build_agent(
-        cfg,
+        agent_cfg,
         db,
         memory=PgMemory(state, user_id),
         principles=PgPrinciples(state, user_id),
@@ -2681,9 +2695,9 @@ def _cli_agent(cfg: dict[str, str], db: ReadOnlyDB, state: Any, training: Any, u
 
 
 def _ask(cfg: dict[str, str], question: str) -> str:
-    db, state, training, user_id = _open_state(cfg)
+    db, state, training, user_id, agent_cfg = _open_state(cfg)
     try:
-        result = _cli_agent(cfg, db, state, training, user_id).run_sync(question)
+        result = _cli_agent(agent_cfg, db, state, training, user_id).run_sync(question)
         answer = _final_answer(result)
         _record_turn(
             cfg, question, result, answer=answer,
@@ -2703,9 +2717,9 @@ def _ask_session(cfg: dict[str, str]) -> None:
     ``GARMIN_LOCAL_USER_ID``), so a later ``garmin-ask`` resumes where this one
     left off. ``/clear`` drops the history; ``/new`` folds it into a summary.
     """
-    db, state, training, user_id = _open_state(cfg)
+    db, state, training, user_id, agent_cfg = _open_state(cfg)
     try:
-        agent = _cli_agent(cfg, db, state, training, user_id)
+        agent = _cli_agent(agent_cfg, db, state, training, user_id)
         history = state.get_session_messages(user_id) or []
         if history:
             print(f"Resumed {len(history)} prior message(s) from the database (user {user_id})")

@@ -15,9 +15,8 @@ from .training_rules import _first_monday
 #: Safety cap on the workouts returned in one agenda.
 _MAX_WORKOUTS = 200
 
-#: Keys the agent never needs: bookkeeping and ``completed`` (it restates
-#: ``status``).
-_DROP = ("created_at", "updated_at", "completed")
+#: Bookkeeping keys the agent never needs.
+_DROP = ("created_at", "updated_at")
 
 def _slim(row: dict[str, Any] | None) -> dict[str, Any] | None:
     """One row without bookkeeping keys or empty (None) values (None passes

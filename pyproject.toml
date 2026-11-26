@@ -21,14 +21,9 @@ dependencies = [
     "tzdata>=2026.3",
 ]
 
-[project.optional-dependencies]
-# Only the legacy `garmin-ask-web` chat UI needs Gradio; the server doesn't.
-gradio-ui = ["gradio>=6.22.0"]
-
 [project.scripts]
 garmin-fetch = "garmin_fetch.fetcher:main"
 garmin-ask = "garmin_fetch.ask:main"
-garmin-ask-web = "garmin_fetch.ask_web:main"
 garmin-trace = "garmin_fetch.trace:main"
 garmin-server = "garmin_fetch.server.app:main"
 

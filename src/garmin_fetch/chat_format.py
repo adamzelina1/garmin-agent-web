@@ -1,9 +1,8 @@
 """Shaping agent answers and stored sessions for a chat front-end.
 
-Shared by the FastAPI server and the Gradio UI: turning persisted Pydantic AI
+Used by the FastAPI server and the agent: turning persisted Pydantic AI
 messages back into chat history, pulling ``<chart>`` specs out of an answer,
 and swapping pasted training-plan JSON for the ``<plan_table />`` marker.
-Nothing here depends on a UI toolkit.
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ def strip_leaked_tool_call(text: str) -> tuple[str, bool]:
 
 
 def messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
-    """Map persisted Pydantic AI messages back to Gradio's history format.
+    """Map persisted Pydantic AI messages to chat history (``{role, content}``).
 
     Assistant responses that also carry tool calls are the model's *working
     narration* ("Let me check…", etc.), not its answer — they are skipped so
@@ -76,12 +75,7 @@ def messages_to_history(messages: list[Any]) -> list[dict[str, str]]:
                 continue
             for part in message.parts:
                 if isinstance(part, TextPart):
-                    # Sessions stored before leaked calls were cleaned at save
-                    # time may still hold one.
-                    content, leaked = strip_leaked_tool_call(part.content)
-                    if leaked and not content.strip():
-                        continue
-                    history.append({"role": "assistant", "content": content})
+                    history.append({"role": "assistant", "content": part.content})
     return history
 
 

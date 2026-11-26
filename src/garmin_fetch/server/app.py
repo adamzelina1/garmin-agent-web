@@ -61,6 +61,7 @@ from ..ask import (
     _messages_token_estimate,
     _prune_session_messages,
     _record_turn,
+    account_agent_cfg,
     compact,
 )
 from ..chat_format import (
@@ -120,8 +121,6 @@ class ChartRequest(BaseModel):
 
 
 class ConfigRequest(BaseModel):
-    home_lat: str | None = None
-    home_lon: str | None = None
     home_city: str | None = None
     home_country: str | None = None
     excluded_data_types: list[str] | None = None
@@ -255,27 +254,6 @@ def _limit(limiter: RateLimiter, key: str, what: str) -> None:
             headers={"Retry-After": str(wait)},
         )
     limiter.record(key)
-
-
-def _user_agent_cfg(cfg: dict[str, Any], user: dict[str, Any], auth: Any) -> dict[str, Any]:
-    """Per-user config for the LLM agent.
-
-    The LLM provider (API key, base URL, model) is server-wide, sourced only
-    from the server ``.env`` — it is never per-account. Only the weather
-    location and the excluded data types remain user-specific overrides.
-    """
-    user_cfg = dict(cfg)
-    user_cfg["llm_api_key"] = cfg.get("llm_api_key") or ""
-    user_cfg["llm_base_url"] = cfg.get("llm_base_url") or ""
-    user_cfg["llm_model"] = cfg.get("llm_model") or ""
-    user_cfg["llm_provider"] = cfg.get("llm_provider") or ""
-    user_cfg["llm_reasoning_effort"] = (
-        user.get("reasoning_effort") or cfg.get("llm_reasoning_effort") or ""
-    )
-    user_cfg["weather_home_lat"] = user.get("home_lat") or ""
-    user_cfg["weather_home_lon"] = user.get("home_lon") or ""
-    user_cfg["excluded_data_types"] = user.get("excluded_data_types") or ""
-    return user_cfg
 
 
 def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
@@ -464,10 +442,6 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         # auto-sync toggle, the sync start date) must never reset unrelated
         # settings to empty via Pydantic defaults.
         kwargs: dict[str, Any] = {}
-        if body.home_lat is not None:
-            kwargs["home_lat"] = body.home_lat.strip()
-        if body.home_lon is not None:
-            kwargs["home_lon"] = body.home_lon.strip()
         if body.home_city is not None:
             kwargs["home_city"] = body.home_city.strip()
         if body.home_country is not None:
@@ -837,7 +811,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                 "the LLM agent is not configured: set LLM_API_KEY (or a local "
                 "LLM_BASE_URL with LLM_MODEL) in the server .env and restart",
             )
-        return _user_agent_cfg(request.app.state.cfg, user, auth)
+        return account_agent_cfg(request.app.state.cfg, user)
 
     def _user_readonly(request: Request, user: dict) -> ReadOnlyDB:
         """The agent's handle for one request, dated in the user's zone (the
