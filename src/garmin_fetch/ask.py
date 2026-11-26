@@ -219,7 +219,7 @@ _TABLE_NOTES: dict[str, str] = {
         "the account's ONE long-term goal (an event such as a marathon) over "
         "[start_date, target_date]; the whole season hangs off it. read-only via "
         "SQL — write only through training_apply. sport is "
-        "run/cycle/swim/strength/rest/other"
+        "run/cycle/swim/strength/other"
     ),
     "training_block": (
         "one row per periodized phase of a goal: name/focus are free text, "
@@ -329,7 +329,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "qualifier": "category label: acwr = Sweet Spot/Elevated/Danger/Detraining; run_cadence_drift = Form Up/Stable/Form Dropping/Breaking Down",
     },
     "training_workout": {
-        "activity_type": "run/cycle/swim/strength/rest/other",
+        "activity_type": "run/cycle/swim/strength/other (no rest type: a day without a workout is a rest day)",
         "duration_min": "planned minutes (computed from steps)",
         "distance_km": "planned km; for a run an ESTIMATE from its steps at the learned zone paces",
         "target_pace_min_km": "prescribed running pace as DECIMAL min/km (5.5 = 5:30)",
@@ -338,8 +338,8 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "steps": (
             "TEXT holding an ordered JSON array (cast `steps::jsonb` before any "
             "JSON function) of the session's segments (warm-up/work/"
-            "recovery/cool-down, intervals, strides, ...); at least one for "
-            "every non-rest workout (NULL only on rest days); stored as "
+            "recovery/cool-down, intervals, strides, ...); at least one on "
+            "every workout; stored as "
             "{kind: warmup/steady/work/recovery/cooldown/rest, duration_sec, "
             "label?, intensity?, target_pace_min_km?, target_hr_zone?, "
             "target_power_w?}; label is a short segment name (no duration/rep). "
@@ -354,7 +354,7 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         ),
     },
     "training_goal": {
-        "sport": "run/cycle/swim/strength/rest/other (same vocabulary as workouts); may be NULL",
+        "sport": "run/cycle/swim/strength/other (same vocabulary as workouts); may be NULL",
         "start_date": "YYYY-MM-DD; campaign start date",
         "target_date": "YYYY-MM-DD; the event/race day, may be NULL",
         "target_time": "free text goal finish time (e.g. 3:45:00)",
@@ -451,7 +451,9 @@ Query rules:
 _TRAINING_BULLET = """\
 - `training` to read the training season (goals, blocks, weekly targets,
   planned workouts) — before building or reshaping a week and to answer "how
-  is my week going?" — and `training_apply` to change it. To show a plan in chat, embed
+  is my week going?" — and `training_apply` to change it. A day without a
+  workout IS a rest day: never plan, title or describe a rest workout — leave
+  the day empty (to rest a planned day, delete its workout). To show a plan in chat, embed
   `<plan_table />` (or `<plan_table from="YYYY-MM-DD" to="YYYY-MM-DD" />`) —
   never a JSON dump or a markdown table.
 """

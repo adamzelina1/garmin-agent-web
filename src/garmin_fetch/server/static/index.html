@@ -461,16 +461,12 @@
   .plan-card .pc-title { font-weight:600; color:var(--text); margin:3px 0; }
   .plan-card .pc-meta { display:flex; flex-wrap:wrap; align-items:baseline; color:var(--muted); font-size:11.5px; }
   .pc-metric { color:var(--muted); white-space:nowrap; }
-  .pc-metric.plain { color:var(--muted); white-space:normal; }
   .pc-metric + .pc-metric::before { content:"·"; margin:0 7px; color:var(--muted); opacity:.5; }
   .pc-metric b { font-weight:600; color:#c6d0da; }
   .pc-metric em { font-style:normal; font-size:.82em; opacity:.7; margin-left:3px; }
   .plan-card .pc-done { display:inline-flex; align-items:center; gap:4px; font-size:10px; font-weight:700;
                         letter-spacing:.05em; text-transform:uppercase; color:var(--ok); margin-left:6px; }
   .plan-card .pc-done::before { content:"✓"; font-size:10px; line-height:1; }
-  .plan-card.rest { opacity:.75; }
-  .plan-card.rest .pc-type { color:var(--muted); }
-  .plan-card.rest .pc-done { display:none; }
   .plan-card.done { background:rgba(34,197,94,.06); }
   .plan-card.done .pc-type { color:var(--ok); }
   .plan-card.done .pc-title { color:#9fb8aa; text-decoration:line-through; text-decoration-color:rgba(34,197,94,.6); }
@@ -908,7 +904,6 @@
             <option value="cycle">Cycle</option>
             <option value="swim">Swim</option>
             <option value="strength">Strength</option>
-            <option value="rest">Rest</option>
             <option value="other">Other</option>
           </select>
         </div>
@@ -963,7 +958,7 @@
         </div>
       </div>
       <div class="steps-head">
-        <label style="margin:0">Structured steps <span class="muted">(at least 1; optional for rest)</span></label>
+        <label style="margin:0">Structured steps <span class="muted">(at least 1)</span></label>
         <button type="button" id="pm-add-step" class="secondary">+ Add step</button>
       </div>
       <div id="pm-steps"></div>
@@ -1512,7 +1507,7 @@ function buildPlanTable(box, workouts) {
     const mk = (t) => { const td = document.createElement("td"); td.textContent = t || ""; return td; };
     tr.appendChild(mk(w.planned_date));
     tr.appendChild(mk(w.activity_type));
-    tr.appendChild(mk(w.title || (w.activity_type === "rest" ? "Rest" : "")));
+    tr.appendChild(mk(w.title || ""));
     tr.appendChild(mk(w.intensity || ""));
     tr.appendChild(mk(w.duration_min != null ? w.duration_min + " min" : ""));
     tr.appendChild(mk(w.distance_km != null
@@ -1864,9 +1859,9 @@ async function pollStatus() {
   }
 }
 
-const PLAN_TYPES = ["run", "cycle", "swim", "strength", "rest", "other"];
+const PLAN_TYPES = ["run", "cycle", "swim", "strength", "other"];
 const PLAN_COLORS = { run:"#e07a45", cycle:"#3fb6a8", swim:"#06b6d4",
-                      strength:"#a855f7", rest:"#64748b", other:"#eab308" };
+                      strength:"#a855f7", other:"#eab308" };
 // Structured-workout step roles, shared by the editor and the card chips.
 const STEP_KINDS = [
   ["warmup", "Warm-up", "#38bdf8"],
@@ -2086,7 +2081,7 @@ function renderPlanList(workouts) {
       row.appendChild(badge);
       const title = document.createElement("span");
       title.className = "pl-title";
-      title.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
+      title.textContent = w.title || "Workout";
       row.appendChild(title);
       const meta = document.createElement("span");
       meta.className = "pl-meta";
@@ -2758,9 +2753,9 @@ async function loadBriefing() {
       info.style.minWidth = "0";
       const name = document.createElement("div");
       name.className = "bf-wname";
-      name.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
+      name.textContent = w.title || "Workout";
       const metaParts = workoutMeta(w);
-      if (w.completed && w.activity_type !== "rest") metaParts.push({ v: "done", u: "" });
+      if (w.completed) metaParts.push({ v: "done", u: "" });
       info.appendChild(name);
       if (metaParts.length) {
         const m = document.createElement("div");
@@ -2871,10 +2866,10 @@ function renderPlan(workouts) {
     head.appendChild(left); head.appendChild(wxSlot);
     day.appendChild(head);
     const dayWorkouts = byDate[iso] || [];
-    // Completed, rest, and empty past days are "spent" — fade them so Today and
+    // Completed and empty (rest) past days are "spent" — fade them so Today and
     // upcoming key sessions carry the visual weight.
     const lowPriority = dayWorkouts.length
-      ? dayWorkouts.every((w) => w.completed || w.activity_type === "rest")
+      ? dayWorkouts.every((w) => w.completed)
       : iso < today;
     if (lowPriority && iso !== today) day.classList.add("dim");
     const list = document.createElement("div");
@@ -2929,7 +2924,6 @@ function fmtPace(dec) {
 
 // Metrics as data pairs ({v, u}) so value and unit can be weighted separately.
 function workoutMeta(w) {
-  if (w.activity_type === "rest") return [{ v: "Passive Recovery", u: "", plain: true }];
   const parts = [];
   // Zero-valued fields (0 km on a trainer ride, 0 min on a lift) are database
   // filler — drop them instead of leaking "0 km · 0 min" into the card.
@@ -2947,13 +2941,11 @@ function workoutMeta(w) {
   return parts;
 }
 
-// Render one metric pair: bold value + de-emphasised unit. `plain` metrics are
-// quiet text (e.g. "Passive Recovery") with no value emphasis.
+// Render one metric pair: bold value + de-emphasised unit.
 function metricNode(m) {
   const s = document.createElement("span");
-  s.className = "pc-metric" + (m.plain ? " plain" : "");
+  s.className = "pc-metric";
   if (m.title) s.title = m.title;
-  if (m.plain) { s.textContent = m.v; return s; }
   const b = document.createElement("b");
   b.textContent = m.v;
   s.appendChild(b);
@@ -3104,7 +3096,7 @@ function compareLine(planned, actual, unit) {
 
 function workoutCompareNode(w) {
   const a = w.actual;
-  if (!a || w.activity_type === "rest") return null;
+  if (!a) return null;
   const box = document.createElement("div");
   box.className = "pcmp-item";
   box.style.borderLeftColor = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
@@ -3169,10 +3161,9 @@ function workoutCard(w) {
   const color = PLAN_COLORS[w.activity_type] || PLAN_COLORS.other;
   const card = document.createElement("div");
   card.className = "plan-card"
-    + (w.activity_type === "rest" ? " rest" : "")
     + (w.completed ? " done" : "")
     + (w.status === "skipped" ? " skipped" : "");
-  card.style.borderLeftColor = (w.completed && w.activity_type !== "rest") ? "#22c55e" : color;
+  card.style.borderLeftColor = w.completed ? "#22c55e" : color;
   const hasSteps = !!(w.steps && w.steps.length);
   if ((w.description && w.description.trim()) || hasSteps) {
     card.addEventListener("mouseenter", () => showCardTip(card, workoutTipNode(w)));
@@ -3182,7 +3173,7 @@ function workoutCard(w) {
   const t = document.createElement("span");
   t.className = "pc-type";
   t.textContent = w.activity_type;
-  if (w.activity_type !== "rest") t.style.color = color;
+  t.style.color = color;
   head.appendChild(t);
   if (w.completed) {
     const done = document.createElement("span");
@@ -3197,10 +3188,10 @@ function workoutCard(w) {
   }
   const title = document.createElement("div");
   title.className = "pc-title";
-  title.textContent = w.title || (w.activity_type === "rest" ? "Rest" : "Workout");
+  title.textContent = w.title || "Workout";
   const m = document.createElement("div");
   m.className = "pc-meta";
-  const metrics = workoutMeta(w).concat(w.activity_type === "rest" ? [] : workoutTargets(w));
+  const metrics = workoutMeta(w).concat(workoutTargets(w));
   if (hasSteps && w.steps.length > 1) {
     metrics.push({ v: String(w.steps.length), u: "steps",
                    title: "Structured workout — hover for the splits" });
@@ -3345,7 +3336,7 @@ function updateWorkoutPhaseBadge() {
   for (const g of planGoals) {
     const goal = g.goal;
     const sport = goal.sport;
-    const sportMatch = !sport || sport === "other" || sport === "rest" || !type || type === "other" || type === "rest" || sport === type;
+    const sportMatch = !sport || sport === "other" || !type || type === "other" || sport === type;
     for (const b of (g.blocks || [])) {
       if (b.start_date && b.end_date && b.start_date <= d && d <= b.end_date) {
         const days = Math.round((parseISO(b.end_date) - parseISO(b.start_date)) / 86400000);
@@ -3364,7 +3355,7 @@ function updateWorkoutPhaseBadge() {
   for (const g of planGoals) {
     const goal = g.goal;
     const sport = goal.sport;
-    const sportMatch = !sport || sport === "other" || sport === "rest" || !type || type === "other" || type === "rest" || sport === type;
+    const sportMatch = !sport || sport === "other" || !type || type === "other" || sport === type;
     if (sportMatch && (!goal.start_date || goal.start_date <= d) && (!goal.target_date || goal.target_date >= d)) {
       setIconText(badge, "target", (goal.title || "Goal") + " (Unphased)");
       return;
@@ -3376,8 +3367,8 @@ function updateWorkoutPhaseBadge() {
 // ---- Structured-workout step editor ----------------------------------------
 // Each `.step-row` is one interval; `collectSteps` reads the rows back into the
 // API's step shape (duration in seconds, targets optional) and `updateStepsTotal`
-// keeps the running total in sync. Every workout except a rest day needs at
-// least one step (enforced server-side too), so a new workout starts with one.
+// keeps the running total in sync. Every workout needs at least one step
+// (enforced server-side too), so a new workout starts with one.
 
 function stepInput(row, cls, type, placeholder, value) {
   const input = document.createElement("input");
@@ -3518,7 +3509,7 @@ async function savePlan() {
     status: $("pm-status").value,
   };
   if (!body.planned_date) { setErr($("plan-modal-error"), "pick a date"); return; }
-  if (body.activity_type !== "rest" && !body.steps.length) {
+  if (!body.steps.length) {
     setErr($("plan-modal-error"), "add at least one step with a duration");
     return;
   }
@@ -3639,7 +3630,7 @@ function renderGoalEditor() {
   form.appendChild(goalRow(
     goalField("Title", "gm-title", G.title, { placeholder: "Autumn marathon" }),
     goalSelect("Sport", "gm-sport", G.sport,
-      ["", "run", "cycle", "swim", "strength", "rest", "other"])));
+      ["", "run", "cycle", "swim", "strength", "other"])));
   form.appendChild(goalRow(
     goalField("Start date", "gm-start", G.start_date, { type: "date" }),
     goalField("Target date", "gm-date", G.target_date, { type: "date" })));

@@ -296,13 +296,12 @@ class TrainingWorkoutStore:
 
         Best-effort and idempotent: only moves a workout from planned to
         completed, never un-completes and never touches a skipped one. A
-        non-rest workout is matched to an activity of the same family on the
+        workout is matched to an activity of the same family on the
         planned day, then on the adjacent days (±1) — a long run logged the next
         morning still counts. Each activity completes at most one workout, and
         same-day matches take priority over the adjacent-day fallback (so an
         activity is never claimed by two workouts, nor borrowed from a day whose
-        own workout still needs it). A past rest workout is completed when no
-        activity exists that day. Dead ``completed_activity_id`` links (an
+        own workout still needs it). Dead ``completed_activity_id`` links (an
         activity removed by a re-parse) are cleared first. Future workouts are
         never touched. Returns {"completed": n}.
         """
@@ -362,16 +361,7 @@ class TrainingWorkoutStore:
                 ).fetchall()
             }
             matched: set[int] = set()
-            pending: list[Any] = []
-            for w in workouts:
-                if w["planned_date"] > today:
-                    continue
-                day_acts = by_date.get(w["planned_date"], [])
-                if w["activity_type"] == "rest":
-                    if w["planned_date"] < today and not day_acts:
-                        updates.append((None, now, user_id, w["id"]))
-                    continue
-                pending.append(w)
+            pending = [w for w in workouts if w["planned_date"] <= today]
 
             def _claim(workout: Any, day_acts: list[dict[str, Any]]) -> bool:
                 candidates = [

@@ -22,7 +22,8 @@ _MAX_DESCRIPTION_CHARS = 200
 
 #: Allowed training-plan values (kept here so the store, the API and the agent
 #: tools share one vocabulary).
-ACTIVITY_TYPES = ("run", "cycle", "swim", "strength", "rest", "other")
+#: There is no rest workout: a day without a workout is a rest day.
+ACTIVITY_TYPES = ("run", "cycle", "swim", "strength", "other")
 INTENSITIES = ("easy", "moderate", "hard", "race_pace")
 
 #: Workout lifecycle. ``completed`` and ``partial`` both count as done; the
@@ -33,10 +34,6 @@ PLAN_STATUSES = ("planned", "completed", "partial", "skipped")
 #: of ``{kind, duration_sec, ...}`` intervals (e.g. warm-up, threshold,
 #: recovery); the flat duration/distance/targets remain the workout summary.
 STEP_KINDS = ("warmup", "steady", "work", "recovery", "cooldown", "rest")
-
-#: Activity types that may be saved without structured steps (every other
-#: workout must carry at least one).
-STEPLESS_TYPES = ("rest",)
 
 #: Hard backstops so a runaway edit can't bloat a single workout row.
 _MAX_STEPS = 50
@@ -159,15 +156,12 @@ def _normalize_steps(value: Any) -> str | None:
 
 
 def _require_steps(activity_type: Any, steps: Any) -> None:
-    """Raise ``ValueError`` unless a non-rest workout has at least one step,
-    and every non-rest step of a run carries a pace or an HR zone (so the
-    run's distance can be computed from its steps)."""
+    """Raise ``ValueError`` unless the workout has at least one step and
+    every non-rest step of a run carries a pace or an HR zone (so the run's
+    distance can be computed from its steps)."""
     parsed = _parse_steps(steps)
-    if activity_type not in STEPLESS_TYPES and not parsed:
-        raise ValueError(
-            f"a {activity_type} workout needs at least one step "
-            "(only rest days may have none)"
-        )
+    if not parsed:
+        raise ValueError(f"a {activity_type} workout needs at least one step")
     if activity_type != "run":
         return
     missing = [

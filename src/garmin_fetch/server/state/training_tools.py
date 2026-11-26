@@ -86,8 +86,8 @@ class WorkoutEdit(_Spec):
     steps: Annotated[list[Step] | None, Loose] = Field(
         None,
         description=(
-            "ordered segments; REQUIRED (at least one) when creating anything but a rest "
-            "day — a single steady step for a plain run. Every non-rest step of a RUN "
+            "ordered segments; REQUIRED (at least one) when creating — a single steady "
+            "step for a plain run. Every non-rest step of a RUN "
             "needs target_pace_min_km (reps / race pace) or target_hr_zone (easy / steady)"
         ),
     )

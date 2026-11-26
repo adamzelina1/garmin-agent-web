@@ -12,8 +12,7 @@ from typing import Any
 
 #: Garmin activity typeKeys that satisfy each plan ``activity_type`` when
 #: auto-matching completed activities and when summing a goal's actual weekly
-#: volume. ``rest`` and ``other`` are handled specially (absence / any type) and
-#: are intentionally absent here.
+#: volume. ``other`` matches any type and is intentionally absent here.
 GARMIN_TYPE_MAP: dict[str, frozenset[str]] = {
     "run": frozenset({
         "running", "track_running", "trail_running", "indoor_running",
@@ -185,10 +184,10 @@ def _activity_matches(plan_type: str, garmin_type: str | None) -> bool:
 def _goal_matches(sport: str | None, garmin_type: str | None) -> bool:
     """True when a Garmin typeKey counts toward a goal's volume.
 
-    A goal with no sport (or the catch-all ``other``/``rest``) counts every
-    activity; otherwise the sport must map through :data:`GARMIN_TYPE_MAP`.
+    A goal with no sport (or the catch-all ``other``) counts every activity;
+    otherwise the sport must map through :data:`GARMIN_TYPE_MAP`.
     """
-    if not sport or sport in ("other", "rest"):
+    if not sport or sport == "other":
         return True
     return _activity_matches(sport, garmin_type)
 
@@ -197,13 +196,13 @@ def _workout_matches_sport(sport: str | None, activity_type: str | None) -> bool
     """True when a workout activity_type satisfies a goal's sport.
 
     Both values come from :data:`ACTIVITY_TYPES` ("run", "cycle", "swim",
-    "strength", "rest", "other"). A goal with no sport (or "other"/"rest")
-    matches all workout types, and a "rest"/"other" workout matches any
-    sport. Otherwise the types must match (or map via :data:`GARMIN_TYPE_MAP`).
+    "strength", "other"). A goal with no sport (or "other") matches all
+    workout types, and an "other" workout matches any sport. Otherwise the
+    types must match (or map via :data:`GARMIN_TYPE_MAP`).
     """
-    if not sport or sport in ("other", "rest"):
+    if not sport or sport == "other":
         return True
-    if not activity_type or activity_type in ("other", "rest"):
+    if not activity_type or activity_type == "other":
         return True
     if sport == activity_type:
         return True

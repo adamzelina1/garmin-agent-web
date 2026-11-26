@@ -33,15 +33,11 @@ def _slim(row: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _workout(w: dict[str, Any]) -> dict[str, Any]:
-    """A planned workout; with steps, its targets live on the steps only.
-    A rest day is just its date, title and description, and a completed
-    workout points at its activity (listed in the week's ``actual``)."""
+    """A planned workout; with steps, its targets live on the steps only,
+    and a completed workout points at its activity (listed in the week's
+    ``actual``)."""
     out = _slim(w) or {}
     out.pop("actual", None)
-    if w["activity_type"] == "rest":
-        return {k: out[k] for k in (
-            "id", "planned_date", "activity_type", "title", "description", "status",
-        ) if k in out}
     if w.get("steps"):
         for key in _STEP_FIELDS:
             out.pop(key, None)
