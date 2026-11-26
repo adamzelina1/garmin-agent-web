@@ -58,9 +58,7 @@ class TrainingWorkoutStore:
             self._set_user(conn, user_id)
             sql = (
                 "SELECT w.*, a.distance_km AS act_distance_km, "
-                "a.duration_hours AS act_duration_hours, "
-                "a.pace_min_km AS act_pace_min_km, a.avg_hr AS act_avg_hr, "
-                "a.avg_power_w AS act_avg_power_w "
+                "a.duration_hours AS act_duration_hours, a.avg_hr AS act_avg_hr "
                 "FROM training_workout w LEFT JOIN activity_summaries a "
                 "ON a.user_id = w.user_id "
                 "AND a.activity_id = w.completed_activity_id "
@@ -86,9 +84,7 @@ class TrainingWorkoutStore:
                 d["actual"] = {
                     "distance_km": r["act_distance_km"],
                     "duration_min": round(hours * 60) if hours is not None else None,
-                    "pace_min_km": r["act_pace_min_km"],
                     "avg_hr": r["act_avg_hr"],
-                    "avg_power_w": r["act_avg_power_w"],
                 }
             out.append(d)
         return out
@@ -111,16 +107,13 @@ class TrainingWorkoutStore:
         row = conn.execute(
             "INSERT INTO training_workout (user_id, planned_date, activity_type, "
             "title, description, duration_min, distance_km, intensity, "
-            "target_pace_min_km, target_hr_zone, target_power_w, steps, status, "
-            "created_at, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s) RETURNING *",
+            "target_hr_zone, steps, status, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
             (
                 user_id, fields["planned_date"], fields["activity_type"],
                 fields.get("title"), fields.get("description"),
                 fields.get("duration_min"), fields.get("distance_km"),
-                fields.get("intensity"), fields.get("target_pace_min_km"),
-                fields.get("target_hr_zone"), fields.get("target_power_w"),
+                fields.get("intensity"), fields.get("target_hr_zone"),
                 fields.get("steps"), fields.get("status") or "planned",
                 now, now,
             ),

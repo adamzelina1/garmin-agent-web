@@ -132,7 +132,7 @@ _ALLOWED_TABLES = (
     "daily_metrics", "activity_summaries", "activity_detail_series",
     "activity_splits", "hr_zones", "power_zones", "race_predictions", "gear",
     "devices", "derived_metrics", "training_workout", "training_goal",
-    "training_block", "training_week", "weather_forecast",
+    "training_week", "weather_forecast",
 )
 
 #: Derived metrics ``get_metric_trend`` reads (``derived_metrics`` rows).
@@ -214,25 +214,19 @@ _TABLE_NOTES: dict[str, str] = {
     ),
     "training_workout": (
         "planned workouts; READ-ONLY via SQL — write only through "
-        "training_apply. planned_date places a workout in its block and week. status is "
-        "planned/completed/partial/skipped; target_* columns hold the prescribed pace/HR-zone/power"
+        "training_apply. planned_date places a workout in its week. status is "
+        "planned/completed/partial/skipped; target_hr_zone is the headline zone, per-segment targets live in steps"
     ),
     "training_goal": (
-        "the account's ONE long-term goal (an event such as a marathon) over "
-        "[start_date, target_date]; the whole season hangs off it. read-only via "
-        "SQL — write only through training_apply. sport is "
-        "run/cycle/swim/strength/other"
-    ),
-    "training_block": (
-        "one row per periodized phase of a goal: name/focus are free text, "
-        "start_date/end_date define the span (ordered chronologically by start_date); "
-        "read-only via SQL — write only through training_apply"
+        "the account's ONE long-term goal (an event such as a marathon); the "
+        "season runs over [start_date, target_date] and its weeks are numbered "
+        "from start_date. read-only via SQL — write only through training_apply. "
+        "sport is run/cycle/swim/strength/other"
     ),
     "training_week": (
-        "one row per (block_id, week_start): the target for one calendar "
-        "week (Mon..Sun) of a block — duration_min (minutes; the only volume "
-        "target) and an optional is_deload flag. "
-        "read-only via SQL — write only through training_apply"
+        "one row per week_start (a Monday): the target for that calendar week "
+        "(Mon..Sun) — duration_min (minutes; the only volume target) and an "
+        "optional is_deload flag. read-only via SQL — write only through training_apply"
     ),
     "weather_forecast": (
         "stored daily Open-Meteo weather forecast refreshed each sync (calendar_date, "
@@ -334,21 +328,18 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
         "activity_type": "run/cycle/swim/strength/other (no rest type: a day without a workout is a rest day)",
         "duration_min": "planned minutes (computed from steps)",
         "distance_km": "planned km; for a run an ESTIMATE from its steps at the learned zone paces",
-        "target_pace_min_km": "prescribed running pace as DECIMAL min/km (5.5 = 5:30)",
-        "target_hr_zone": "prescribed HR zone/target, free text (e.g. 'Z2' or '140-150')",
-        "target_power_w": "prescribed power in watts (int)",
+        "target_hr_zone": "the session's headline HR zone (free text, e.g. 'Z2'); per-segment targets are in steps",
         "steps": (
             "TEXT holding an ordered JSON array (cast `steps::jsonb` before any "
             "JSON function) of the session's segments (warm-up/work/"
             "recovery/cool-down, intervals, strides, ...); at least one on "
             "every workout; stored as "
             "{kind: warmup/steady/work/recovery/cooldown/rest, duration_sec, "
-            "label?, intensity?, target_pace_min_km?, target_hr_zone?, "
-            "target_power_w?}; label is a short segment name (no duration/rep). "
+            "label?, intensity?, target_hr_zone?, target_pace_min_km? (DECIMAL "
+            "min/km, 5.5 = 5:30)}; label is a short segment name (no duration/rep). "
             "Intervals are written out one step per rep. "
             "When WRITING via training_apply pass a friendly `duration` "
-            "string ('15m', '90s', '1:30') instead of seconds; NULL/[] only for "
-            "a single continuous effort"
+            "string ('15m', '90s', '1:30') instead of seconds"
         ),
         "status": "planned/completed/partial/skipped; 'partial' and 'completed' both count as done",
         "completed_activity_id": (
@@ -357,15 +348,9 @@ _COLUMN_DOCS: dict[str, dict[str, str]] = {
     },
     "training_goal": {
         "sport": "run/cycle/swim/strength/other (same vocabulary as workouts); may be NULL",
-        "start_date": "YYYY-MM-DD; campaign start date",
+        "start_date": "YYYY-MM-DD; the season's first day (week 1 holds it)",
         "target_date": "YYYY-MM-DD; the event/race day, may be NULL",
         "target_time": "free text goal finish time (e.g. 3:45:00)",
-    },
-    "training_block": {
-        "name": "free text phase label (Base/Build/Peak/Taper or any custom name)",
-        "focus": "free text training focus",
-        "start_date": "YYYY-MM-DD (required)",
-        "end_date": "YYYY-MM-DD (required); on/after start_date",
     },
     "training_week": {
         "week_start": "Monday of this calendar week (YYYY-MM-DD)",
@@ -451,8 +436,8 @@ Query rules:
 
 #: The training bullet of the prompt, emitted only when a season is wired.
 _TRAINING_BULLET = """\
-- `training` to read the training season (goals, blocks, weekly targets,
-  planned workouts) — before building or reshaping a week and to answer "how
+- `training` to read the training season (the goal, weekly targets, planned
+  workouts) — before building or reshaping a week and to answer "how
   is my week going?" — and `training_apply` to change it. Prescribe every run
   and rep by time, never by distance — in workouts, titles and chat alike
   (`60 min Z2`, `4x4 min Z5`; not `12 km easy` or `1 km repeats`); km is only

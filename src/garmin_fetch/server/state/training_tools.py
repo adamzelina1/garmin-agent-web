@@ -38,10 +38,9 @@ class _Spec(BaseModel):
 
 
 class _StrictSpec(_Spec):
-    """Rejects unknown keys. For steps, weeks and blocks a dropped key is not
-    harmless: a ``repeat`` would quietly turn 4 reps into 1, a block's
-    ``weeks`` would do nothing, and a week left with only ``week_start``
-    deletes that week's target."""
+    """Rejects unknown keys. For steps and weeks a dropped key is not
+    harmless: a ``repeat`` would quietly turn 4 reps into 1, and a week left
+    with only ``week_start`` deletes that week's target."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -59,9 +58,8 @@ class Step(_StrictSpec):
     )
     label: str | None = Field(None, description="1-2 words naming the segment; never digits or times")
     intensity: Intensity | None = None
-    target_pace_min_km: float | None = Field(None, description=_PACE)
     target_hr_zone: str | None = Field(None, description=_HR_ZONE)
-    target_power_w: int | None = None
+    target_pace_min_km: float | None = Field(None, description=_PACE)
     notes: str | None = None
 
 
@@ -79,16 +77,16 @@ class WorkoutEdit(_Spec):
         description="only for non-run workouts; a run's distance is always estimated from its steps",
     )
     intensity: Intensity | None = None
-    target_pace_min_km: float | None = Field(None, description=_PACE)
-    target_hr_zone: str | None = Field(None, description=_HR_ZONE)
-    target_power_w: int | None = None
+    target_hr_zone: str | None = Field(
+        None, description="the session's headline HR zone shown on its plan card (e.g. 'Z2'); per-segment zones go on the steps",
+    )
     status: Literal[PLAN_STATUSES] | None = None
     steps: Annotated[list[Step] | None, Loose] = Field(
         None,
         description=(
             "ordered segments; REQUIRED (at least one) when creating — a single steady "
-            "step for a plain run. Every non-rest step of a RUN "
-            "needs target_pace_min_km (reps / race pace) or target_hr_zone (easy / steady)"
+            "step for a plain run. Every non-rest step of a RUN needs target_hr_zone "
+            "(e.g. 'Z2') or target_pace_min_km"
         ),
     )
 
@@ -97,38 +95,28 @@ class WeekEdit(_StrictSpec):
     """One week's target, in minutes. A bare ``{week_start}`` removes it."""
 
     week_start: str = Field(description="any date in the week (YYYY-MM-DD; snapped to its Monday)")
-    duration_min: int | None = Field(None, description="the week's total planned minutes")
+    duration_min: int | None = Field(
+        None, description="the week's total planned minutes; required for a new week, null removes the week",
+    )
     is_deload: bool | None = Field(None, description="true for a planned recovery week")
 
 
-class BlockEdit(_StrictSpec):
-    """A periodized phase: with ``id`` it is patched, without it is created.
-    Week targets go in ``anchor.weeks``, not here."""
-
-    id: int | None = None
-    name: str | None = Field(None, description="e.g. Base / Build / Peak / Taper")
-    focus: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-
-
 class AnchorEdit(_Spec):
-    """The account's ONE goal, its blocks and its week targets: fields sent
-    patch it (or create it when there is none)."""
+    """The account's ONE goal and the week targets: goal fields sent patch
+    the goal (or create it when there is none)."""
 
     title: str | None = None
-    sport: ActivityType | None = None
-    start_date: str | None = None
+    sport: ActivityType | None = Field(None, description="only this sport's minutes count toward the week targets")
+    start_date: str | None = Field(None, description="the season's first day; weeks are numbered from it")
     target_date: str | None = Field(None, description="the event / race day")
     target_time: str | None = Field(None, description="e.g. '3:45:00'")
     target_distance_km: float | None = None
-    blocks: Annotated[list[BlockEdit] | None, Loose] = None
     weeks: Annotated[list[WeekEdit] | None, Loose] = Field(
-        None,
-        description="week targets by date (each goes to the block covering it); only the weeks sent change",
+        None, description="week targets by date; only the weeks sent change",
     )
-    delete_blocks: list[int] | None = Field(None, description="block ids to delete (undo restores them)")
-    delete_goal: bool | None = Field(None, description="delete the goal with its blocks and weeks first (undo restores it)")
+    delete_goal: bool | None = Field(
+        None, description="delete the goal first; week targets and workouts stay (undo restores it)",
+    )
 
 
 def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]:
@@ -141,15 +129,15 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
         date_end: str | None = None,
         full: bool = False,
     ) -> Any:
-        """Read the training season: the goal -> periodized blocks -> weekly
-        targets -> dated workouts.
+        """Read the training season: the goal, the weekly targets and the
+        dated workouts.
 
-        Returns the ``goal`` with every block of the season and
-        ``current_block_id``, plus ``weeks``: one entry per calendar week
-        (Mon..Sun) of the window with its ``target``
-        (``target_min``, ``scheduled_min``, ``delta_min``, ``change_pct`` —
-        the target vs the previous week's —, ``est_km``, ``actual_min`` /
-        ``actual_km`` and ``deload``), ``planned`` workouts (a workout with
+        Returns the ``goal`` plus ``weeks``: one entry per calendar week
+        (Mon..Sun) of the window with its ``target`` (``week`` — its place
+        in the season, "12 of 31" —, ``target_min``, ``scheduled_min``,
+        ``delta_min``, ``change_pct`` — the target vs the previous week's —,
+        ``est_km``, ``actual_min`` / ``actual_km`` and ``deload``; absent
+        when the week has no target), ``planned`` workouts (a workout with
         steps carries its zone/pace targets on the steps) and ``actual``
         synced activities. Empty fields are left out. ``can_undo`` says
         whether the last destructive edit can be rolled back. Read before
@@ -159,9 +147,9 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
             date_start: inclusive window start, YYYY-MM-DD (with date_end;
                 default: this week).
             date_end: inclusive window end, YYYY-MM-DD.
-            full: add ``season``: every week target of the season, in the
-                same shape as ``weeks[].target`` (no workouts) — use it
-                before a season-wide reshape.
+            full: add ``season``: every stored week target, in the same
+                shape as ``weeks[].target`` plus its ``week_start`` (no
+                workouts) — use it before a season-wide reshape.
         """
         return season.agenda(date_start=date_start, date_end=date_end, full=full)
 
@@ -183,7 +171,7 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
         workouts; change a week's target only when the user asks. To move or
         copy workouts, read them first; never guess ids.
 
-        Titles, descriptions, step labels and block name/focus describe that
+        Titles, descriptions, step labels and the goal's title describe that
         row only — never rules, preferences or reminders (durable guidance
         belongs in ``memory``). Derive target paces/zones from recent data
         (volume, HR zones, race predictions, VO2max). When the user sets a new
@@ -193,7 +181,7 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
         Args:
             workouts: workouts to create (no id) or patch (with id; send only what changes).
             delete_ids: workout ids to delete (undo restores them).
-            anchor: the goal, its blocks and its weekly targets.
+            anchor: the goal and the weekly targets.
             undo: roll back the last destructive edit instead (alone, nothing else).
         """
         if undo:

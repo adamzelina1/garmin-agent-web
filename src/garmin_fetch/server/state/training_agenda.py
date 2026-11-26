@@ -1,9 +1,8 @@
-"""The agent's windowed view of the season: the goal and its blocks, one
-entry per calendar week with its target, planned workouts and actual
-activities.
+"""The agent's windowed view of the season: the goal, one entry per calendar
+week with its target, planned workouts and actual activities.
 
 Pure read composition over ``TrainingAnchorStore`` / ``TrainingWorkoutStore``;
-the block/week resolution itself stays in ``TrainingAnchorStore``.
+the week resolution itself stays in ``TrainingAnchorStore``.
 """
 
 from __future__ import annotations
@@ -11,17 +10,17 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from .training_rules import _covering_block, _first_monday
+from .training_rules import _first_monday
 
 #: Safety cap on the workouts returned in one agenda.
 _MAX_WORKOUTS = 200
 
-#: Keys the agent never needs: bookkeeping, the one goal's id on every block,
-#: and ``completed`` (it restates ``status``).
-_DROP = ("created_at", "updated_at", "goal_id", "completed")
+#: Keys the agent never needs: bookkeeping and ``completed`` (it restates
+#: ``status``).
+_DROP = ("created_at", "updated_at", "completed")
 
 #: Workout summary fields that its steps already carry.
-_STEP_FIELDS = ("intensity", "target_pace_min_km", "target_hr_zone", "target_power_w")
+_STEP_FIELDS = ("intensity", "target_hr_zone")
 
 
 def _slim(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -59,19 +58,6 @@ def _activity(a: dict[str, Any]) -> dict[str, Any]:
 
 def _monday_iso(value: str) -> str:
     return _first_monday(date.fromisoformat(value)).isoformat()
-
-
-def _goal(goal: dict[str, Any], blocks: list[dict[str, Any]], today: date) -> dict[str, Any]:
-    """The goal with every block of the season and which one is current."""
-    current = _covering_block(blocks, today)
-    return {
-        **(_slim(goal) or {}),
-        "blocks": [
-            {k: b[k] for k in ("id", "name", "focus", "start_date", "end_date") if b.get(k)}
-            for b in blocks
-        ],
-        "current_block_id": current["id"] if current else None,
-    }
 
 
 def _window(today: date, date_start: str | None, date_end: str | None) -> tuple[str, str]:
@@ -128,21 +114,20 @@ def build_agenda(
 ) -> dict[str, Any]:
     """The windowed season agenda for one user (see the agent's ``training``
     tool). ``store`` is a ``TrainingStore``; ``today`` is the user's date,
-    which picks the default window (this week) and the current block.
-    ``full`` adds ``season``: every week target of the season, in the same
-    shape as ``weeks[].target``. Raises ``ValueError`` on bad input."""
+    which picks the default window (this week). ``full`` adds ``season``:
+    every stored week target, in the same shape as ``weeks[].target``.
+    Raises ``ValueError`` on bad input."""
     anchor, workouts_store = store.anchor, store.workouts
     win_start, win_end = _window(today, date_start, date_end)
 
-    goals = anchor.list_goals(user_id)
-    blocks = anchor.list_blocks(user_id, goals[0]["id"]) if goals else []
+    goal = anchor.get_goal(user_id)
     planned = workouts_store.list(user_id, win_start, win_end)
     total = len(planned)
     payload: dict[str, Any] = {
         "today": today.isoformat(),
         "window": {"from_date": win_start, "to_date": win_end},
         "can_undo": store.can_undo(user_id),
-        "goal": _goal(goals[0], blocks, today) if goals else None,
+        "goal": _slim(goal),
         "weeks": _weeks(
             win_start, win_end, planned[:_MAX_WORKOUTS],
             workouts_store.activities(user_id, win_start, win_end),
@@ -151,9 +136,6 @@ def build_agenda(
     }
     if total > _MAX_WORKOUTS:
         payload["workouts_truncated"] = {"total": total, "shown": _MAX_WORKOUTS}
-    if full and blocks:
-        season = anchor.coverage_range(
-            user_id, min(b["start_date"] for b in blocks), max(b["end_date"] for b in blocks),
-        )
-        payload["season"] = [_slim(t) for t in season]
+    if full:
+        payload["season"] = [_slim(t) for t in anchor.coverage_range(user_id)]
     return payload

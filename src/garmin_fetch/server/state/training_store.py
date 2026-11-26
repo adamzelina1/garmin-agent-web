@@ -49,11 +49,12 @@ def _read_snapshot(conn: Any, user_id: int) -> Any | None:
 class TrainingStore:
     """One owner of the whole training season on a single connection pool.
 
-    The season is one tree — goal → block → week → workout — and this store is
-    the only place it is written. The workout and anchor sub-stores share this
-    pool, and one season-wide snapshot spans both, so a single destructive edit
-    (in either half) is restored by a single ``undo``. Every write still sets
-    ``app.user_id`` per transaction, so RLS isolates accounts.
+    The season is the goal, the week targets and the workouts, all lined up
+    by date, and this store is the only place it is written. The workout and
+    anchor sub-stores share this pool, and one season-wide snapshot spans
+    both, so a single destructive edit (in either half) is restored by a
+    single ``undo``. Every write still sets ``app.user_id`` per transaction,
+    so RLS isolates accounts.
     """
 
     def __init__(self, url: str) -> None:
@@ -72,7 +73,8 @@ class TrainingStore:
     # -- destructive edits (one season snapshot, one undo) --------------------
 
     def apply(self, user_id: int, spec: dict[str, Any]) -> dict[str, Any]:
-        """One season edit: optional ``anchor`` and/or ``workouts`` sections.
+        """One season edit: optional ``anchor`` (the goal and its week
+        targets), ``workouts`` (a list to create/patch) and ``delete_ids``.
 
         This is the single write surface the agent uses. Both sections run on ONE
         connection/transaction, so a failure in either rolls the whole edit back —
@@ -87,60 +89,38 @@ class TrainingStore:
                 self._set_user(conn, user_id)
                 return {"restored": self._undo(conn, user_id)}
         anchor_spec = spec.get("anchor")
-        raw_workouts = spec.get("workouts")
-        workouts_spec: dict[str, Any] | None = None
-        if isinstance(raw_workouts, dict):
-            workouts_spec = dict(raw_workouts)
-            if spec.get("delete_ids") and "delete_ids" not in workouts_spec:
-                workouts_spec["delete_ids"] = spec["delete_ids"]
-        elif isinstance(raw_workouts, list):
-            workouts_spec = {"workouts": raw_workouts}
-            if spec.get("delete_ids"):
-                workouts_spec["delete_ids"] = spec["delete_ids"]
-        elif spec.get("delete_ids"):
-            workouts_spec = {"delete_ids": spec["delete_ids"]}
-
-        if anchor_spec is None and workouts_spec is None:
+        workouts = spec.get("workouts") or []
+        delete_ids = spec.get("delete_ids") or []
+        if anchor_spec is None and not workouts and not delete_ids:
             raise ValueError(
-                "spec needs an 'anchor' or 'workouts' section (or {'undo': true})"
+                "spec needs an 'anchor', 'workouts' or 'delete_ids' section "
+                "(or {'undo': true})"
             )
         if anchor_spec is not None and not isinstance(anchor_spec, dict):
             raise ValueError("'anchor' must be an object")
+        if not isinstance(workouts, list):
+            raise ValueError("'workouts' must be a list")
         # Destructive = removes rows or overwrites week targets.
-        blocks = (anchor_spec or {}).get("blocks") or []
         goal_weeks = (anchor_spec or {}).get("weeks") or []
-        rewrites_weeks = bool(goal_weeks) or any(
-            isinstance(b, dict) and b.get("id") is not None and "weeks" in b
-            for b in blocks
-        )
         destructive = bool(
-            (anchor_spec and (
-                anchor_spec.get("delete_goal")
-                or anchor_spec.get("delete_blocks")
-                or rewrites_weeks
-            ))
-            or (workouts_spec and workouts_spec.get("delete_ids"))
+            goal_weeks or (anchor_spec or {}).get("delete_goal") or delete_ids
         )
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
             before = self._capture(conn, user_id) if destructive else None
             result: dict[str, Any] = {}
             if anchor_spec is not None:
-                result["anchor"] = self.anchor.apply_spec(
-                    user_id, anchor_spec, conn=conn
-                )
-            if workouts_spec is not None:
+                result["anchor"] = self.anchor.apply_spec(conn, user_id, anchor_spec)
+            if workouts or delete_ids:
                 result["workouts"] = self.workouts.apply(
-                    user_id, workouts_spec, conn=conn
+                    user_id, {"workouts": workouts, "delete_ids": delete_ids}, conn=conn
                 )
             # Same transaction as the edit, and only when it really removed
-            # something — deleting an unknown id must not clobber the last
-            # good snapshot with a no-op one.
+            # or rewrote something — deleting an unknown id must not clobber
+            # the last good snapshot with a no-op one.
             if before is not None and (
-                anchor_spec and (
-                    anchor_spec.get("delete_blocks") or rewrites_weeks
-                )
-                or result.get("anchor", {}).get("deleted_goals")
+                goal_weeks
+                or result.get("anchor", {}).get("deleted_goal")
                 or result.get("workouts", {}).get("deleted")
             ):
                 _write_snapshot(conn, user_id, before)
@@ -148,11 +128,8 @@ class TrainingStore:
         # the now-scheduled volume, so the caller sees a missed weekly target
         # immediately instead of summing workouts itself.
         dates = list(result.get("workouts", {}).pop("dates", []))
-        week_lists = [goal_weeks] + [
-            b.get("weeks") or [] for b in blocks if isinstance(b, dict)
-        ]
         dates += [
-            str(w["week_start"]) for ws in week_lists for w in ws
+            str(w["week_start"]) for w in goal_weeks
             if isinstance(w, dict) and w.get("week_start")
         ]
         weeks = self._week_coverage(user_id, dates)
@@ -170,7 +147,7 @@ class TrainingStore:
         hi = (date.fromisoformat(hi) + timedelta(days=6)).isoformat()
         out = []
         for row in self.anchor.coverage_range(user_id, lo, hi):
-            if row["week_start"] in mondays and row["target_min"] is not None:
+            if row["week_start"] in mondays:
                 out.append({
                     k: row[k] for k in (
                         "week_start", "target_min", "scheduled_min",
@@ -188,24 +165,16 @@ class TrainingStore:
             "SELECT * FROM training_workout WHERE user_id = %s ORDER BY id",
             (user_id,),
         ).fetchall()
-        goals = conn.execute(
-            "SELECT * FROM training_goal WHERE user_id = %s ORDER BY id",
-            (user_id,),
-        ).fetchall()
-        blocks = conn.execute(
-            "SELECT * FROM training_block WHERE user_id = %s "
-            "ORDER BY goal_id, start_date, id",
-            (user_id,),
-        ).fetchall()
+        goal = conn.execute(
+            "SELECT * FROM training_goal WHERE user_id = %s", (user_id,),
+        ).fetchone()
         weeks = conn.execute(
-            "SELECT * FROM training_week WHERE user_id = %s "
-            "ORDER BY block_id, week_start",
+            "SELECT * FROM training_week WHERE user_id = %s ORDER BY week_start",
             (user_id,),
         ).fetchall()
         return {
             "workouts": [dict(r) for r in plan],
-            "goals": [dict(r) for r in goals],
-            "blocks": [dict(r) for r in blocks],
+            "goal": dict(goal) if goal else None,
             "weeks": [dict(r) for r in weeks],
         }
 
@@ -218,8 +187,8 @@ class TrainingStore:
     def undo(self, user_id: int) -> dict[str, int]:
         """Restore the whole season from the last snapshot (original ids kept).
 
-        Plan rows carry their own goal/block ids, so restoring the tree in
-        dependency-free order (goal, block, week, plan) re-links everything.
+        The goal, week targets and workouts only line up by date, so they
+        restore independently.
         """
         with self._pool.connection() as conn:
             self._set_user(conn, user_id)
@@ -229,68 +198,45 @@ class TrainingStore:
         payload = _read_snapshot(conn, user_id)
         if payload is None:
             raise ValueError("nothing to undo: no season snapshot stored")
-        for table in (
-            "training_workout", "training_week", "training_block", "training_goal"
-        ):
+        for table in ("training_workout", "training_week", "training_goal"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
-        for g in payload.get("goals", []):
+        if (g := payload["goal"]) is not None:
             conn.execute(
-                "INSERT INTO training_goal (id, user_id, title, sport, "
-                "start_date, target_date, target_distance_km, target_time, "
-                "created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO training_goal (user_id, title, sport, start_date, "
+                "target_date, target_distance_km, target_time) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (
-                    g.get("id"), user_id, g.get("title"), g.get("sport"),
-                    g.get("start_date"), g.get("target_date"),
-                    g.get("target_distance_km"), g.get("target_time"),
-                    g.get("created_at"), g.get("updated_at"),
+                    user_id, g["title"], g["sport"], g["start_date"],
+                    g["target_date"], g["target_distance_km"], g["target_time"],
                 ),
             )
-        for b in payload.get("blocks", []):
+        for w in payload["weeks"]:
             conn.execute(
-                "INSERT INTO training_block (id, user_id, goal_id, name, "
-                "start_date, end_date, focus, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    b.get("id"), user_id, b.get("goal_id"), b.get("name"),
-                    b.get("start_date"), b.get("end_date"), b.get("focus"),
-                    b.get("created_at"), b.get("updated_at"),
-                ),
+                "INSERT INTO training_week (user_id, week_start, duration_min, is_deload) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, w["week_start"], w["duration_min"], w["is_deload"]),
             )
-        for w in payload.get("weeks", []):
-            conn.execute(
-                "INSERT INTO training_week (id, user_id, block_id, week_start, "
-                "duration_min, is_deload, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    w.get("id"), user_id, w.get("block_id"),
-                    w.get("week_start"), w.get("duration_min"),
-                    w.get("is_deload"),
-                    w.get("created_at"), w.get("updated_at"),
-                ),
-            )
-        for w in payload.get("workouts", []):
+        for w in payload["workouts"]:
             conn.execute(
                 "INSERT INTO training_workout (id, user_id, planned_date, "
                 "activity_type, title, description, duration_min, distance_km, "
-                "intensity, target_pace_min_km, target_hr_zone, target_power_w, "
-                "steps, status, completed_activity_id, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s)",
+                "intensity, target_hr_zone, steps, status, completed_activity_id, "
+                "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s, %s, %s)",
                 (
                     w.get("id"), user_id, w.get("planned_date"),
                     w.get("activity_type"), w.get("title"),
                     w.get("description"), w.get("duration_min"),
                     w.get("distance_km"), w.get("intensity"),
-                    w.get("target_pace_min_km"), w.get("target_hr_zone"),
-                    w.get("target_power_w"), w.get("steps"), w.get("status"),
+                    w.get("target_hr_zone"), w.get("steps"), w.get("status"),
                     w.get("completed_activity_id"),
                     w.get("created_at"), w.get("updated_at"),
                 ),
             )
         return {
-            "workouts": len(payload.get("workouts", [])),
-            "goals": len(payload.get("goals", [])),
+            "workouts": len(payload["workouts"]),
+            "weeks": len(payload["weeks"]),
+            "goal": payload["goal"] is not None,
         }
 
 

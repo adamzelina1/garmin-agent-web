@@ -18,7 +18,8 @@ API:
 - ``PATCH /training/workouts/{id}`` — partial update of a workout (JWT)
 - ``DELETE /training/workouts/{id}`` — delete a workout (JWT, undoable)
 - ``POST /training/undo``    — restore the whole season pre-destructive-edit (JWT)
-- ``GET  /training/anchor``    — goals + blocks + weeks + resolved week (JWT)
+- ``GET  /training/anchor``    — goal + week targets + resolved week (JWT)
+- ``POST|PATCH|DELETE /training/anchor`` — create / patch / delete the goal (JWT)
 - ``POST /ask``             — run the read-only agent (JWT, per-user rows)
 - ``GET  /ask/history``     — the stored conversation for the caller (JWT)
 - ``POST /ask/clear``       — drop the stored conversation, fresh session (JWT)
@@ -132,8 +133,8 @@ class WorkoutStep(BaseModel):
     positive duration is required — use the friendly ``duration`` string
     (``"15m"``, ``"90s"``, ``"1:30"``) or a plain number of minutes, or
     ``duration_sec`` (whole seconds, the form steps are read back in).
-    Intervals are written out step by step; the optional targets mirror the
-    flat workout targets.
+    Intervals are written out step by step; the optional targets are an HR
+    zone and a pace.
     """
 
     kind: str = "steady"
@@ -141,9 +142,8 @@ class WorkoutStep(BaseModel):
     duration: str | float | None = None
     duration_sec: float | None = None
     intensity: str | None = None
-    target_pace_min_km: float | None = None
     target_hr_zone: str | None = None
-    target_power_w: int | None = None
+    target_pace_min_km: float | None = None
     notes: str | None = None
 
 
@@ -157,9 +157,7 @@ class TrainingWorkout(BaseModel):
     duration_min: int | None = None
     distance_km: float | None = None
     intensity: str | None = None
-    target_pace_min_km: float | None = None
     target_hr_zone: str | None = None
-    target_power_w: int | None = None
     steps: list[WorkoutStep] | None = None
     status: str | None = None
 
@@ -174,43 +172,33 @@ class TrainingWorkoutPatch(BaseModel):
     duration_min: int | None = None
     distance_km: float | None = None
     intensity: str | None = None
-    target_pace_min_km: float | None = None
     target_hr_zone: str | None = None
-    target_power_w: int | None = None
     steps: list[WorkoutStep] | None = None
     status: str | None = None
 
 
 class TrainingWeek(BaseModel):
-    """One week target of a block, in minutes.
+    """One calendar week's target, in minutes.
 
     Weeks are patched by ``week_start`` (any date; snapped to its Monday): only
     the weeks sent are written, and a week sent with no targets is cleared.
     """
 
-    week_start: str | None = None
+    week_start: str
     duration_min: int | None = None
     is_deload: bool | None = None
 
 
-class TrainingBlock(BaseModel):
-    id: int | None = None
-    name: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    focus: str | None = None
-    weeks: list[TrainingWeek] | None = None
-
-
 class TrainingAnchor(BaseModel):
+    """The goal's fields plus week targets; only the fields sent change."""
+
     title: str | None = None
     sport: str | None = None
     start_date: str | None = None
     target_date: str | None = None
     target_distance_km: float | None = None
     target_time: str | None = None
-    blocks: list[TrainingBlock] | None = None
-    delete_blocks: list[int] | None = None
+    weeks: list[TrainingWeek] | None = None
 
 
 # -- App state ---------------------------------------------------------------
@@ -680,7 +668,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         """Partial workout update — only the fields sent change.
 
         This is the edit path the plan tab uses (including drag-and-drop), so
-        moving a workout never clears its title, targets or goal/block link.
+        moving a workout never clears its title, steps or status.
         """
         workouts: TrainingWorkoutStore = request.app.state.workouts
         if workouts.get(user["id"], workout_id) is None:
@@ -693,7 +681,7 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
     def training_workout_delete(
         workout_id: int, request: Request, user: dict = Depends(get_user)
     ) -> dict[str, Any]:
-        result = _apply(request, user["id"], {"workouts": {"delete_ids": [workout_id]}})
+        result = _apply(request, user["id"], {"delete_ids": [workout_id]})
         if not result["workouts"]["deleted"]:
             raise HTTPException(404, "workout not found")
         return {"status": "ok"}
@@ -736,30 +724,16 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
 
     # -- long-term anchor -----------------------------------------------------
 
-    def _goal_dump(
-        store: TrainingAnchorStore, user_id: int, gid: int,
-        week_start: str | None = None,
-    ) -> dict[str, Any]:
-        """One goal with its blocks (+ weeks), resolved block and weekly target.
-
-        Thin wrapper over ``TrainingAnchorStore.resolve_goal`` (the single
-        composition shared with the agent tools), resolved for ``week_start``
-        (default today) so the plan tab never re-derives block/week selection.
-        """
-        resolved = store.resolve_goal(user_id, gid, week_start)
-        if resolved is None:
-            raise HTTPException(404, "goal not found")
-        return resolved
-
     @app.get("/training/anchor")
     def training_anchor_get(
         request: Request, user: dict = Depends(get_user),
         week_start: str | None = None,
     ) -> dict[str, Any]:
-        """The user's long-term anchors (goal + blocks + weeks + current block).
+        """The goal (or None), every week target and ``weekly_target``.
 
-        ``week_start`` (YYYY-MM-DD, default today) selects the week whose week
-        target each goal reports as ``weekly_target``.
+        ``week_start`` (YYYY-MM-DD, default today) selects the week reported as
+        ``weekly_target`` (see ``TrainingAnchorStore.resolve``, the same
+        resolution the agent's tools use).
         """
         if week_start:
             from datetime import date as _date
@@ -771,52 +745,31 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
                     400, "week_start must be a YYYY-MM-DD date"
                 ) from exc
         anchor: TrainingAnchorStore = request.app.state.anchor
-        goals = [
-            _goal_dump(anchor, user["id"], g["id"], week_start)
-            for g in anchor.list_goals(user["id"])
-        ]
-        return {"goals": goals}
+        return anchor.resolve(user["id"], week_start)
 
-    @app.post("/training/anchor")
-    def training_anchor_create(
-        body: TrainingAnchor, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
-        """Create the account's goal (an account has one; edit it instead)."""
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        if anchor.list_goals(user["id"]):
-            raise HTTPException(400, "this account already has a goal — edit it instead")
-        result = _apply(request, user["id"], {"anchor": body.model_dump(exclude_none=True)})
-        return _goal_dump(anchor, user["id"], result["anchor"]["goal_id"])
-
-    @app.patch("/training/anchor/{goal_id}")
+    @app.patch("/training/anchor")
     def training_anchor_update(
-        goal_id: int,
-        body: TrainingAnchor,
-        request: Request,
-        user: dict = Depends(get_user),
+        body: TrainingAnchor, request: Request, user: dict = Depends(get_user),
     ) -> dict[str, Any]:
-        """Partial update of one goal (only the fields sent change).
+        """Patch the goal and/or week targets (only the fields sent change);
+        goal fields create the goal when the account has none.
 
         Goes through the same transactional ``TrainingStore.apply`` as the
-        agent, so a destructive edit (removed blocks, rewritten weeks) is
-        snapshotted for undo in the same transaction.
+        agent, so rewritten weeks are snapshotted for undo in the same
+        transaction.
         """
-        anchor: TrainingAnchorStore = request.app.state.anchor
-        if anchor.get_goal(user["id"], goal_id) is None:
-            raise HTTPException(404, "goal not found")
         _apply(request, user["id"], {"anchor": body.model_dump(exclude_unset=True)})
-        return _goal_dump(anchor, user["id"], goal_id)
-
-    @app.delete("/training/anchor/{goal_id}")
-    def training_anchor_delete(
-        goal_id: int, request: Request, user: dict = Depends(get_user)
-    ) -> dict[str, Any]:
         anchor: TrainingAnchorStore = request.app.state.anchor
-        if anchor.get_goal(user["id"], goal_id) is None:
-            raise HTTPException(404, "goal not found")
+        return anchor.resolve(user["id"])
+
+    @app.delete("/training/anchor")
+    def training_anchor_delete(
+        request: Request, user: dict = Depends(get_user)
+    ) -> dict[str, Any]:
+        """Delete the goal (undoable); week targets and workouts stay."""
         result = _apply(request, user["id"], {"anchor": {"delete_goal": True}})
-        if not result["anchor"]["deleted_goals"]:
-            raise HTTPException(404, "goal not found")
+        if not result["anchor"]["deleted_goal"]:
+            raise HTTPException(404, "no goal to delete")
         return {"status": "ok"}
 
     # -- weather ---------------------------------------------------------------

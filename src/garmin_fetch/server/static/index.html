@@ -309,13 +309,6 @@
   #plan-anchor { display:flex; flex-direction:column; gap:10px; }
   #plan-anchor.hidden { display:none; }
   #plan-anchor .plan-anchor { margin-bottom:0; }
-  .goal-tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
-  .goal-tabs.hidden { display:none; }
-  .goal-chip { background:none; border:0; border-bottom:2px solid transparent; border-radius:0;
-               color:var(--muted); padding:3px 2px; font-size:13px; cursor:pointer;
-               font-weight:600; letter-spacing:-.01em; transition:color .15s ease, border-color .15s ease; }
-  .goal-chip:hover { color:var(--text); }
-  .goal-chip.active { background:none; color:var(--accent); border-bottom-color:var(--accent); }
   .wp-row { font-size:12.5px; color:var(--text); }
   .wp-row .wp-bar-row { display:flex; align-items:center; gap:10px; }
   .wp-compact { display:flex; align-items:center; gap:10px; }
@@ -394,34 +387,17 @@
   .gd-kv { display:grid; grid-template-columns:112px 1fr; gap:6px 14px; margin:0; font-size:13px; }
   .gd-kv dt { color:var(--muted); }
   .gd-kv dd { margin:0; color:var(--text); }
-  .phase-strip { display:flex; margin-top:10px; height:14px; border-radius:7px; overflow:hidden;
-                 background:transparent; margin-bottom:8px; }
-  .phase-seg { flex:none; opacity:.5; border-radius:3px; cursor:pointer;
-               transition:opacity .15s ease, box-shadow .15s ease; }
-  .phase-seg:hover { opacity:.85; }
-  .phase-seg.selected { opacity:1; box-shadow:inset 0 0 0 2px #fff; }
-  .phase-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin:0 0 4px; }
-  .phase-legend .pl-item { display:inline-flex; align-items:center; gap:6px; font-size:11.5px;
-                           color:var(--muted); cursor:pointer; }
-  .phase-legend .pl-item:hover { color:var(--text); }
-  .phase-legend .pl-item .pl-dot { width:9px; height:9px; border-radius:3px; flex:none; }
-  .phase-legend .pl-item.selected { color:var(--text); font-weight:700; }
-  .phase-empty { color:var(--muted); font-size:11.5px; margin-top:8px; }
-  .phase-detail { margin-top:12px; background:var(--surface-2); border-radius:8px;
-                  padding:11px 13px; color:var(--muted); font-size:12px; line-height:1.5; }
-  .phase-detail:empty { display:none; }
-  .phase-detail .pd-title { color:var(--text); font-weight:700; font-size:13px; margin-bottom:3px; }
-  .phase-detail .pd-meta { font-size:11.5px; font-variant-numeric:tabular-nums; }
-  .phase-detail .pd-focus, .phase-detail .pd-weeks { margin-top:6px; }
-  .phase-detail .pd-weeks-title { color:var(--text); font-weight:600; margin-bottom:4px; }
-  .phase-detail .pd-week { margin-top:3px; }
-  .phase-detail .pd-week-head { font-variant-numeric:tabular-nums; }
-  .plan-day.block { box-shadow:inset 0 2px 0 rgba(59,130,246,.55); }
+  .gd-week { display:flex; align-items:baseline; gap:10px; padding:4px 8px; border-radius:6px;
+             font-size:12.5px; font-variant-numeric:tabular-nums; color:var(--muted); }
+  .gd-week.current { background:var(--surface-2); color:var(--text); }
+  .gd-week .gdw-n { width:34px; flex:none; font-weight:600; }
+  .gd-week .gdw-date { width:56px; flex:none; }
+  .gd-week .gdw-min { color:var(--text); font-weight:600; }
+  .gd-week .gdw-tag { padding:0 7px; border-radius:9px; background:var(--surface-3); font-size:11px; }
   .plan-week { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:10px; }
   .plan-day { background:var(--surface-1); border:0; border-radius:10px;
               padding:10px; min-height:150px; display:flex; flex-direction:column; }
   .plan-day.today { box-shadow:inset 0 0 0 1px var(--accent); }
-  .plan-day.block.today { box-shadow:inset 0 0 0 1px var(--accent), inset 0 2px 0 rgba(59,130,246,.55); }
   .plan-day-header { display:flex; justify-content:space-between; align-items:baseline;
                      font-size:11.5px; color:var(--muted); margin-bottom:2px; }
   .plan-day-header { align-items:center; flex-wrap:wrap; row-gap:3px; margin-bottom:6px; }
@@ -534,25 +510,17 @@
   .goal-modal h3 { position:sticky; top:0; background:var(--panel); z-index:1; }
   .goal-form { display:flex; flex-direction:column; gap:8px; }
   .goal-form .row > div { flex:1; }
-  .block-card { border:1px solid var(--border); border-radius:8px; padding:10px; background:var(--panel2); }
-  .block-card .bc-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
-  .block-card .bc-head b { flex:1; }
   .week-row { display:flex; align-items:center; gap:6px; margin-top:6px; }
   .week-row input[type=number], .week-row input[type=text] { padding:4px 6px; font-size:12px; }
-  .week-row .w-idx { width:44px; flex:none; }
+  .week-row .w-idx { width:118px; flex:none; font-size:12.5px; white-space:nowrap;
+                     font-variant-numeric:tabular-nums; }
   .week-row .w-min { width:70px; flex:none; }
   .week-row .w-int { flex:1; min-width:70px; }
 .week-row .w-deload { display:flex; align-items:center; gap:4px; font-size:11px; color:var(--muted); flex:none; }
 .week-row .w-deload input { width:auto; margin:0; }
   .goal-actions { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
-  .goal-list { display:flex; flex-direction:column; gap:6px; margin-bottom:10px; }
-  .goal-list button { text-align:left; }
-  .goal-list button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-  .modal-actions .spacer { flex:1; }
-  .phase-badge { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; background:var(--surface-2);
-                 border:1px solid var(--border); border-radius:6px; font-size:12.5px; color:var(--text); }
-  .block-head-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
-  .block-head-row .danger { margin-left:auto; }
+  .ge-head-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  .ge-head-row .danger { margin-left:auto; }
   .zone-note { font-size:12px; color:var(--muted); margin:2px 0 10px; }
   .td-toolbar { display:flex; align-items:center; justify-content:flex-end; margin:4px 0 2px; }
   #tab-today .briefing, #tab-today .today-grid { margin-top:16px; }
@@ -581,7 +549,7 @@
   .steps-head { display:flex; justify-content:space-between; align-items:center; margin:14px 0 6px; }
   .steps-head button { padding:4px 10px; font-size:12px; }
   #pm-steps { display:flex; flex-direction:column; gap:5px; }
-  .step-row { display:grid; grid-template-columns:92px 1fr 52px 48px 42px 90px 64px 60px 60px 22px;
+  .step-row { display:grid; grid-template-columns:92px 1fr 52px 48px 42px 90px 64px 60px 22px;
               gap:5px; align-items:center; }
   .step-row input, .step-row select { padding:5px 6px; font-size:12px; min-width:0; }
   .step-row .step-del { background:none; border:none; color:var(--err); cursor:pointer; font-size:15px;
@@ -769,9 +737,8 @@
             <button id="plan-view-week" class="active" title="Week calendar">Week</button>
             <button id="plan-view-list" title="List the next 8 weeks">List</button>
           </div>
-          <button id="btn-edit-goals" class="secondary" title="Edit goals, blocks and weeks">Goals</button>
+          <button id="btn-edit-goals" class="secondary" title="Edit the goal and weekly targets">Goal</button>
         </div>
-        <div class="goal-tabs hidden" id="plan-goal-tabs"></div>
         <div class="hidden" id="plan-anchor"></div>
         <div class="banner warn dismissible" style="margin-top:0" id="plan-onboard">
           <span>You can edit your plan here, or ask the AI in
@@ -934,18 +901,8 @@
       </div>
       <div class="row">
         <div>
-          <label>Target pace <span class="muted">(min/km)</span></label>
-          <input type="number" id="pm-pace" min="1" max="60" step="any" placeholder="5.5 = 5:30">
-        </div>
-        <div>
-          <label>Target HR zone</label>
+          <label title="The session's headline zone, shown on its card; each step carries its own">Target HR zone</label>
           <input type="text" id="pm-hrzone" placeholder="Z2 or 140-150" autocomplete="off">
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label>Target power <span class="muted">(W)</span></label>
-          <input type="number" id="pm-power" min="0" placeholder="—">
         </div>
         <div>
           <label>Status</label>
@@ -963,10 +920,6 @@
       </div>
       <div id="pm-steps"></div>
       <div class="step-hint" id="pm-steps-total">No structured steps</div>
-      <div style="margin-top:4px">
-        <label style="margin:0 0 4px">Training Phase</label>
-        <div id="pm-phase-badge" class="phase-badge">Standalone workout</div>
-      </div>
       <div class="modal-actions">
         <button id="pm-delete" class="danger">Delete</button>
         <span class="spacer"></span>
@@ -976,17 +929,16 @@
     </div>
   </div>
 
-  <!-- Goal / phase / week editor -->
+  <!-- Goal & weekly targets editor -->
   <div id="goal-modal" class="modal-bg hidden" role="dialog" aria-modal="true" aria-labelledby="goal-modal-title">
     <div class="modal goal-modal">
-      <h3 id="goal-modal-title">Goals, blocks &amp; weeks</h3>
+      <h3 id="goal-modal-title">Goal &amp; weekly targets</h3>
       <div class="banner err hidden" id="goal-modal-error"></div>
       <div id="goal-modal-body"></div>
       <div class="modal-actions">
-        <button id="goal-undo" class="secondary" title="Restore the goals/blocks from before the last destructive save">Undo last save</button>
+        <button id="goal-undo" class="secondary" title="Restore the goal and week targets from before the last save">Undo last save</button>
         <span class="spacer"></span>
         <button id="goal-cancel" class="secondary">Close</button>
-        <button id="goal-new" class="secondary">New goal</button>
         <button id="goal-save">Save goal</button>
       </div>
     </div>
@@ -1065,8 +1017,7 @@ function showAuth() {
   $("plan-compare-grid").innerHTML = "";
   $("plan-compare").classList.add("hidden");
   for (const k of Object.keys(TODAY_CARDS)) delete TODAY_CARDS[k];
-  planGoals = []; planWorkouts = []; planActivities = []; planActiveBlocks = [];
-  planSelectedGoalId = null;
+  planAnchor = null; planWorkouts = []; planActivities = [];
   planWeatherByDate = {};
   planWeekStart = mondayOf(new Date());
 }
@@ -1875,15 +1826,11 @@ const STEP_KIND_MAP = Object.fromEntries(STEP_KINDS.map(([k, label, color]) => [
 const DAY_LABELS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 let planWeekStart = mondayOf(new Date());
 let planEditId = null;
-let planGoals = [];
+let planAnchor = null;  // GET /training/anchor: {goal, weeks, weekly_target}
 let planWorkouts = [];
 let planActivities = [];
-let planActiveBlocks = [];
-let planSelectedGoalId = null;
 let planView = localStorage.getItem("plan_view") === "list" ? "list" : "week";
-let goalEditId = null;   // null = creating a new goal
-let goalDraft = null;    // working copy of the goal being edited
-let goalOriginalBlockIds = []; // stored block ids when the editor opened
+let goalDraft = null;    // the goal editor's working copy: {goal, weeks: {week_start: target}}
 
 function mondayOf(d) {
   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -2097,190 +2044,87 @@ function renderPlanList(workouts) {
 async function loadAnchor(weekStart, seq) {
   const box = $("plan-anchor");
   if (!box) return;
-  let goals = [];
+  let data = null;
   try {
     const q = weekStart ? "?week_start=" + encodeURIComponent(weekStart) : "";
-    const data = await api("/training/anchor" + q, undefined, "GET");
-    goals = data.goals || [];
-  } catch (e) { goals = []; }
+    data = await api("/training/anchor" + q, undefined, "GET");
+  } catch (e) { data = null; }
   if (planLoadStale(seq)) return;
-  renderAnchor(goals);
+  renderAnchor(data);
 }
 
-function renderAnchor(goals) {
+// The ribbon above the calendar: the goal, where the shown week sits in its
+// season ("Week 12 of 31 · 136 days to go") and that week's target-vs-actual
+// bar. Every number comes from the server's resolution of the week.
+function renderAnchor(data) {
   const box = $("plan-anchor");
   if (!box) return;
-  planGoals = goals;
-  // An account has one goal: once it exists, it is edited, never added to.
-  $("goal-new").classList.toggle("hidden", goals.length > 0);
-  renderGoalSelector();
-  const g = selectedGoal();
-  if (!g) {
-    box.classList.add("hidden");
-    box.innerHTML = "";
-    planActiveBlocks = [];
-    applyBlockHighlight();
-    return;
-  }
-  box.classList.remove("hidden");
+  planAnchor = data;
   box.innerHTML = "";
-  planActiveBlocks = [];
-  const today = fmt(new Date());
-  for (const b of (g.blocks || [])) {
-    if (b.start_date && b.end_date && b.start_date <= today && today <= b.end_date) {
-      planActiveBlocks.push(b);
-    }
-  }
-  renderOneAnchor(box, g);
-  applyBlockHighlight();
-}
-
-function selectedGoal() {
-  if (planSelectedGoalId != null) {
-    const g = planGoals.find((x) => x.goal.id === planSelectedGoalId);
-    if (g) return g;
-  }
-  const today = fmt(new Date());
-  const active = planGoals.find((g) => (g.blocks || []).some((b) =>
-    b.start_date && b.end_date && b.start_date <= today && today <= b.end_date));
-  if (active) { planSelectedGoalId = active.goal.id; return active; }
-  if (planGoals.length) { planSelectedGoalId = planGoals[0].goal.id; return planGoals[0]; }
-  return null;
-}
-
-function renderGoalSelector() {
-  const box = $("plan-goal-tabs");
-  if (!box) return;
-  if (planGoals.length <= 1) { box.classList.add("hidden"); box.innerHTML = ""; return; }
-  selectedGoal();
+  const G = data && data.goal;
+  const tgt = data && data.weekly_target;
+  if (!G && !(tgt && tgt.week)) { box.classList.add("hidden"); return; }
   box.classList.remove("hidden");
-  box.innerHTML = "";
-  // Stable order (creation order from the backend). Clicking only highlights the
-  // active chip — it never reorders the row.
-  const ordered = [...planGoals].sort((a, b) => (a.goal.id || 0) - (b.goal.id || 0));
-  for (const g of ordered) {
-    const chip = document.createElement("button");
-    chip.className = "goal-chip" + (g.goal.id === planSelectedGoalId ? " active" : "");
-    chip.textContent = g.goal.title || ("Goal " + g.goal.id);
-    chip.addEventListener("click", () => {
-      planSelectedGoalId = g.goal.id;
-      renderAnchor(planGoals);
-    });
-    box.appendChild(chip);
-  }
-}
 
-function renderOneAnchor(container, anchor) {
-  const box = document.createElement("div");
-  box.className = "plan-anchor";
-  const G = anchor.goal || {};
+  const card = document.createElement("div");
+  card.className = "plan-anchor";
   const head = document.createElement("div");
   head.className = "goal-head";
   const title = document.createElement("span");
   title.className = "goal-title";
-  title.textContent = G.title || "Training anchor";
+  title.textContent = G ? (G.title || "Goal") : "Weekly target";
   head.appendChild(title);
-  const hint = document.createElement("button");
-  hint.type = "button";
-  hint.className = "goal-hint";
-  const chev = document.createElement("span");
-  chev.className = "gh-chev";
-  chev.textContent = "▸";
-  hint.appendChild(chev);
-  hint.appendChild(document.createTextNode("Details"));
-  hint.addEventListener("click", (e) => { e.stopPropagation(); openGoalDrawer(anchor); });
-  head.appendChild(hint);
-  box.appendChild(head);
+  if (G) {
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "goal-hint";
+    const chev = document.createElement("span");
+    chev.className = "gh-chev";
+    chev.textContent = "▸";
+    hint.appendChild(chev);
+    hint.appendChild(document.createTextNode("Details"));
+    hint.addEventListener("click", (e) => { e.stopPropagation(); openGoalDrawer(); });
+    head.appendChild(hint);
+    card.addEventListener("click", openGoalDrawer);
+  }
+  card.appendChild(head);
 
-  // Macro-season view: a bold "active header" naming where you are, then a
-  // hairline track that reads as a progress bar for the whole plan.
-  const dated = (anchor.blocks || []).filter((b) => b.start_date && b.end_date);
-  const activeId = anchor.current_block ? anchor.current_block.id : null;
-  const activeIdx = activeId != null ? dated.findIndex((b) => b.id === activeId) : -1;
-  const tgt = anchor.weekly_target;
-  const week = tgt && tgt.week ? tgt.week : null;
-  const block = tgt && tgt.block ? tgt.block : null;
-
-  if (dated.length) {
-    const active = dated.find((b) => b.id === activeId) || block || dated[0];
-
-    const headRow = document.createElement("div");
-    headRow.className = "goal-active";
-    const t = document.createElement("div");
-    t.className = "ga-title";
-    t.appendChild(document.createTextNode(
-      "Block " + (activeIdx >= 0 ? activeIdx + 1 : 1) + " of " + dated.length + ": "));
-    const nm = document.createElement("b");
-    nm.textContent = active.name || active.focus || "Block";
-    t.appendChild(nm);
-    if (week) {
-      const weekNum = tgt.week_number;
-      const totalWeeks = tgt.week_count;
-      const wk = document.createElement("span");
-      wk.className = "ga-week";
-      wk.textContent = " (Week " + weekNum + (totalWeeks ? " of " + totalWeeks : "") + ")";
-      t.appendChild(wk);
-    }
-    headRow.appendChild(t);
-    box.appendChild(headRow);
-
-    const stepper = document.createElement("div");
-    stepper.className = "micro-stepper";
-    for (const b of dated) {
-      const on = b.id === activeId;
-      const col = document.createElement("div");
-      col.className = "ms-col" + (on ? " on" : "");
-      const seg = document.createElement("span");
-      seg.className = "ms-seg";
-      col.appendChild(seg);
-      const lbl = document.createElement("span");
-      lbl.className = "ms-label";
-      lbl.textContent = on ? "Current Block" : shortBlockName(b);
-      lbl.title = b.name || b.focus || "Block";
-      col.appendChild(lbl);
-      stepper.appendChild(col);
-    }
-    box.appendChild(stepper);
-  } else if (week) {
-    // No dated phases: fall back to a single summary line.
-    const weekNum = tgt.week_number;
-    const totalWeeks = tgt.week_count;
+  const bits = [];
+  if (tgt && tgt.week_number) {
+    bits.push("Week " + tgt.week_number + (tgt.week_count ? " of " + tgt.week_count : ""));
+  }
+  if (G && G.target_date) bits.push(daysUntil(G.target_date) + " days to go");
+  if (bits.length) {
     const sub = document.createElement("div");
     sub.className = "goal-sub";
     const b = document.createElement("b");
-    b.textContent = "Week " + weekNum + (totalWeeks ? " of " + totalWeeks : "");
+    b.textContent = bits[0];
     sub.appendChild(b);
-    if (block && block.name) sub.appendChild(document.createTextNode(" · " + block.name));
-    box.appendChild(sub);
+    if (bits[1]) sub.appendChild(document.createTextNode(" · " + bits[1]));
+    card.appendChild(sub);
   }
 
   // This week's target-vs-actual bar sits on the ribbon, next to the week it
   // describes.
   const wp = document.createElement("div");
   wp.className = "wp-host";
-  renderWeeklyProgressInto(wp, anchor);
-  box.appendChild(wp);
-
-  box.addEventListener("click", () => openGoalDrawer(anchor));
-  container.appendChild(box);
+  renderWeeklyProgressInto(wp, data);
+  card.appendChild(wp);
+  box.appendChild(card);
 }
 
-// "Polarized Base & Running Economy" -> "Polarized"; "High-Volume Threshold" ->
-// "High-Volume". Short enough for the micro-stepper labels.
-function shortBlockName(b) {
-  const n = (b.name || b.focus || "Block").trim();
-  return n.split(/[\s&:]+/)[0] || n;
+function daysUntil(iso) {
+  return Math.max(0, Math.round((parseISO(iso) - startOfDay(new Date())) / 86400000));
 }
 
 // -- Goal strategy drawer ------------------------------------------------
 // A fixed right sheet: opening/closing it never reflows or scrolls the weekly
 // dashboard behind it.
-function openGoalDrawer(anchor) {
+function openGoalDrawer() {
   const el = $("goal-drawer");
-  if (!el || !anchor) return;
+  const G = planAnchor && planAnchor.goal;
+  if (!el || !G) return;
   hideCardTip(true);
-  const G = anchor.goal || {};
-  const blocks = anchor.blocks || [];
   $("goal-drawer-title").textContent = G.title || "Goal details";
   const body = $("goal-drawer-body");
   body.innerHTML = "";
@@ -2291,11 +2135,9 @@ function openGoalDrawer(anchor) {
   const facts = goalFactsSection(G);
   if (facts) body.appendChild(facts);
 
-  if (blocks.some((b) => b.start_date && b.end_date)) {
-    body.appendChild(goalSection("Block Timeline", (inner) => {
-      renderPhaseStrip(inner, blocks, anchor.current_block);
-      if (!inner.firstChild) inner.appendChild(quietLine("No dated blocks yet."));
-    }));
+  const weeks = planAnchor.weeks || [];
+  if (weeks.length) {
+    body.appendChild(goalSection("Weekly targets", (inner) => renderWeekTargets(inner, weeks)));
   }
 
   el.classList.remove("hidden");
@@ -2331,7 +2173,7 @@ function quietLine(text) {
 
 function goalDateBadge(G) {
   if (!G.target_date) return null;
-  const days = Math.max(0, Math.round((parseISO(G.target_date) - startOfDay(new Date())) / 86400000));
+  const days = daysUntil(G.target_date);
   const when = parseISO(G.target_date).toLocaleDateString("en-GB",
     { day: "numeric", month: "long", year: "numeric" });
   const badge = document.createElement("div");
@@ -2364,15 +2206,6 @@ function goalFactsSection(G) {
     }
     inner.appendChild(dl);
   });
-}
-
-function applyBlockHighlight() {
-  const B = planActiveBlocks;
-  for (const c of document.querySelectorAll("#plan-week .plan-day[data-date]")) {
-    const hit = B && B.some((b) => b.start_date && b.end_date && c.dataset.date >= b.start_date
-      && c.dataset.date <= b.end_date);
-    if (hit) c.classList.add("block"); else c.classList.remove("block");
-  }
 }
 
 // Renders the compact weekly target-vs-actual bar into the plan toolbar (right
@@ -2452,135 +2285,26 @@ function renderWeeklyProgressInto(host, goal) {
   }
 }
 
-function renderPhaseStrip(box, blocks, currentBlock) {
-  const dated = blocks.filter((b) => b.start_date && b.end_date);
-  const undated = blocks.filter((b) => !b.start_date || !b.end_date);
-  // Inline detail panel: hovering a phase writes its details here instead of a
-  // floating tooltip, so nothing has to be positioned or clipped.
-  const detail = document.createElement("div");
-  detail.className = "phase-detail";
-  const segs = new Map();
-  const legendItems = new Map();
-  // Exactly one block is selected at a time; the current block by default.
-  const show = (b) => {
-    for (const s of segs.values()) s.classList.remove("selected");
-    for (const it of legendItems.values()) it.classList.remove("selected");
-    const seg = segs.get(b.id);
-    if (seg) seg.classList.add("selected");
-    const it = legendItems.get(b.id);
-    if (it) it.classList.add("selected");
-    renderBlockDetail(detail, b);
-  };
-  if (dated.length) {
-    const first = dated.map((b) => parseISO(b.start_date)).sort((a, b) => a - b)[0];
-    const last = dated.map((b) => parseISO(b.end_date)).sort((a, b) => b - a)[0];
-    const span = Math.max(1, (last - first) / 86400000);
-    const strip = document.createElement("div");
-    strip.className = "phase-strip";
-    for (const b of dated) {
-      const seg = document.createElement("div");
-      seg.className = "phase-seg";
-      const s = (parseISO(b.start_date) - first) / 86400000;
-      const e = (parseISO(b.end_date) - first) / 86400000;
-      const pct = Math.max(4, Math.min(100, ((e - s + 1) / span) * 100));
-      seg.style.width = "calc(" + pct + "% - 2px)";
-      seg.style.background = phaseColor(b.name || b.focus || b.id);
-      seg.title = b.name || b.focus || "Block";
-      seg.tabIndex = 0;
-      seg.addEventListener("click", () => show(b));
-      seg.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); show(b); }
-      });
-      segs.set(b.id, seg);
-      strip.appendChild(seg);
-    }
-    box.appendChild(strip);
-
-    // Readable legend below the strip (labels no longer clip inside segments).
-    const legend = document.createElement("div");
-    legend.className = "phase-legend";
-    for (const b of dated) {
-      const item = document.createElement("span");
-      item.className = "pl-item";
-      const dot = document.createElement("span");
-      dot.className = "pl-dot";
-      dot.style.background = phaseColor(b.name || b.focus || b.id);
-      item.appendChild(dot);
-      item.appendChild(document.createTextNode(b.name || b.focus || "Block"));
-      item.addEventListener("click", () => show(b));
-      legendItems.set(b.id, item);
-      legend.appendChild(item);
-    }
-    box.appendChild(legend);
-
-    // Current block selected by default; clicking selects another.
-    const initial = dated.find((b) => currentBlock && currentBlock.id === b.id) || dated[0];
-    show(initial);
+// The season's week targets, one line each, with the shown week highlighted:
+// "W12  23 Nov  241 min  +5%  deload".
+function renderWeekTargets(box, weeks) {
+  const shown = planAnchor && planAnchor.weekly_target ? planAnchor.weekly_target.week_start : null;
+  for (const w of weeks) {
+    const row = document.createElement("div");
+    row.className = "gd-week" + (w.week_start === shown ? " current" : "");
+    const cell = (cls, text) => {
+      const c = document.createElement("span");
+      c.className = cls;
+      c.textContent = text;
+      row.appendChild(c);
+    };
+    cell("gdw-n", w.week_number ? "W" + w.week_number : "");
+    cell("gdw-date", parseISO(w.week_start).toLocaleDateString("en-GB", { day: "numeric", month: "short" }));
+    cell("gdw-min", w.duration_min != null ? w.duration_min + " min" : "—");
+    if (w.change_pct != null) cell("gdw-chg", fmtChangePct(w.change_pct));
+    if (w.is_deload) cell("gdw-tag", "deload");
+    box.appendChild(row);
   }
-  if (undated.length) {
-    const note = document.createElement("div");
-    note.className = "phase-empty";
-    note.textContent = undated.map((b) => b.name || b.focus || "Block").join(" · ")
-      + " (undated)";
-    box.appendChild(note);
-  }
-  box.appendChild(detail);
-}
-
-// Block details rendered as DOM into the inline phase panel.
-function renderBlockDetail(container, b) {
-  container.innerHTML = "";
-  const title = document.createElement("div");
-  title.className = "pd-title";
-  title.textContent = b.name || "Block";
-  container.appendChild(title);
-
-  const meta = [];
-  if (b.start_date && b.end_date) meta.push(b.start_date + " → " + b.end_date);
-  else if (b.start_date) meta.push("from " + b.start_date);
-  else if (b.end_date) meta.push("to " + b.end_date);
-  if (meta.length) {
-    const m = document.createElement("div");
-    m.className = "pd-meta";
-    m.textContent = meta.join(" · ");
-    container.appendChild(m);
-  }
-  if (b.focus) {
-    const f = document.createElement("div");
-    f.className = "pd-focus";
-    f.textContent = b.focus;
-    container.appendChild(f);
-  }
-  const hasAnyTarget = b.weeks && b.weeks.some((x) => x.duration_min != null || x.is_deload);
-  if (b.weeks && b.weeks.length && hasAnyTarget) {
-    const w = document.createElement("div");
-    w.className = "pd-weeks";
-    const title = document.createElement("div");
-    title.className = "pd-weeks-title";
-    title.textContent = "Weeks";
-    w.appendChild(title);
-    for (const [wi, x] of b.weeks.entries()) {
-      const row = document.createElement("div");
-      row.className = "pd-week";
-      const head = document.createElement("div");
-      head.className = "pd-week-head";
-      const d = x.duration_min != null ? x.duration_min + "min" : "";
-      const ch = x.change_pct != null ? "(" + fmtChangePct(x.change_pct) + ")" : "";
-      const bits = [d, ch, x.is_deload ? "deload" : ""].filter(Boolean).join(" ");
-      head.textContent = "W" + (wi + 1) + (bits ? " · " + bits : "");
-      row.appendChild(head);
-      w.appendChild(row);
-    }
-    container.appendChild(w);
-  }
-}
-
-const PHASE_COLORS = ["#1f7a5c", "#2f6fa8", "#8a5aa5", "#c77f2e", "#a8443a", "#3d8f8a", "#6b6b8f"];
-function phaseColor(seed) {
-  if (seed == null) return PHASE_COLORS[0];
-  let h = 0; const s = String(seed);
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return PHASE_COLORS[h % PHASE_COLORS.length];
 }
 
 function parseISO(iso) {
@@ -2838,10 +2562,6 @@ function renderPlan(workouts) {
     const day = document.createElement("div");
     day.className = "plan-day" + (iso === today ? " today" : "");
     day.dataset.date = iso;
-    if (planActiveBlocks.some((b) => b.start_date && b.end_date
-        && iso >= b.start_date && iso <= b.end_date)) {
-      day.classList.add("block");
-    }
     const head = document.createElement("div");
     head.className = "plan-day-header";
     const left = document.createElement("span");
@@ -2935,9 +2655,8 @@ function workoutMeta(w) {
     const est = w.activity_type === "run" ? "~" : "";
     parts.push({ v: est + String(Number(w.distance_km)), u: "km" });
   }
-  // The zone/pace/power target already says how hard; intensity only fills in.
-  const hasTarget = w.target_hr_zone || w.target_pace_min_km != null || w.target_power_w != null;
-  if (w.intensity && !hasTarget) parts.push({ v: String(w.intensity).replace(/_/g, " "), u: "" });
+  // The HR zone already says how hard; intensity only fills in.
+  if (w.intensity && !w.target_hr_zone) parts.push({ v: String(w.intensity).replace(/_/g, " "), u: "" });
   return parts;
 }
 
@@ -2957,22 +2676,11 @@ function metricNode(m) {
   return s;
 }
 
-// Prescribed targets rendered as plain metric pairs (pace / HR zone / power);
-// they share the same line as the workout's real numbers instead of forming a
-// separate jagged row of pills.
+// The session's headline HR zone as a plain metric pair, on the same line as
+// the workout's real numbers instead of a separate row of pills.
 function workoutTargets(w) {
-  const out = [];
-  const pace = fmtPace(w.target_pace_min_km);
-  if (pace) {
-    const sp = pace.lastIndexOf(" ");
-    out.push({ v: pace.slice(0, sp), u: pace.slice(sp + 1), title: "Target pace" });
-  }
   const hr = fmtHrZone(w.target_hr_zone);
-  if (hr) out.push({ v: hr, u: "", title: "Target heart-rate zone" });
-  if (w.target_power_w != null) {
-    out.push({ v: String(Number(w.target_power_w)), u: "W", title: "Target power" });
-  }
-  return out;
+  return hr ? [{ v: hr, u: "", title: "Target heart-rate zone" }] : [];
 }
 
 // "2" / "z2" -> "Z2"; anything else ("Zone 2", "145-160 bpm") passes through.
@@ -3012,7 +2720,6 @@ function stepTargetsText(s) {
   if (s.intensity) bits.push(String(s.intensity).replace(/_/g, " "));
   if (s.target_pace_min_km != null) bits.push(fmtPace(s.target_pace_min_km));
   if (s.target_hr_zone) bits.push(fmtHrZone(s.target_hr_zone));
-  if (s.target_power_w != null) bits.push(Number(s.target_power_w) + " W");
   return bits.filter(Boolean).join(" · ");
 }
 
@@ -3124,13 +2831,6 @@ function workoutCompareNode(w) {
     compareLine(pDist, aDist != null ? aDist.toFixed(1) : null, "km"),
     compareLine(pDur, aDur, "min"),
   ];
-  if (w.target_pace_min_km != null) {
-    const pp = fmtPace(w.target_pace_min_km), ap = fmtPace(a.pace_min_km);
-    if (ap) lines.push(compareLine(pp ? pp.split(" ")[0] : null, ap.split(" ")[0], "/km"));
-  }
-  if (w.target_power_w != null && a.avg_power_w != null) {
-    lines.push(compareLine(Number(w.target_power_w), Math.round(a.avg_power_w), "W"));
-  }
   if (a.avg_hr != null) lines.push(compareLine(null, Math.round(a.avg_hr), "bpm"));
   for (const l of lines) if (l) box.appendChild(l);
   return box;
@@ -3318,52 +3018,6 @@ function installDayDrop(day) {
   });
 }
 
-// Populate the goal/phase selects from the loaded anchor so a workout can be
-// Dynamic workout phase badge: resolves the active Block and Goal covering
-// the workout's planned date and activity type via automatic temporal linking.
-function updateWorkoutPhaseBadge() {
-  const badge = $("pm-phase-badge");
-  if (!badge) return;
-  const d = $("pm-date") ? $("pm-date").value.trim() : "";
-  const type = $("pm-type") ? $("pm-type").value.trim() : "";
-  if (!d) {
-    setIconText(badge, "pin", "Pick a date");
-    return;
-  }
-  let bestBlock = null;
-  let bestGoal = null;
-  let bestDays = Infinity;
-  for (const g of planGoals) {
-    const goal = g.goal;
-    const sport = goal.sport;
-    const sportMatch = !sport || sport === "other" || !type || type === "other" || sport === type;
-    for (const b of (g.blocks || [])) {
-      if (b.start_date && b.end_date && b.start_date <= d && d <= b.end_date) {
-        const days = Math.round((parseISO(b.end_date) - parseISO(b.start_date)) / 86400000);
-        if (!bestBlock || (sportMatch && days < bestDays)) {
-          bestBlock = b;
-          bestGoal = goal;
-          bestDays = days;
-        }
-      }
-    }
-  }
-  if (bestBlock && bestGoal) {
-    setIconText(badge, "pin", (bestBlock.name || "Block") + " · " + (bestGoal.title || "Goal"));
-    return;
-  }
-  for (const g of planGoals) {
-    const goal = g.goal;
-    const sport = goal.sport;
-    const sportMatch = !sport || sport === "other" || !type || type === "other" || sport === type;
-    if (sportMatch && (!goal.start_date || goal.start_date <= d) && (!goal.target_date || goal.target_date >= d)) {
-      setIconText(badge, "target", (goal.title || "Goal") + " (Unphased)");
-      return;
-    }
-  }
-  setIconText(badge, "circle", "Standalone workout");
-}
-
 // ---- Structured-workout step editor ----------------------------------------
 // Each `.step-row` is one interval; `collectSteps` reads the rows back into the
 // API's step shape (duration in seconds, targets optional) and `updateStepsTotal`
@@ -3416,7 +3070,6 @@ function addStepRow(step) {
 
   stepInput(row, "st-pace", "number", "pace", s.target_pace_min_km != null ? s.target_pace_min_km : "");
   stepInput(row, "st-hr", "text", "HR", s.target_hr_zone || "");
-  stepInput(row, "st-power", "number", "W", s.target_power_w != null ? s.target_power_w : "");
 
   const del = document.createElement("button");
   del.type = "button";
@@ -3449,7 +3102,6 @@ function collectSteps() {
     const intensity = val(".st-intensity"); if (intensity) step.intensity = intensity;
     const pace = val(".st-pace"); if (pace !== "") step.target_pace_min_km = Number(pace);
     const hr = val(".st-hr"); if (hr) step.target_hr_zone = hr;
-    const power = val(".st-power"); if (power !== "") step.target_power_w = Number(power);
     out.push(step);
   });
   return out;
@@ -3475,13 +3127,10 @@ function openPlanModal(workout, date) {
   $("pm-description").value = workout ? (workout.description || "") : "";
   $("pm-duration").value = workout && workout.duration_min != null ? workout.duration_min : "";
   $("pm-distance").value = workout && workout.distance_km != null ? workout.distance_km : "";
-  $("pm-pace").value = workout && workout.target_pace_min_km != null ? workout.target_pace_min_km : "";
   $("pm-hrzone").value = workout ? (workout.target_hr_zone || "") : "";
-  $("pm-power").value = workout && workout.target_power_w != null ? workout.target_power_w : "";
   $("pm-status").value = workout ? workout.status : "planned";
   renderStepEditor(workout ? workout.steps : null);
   if (!workout) addStepRow({ kind: "steady" });
-  updateWorkoutPhaseBadge();
   $("pm-delete").classList.toggle("hidden", !workout);
   $("plan-modal-title").textContent = workout ? "Edit workout" : "Add workout";
   setErr($("plan-modal-error"), "");
@@ -3502,9 +3151,7 @@ async function savePlan() {
     duration_min: num("pm-duration"),
     distance_km: num("pm-distance"),
     intensity: $("pm-intensity").value,
-    target_pace_min_km: num("pm-pace"),
     target_hr_zone: $("pm-hrzone").value,
-    target_power_w: num("pm-power"),
     steps: collectSteps(),
     status: $("pm-status").value,
   };
@@ -3538,36 +3185,27 @@ async function deletePlan() {
   } catch (e) { setErr($("plan-modal-error"), e.message); }
 }
 
-// ---- Goals / phases / weeks editor -----------------------------------------
-// The long-term anchor is the season shape the plan derives from; this modal is
-// the UI equivalent of the agent's anchor tool. Saving replaces the block set
-// (workouts are re-linked by phase name, the rest detached) and is undoable.
+// ---- Goal & weekly targets editor -----------------------------------------
+// The UI equivalent of the agent's anchor edit: the goal's fields plus one
+// minutes target per calendar week of its season. Saving goes through the
+// same transactional writer as the agent and is undoable.
 
 function openGoalsModal() {
   setErr($("goal-modal-error"), "");
   $("goal-modal").classList.remove("hidden");
-  const sel = selectedGoal();
-  startGoalEdit(sel ? sel.goal.id : null);
+  startGoalEdit();
 }
 
 function closeGoalModal() { $("goal-modal").classList.add("hidden"); }
 
-function startGoalEdit(goalId) {
-  goalEditId = goalId;
-  const g = planGoals.find((x) => x.goal.id === goalId);
-  goalDraft = g
-    ? JSON.parse(JSON.stringify({ goal: g.goal, blocks: g.blocks || [] }))
-    : { goal: {}, blocks: [] };
-  goalOriginalBlockIds = goalDraft.blocks
-    .map((b) => b.id).filter((id) => id != null);
-  for (const b of goalDraft.blocks) {
-    if (!b.start_date || !b.end_date) continue;
-    const n = weekSpan(b);
-    if (!isFinite(n) || n < 1) continue;
-    if (!b.weeks) b.weeks = [];
-    while (b.weeks.length < n) b.weeks.push({});
-    if (b.weeks.length > n) b.weeks.length = n;
+// A fresh working copy of the stored goal and week targets.
+function startGoalEdit() {
+  const A = planAnchor || {};
+  const weeks = {};
+  for (const w of (A.weeks || [])) {
+    weeks[w.week_start] = { duration_min: w.duration_min, is_deload: !!w.is_deload };
   }
+  goalDraft = { goal: Object.assign({}, A.goal || {}), weeks };
   renderGoalEditor();
 }
 
@@ -3613,20 +3251,9 @@ function goalRow(a, b) {
 function renderGoalEditor() {
   const body = $("goal-modal-body");
   body.innerHTML = "";
-  const list = document.createElement("div");
-  list.className = "goal-list";
-  for (const g of planGoals) {
-    const b = document.createElement("button");
-    b.className = "secondary" + (g.goal.id === goalEditId ? " active" : "");
-    b.textContent = g.goal.title || ("Goal " + g.goal.id);
-    b.addEventListener("click", () => startGoalEdit(g.goal.id));
-    list.appendChild(b);
-  }
-  if (planGoals.length) body.appendChild(list);
-
   const form = document.createElement("div");
   form.className = "goal-form";
-  const G = goalDraft.goal || {};
+  const G = goalDraft.goal;
   form.appendChild(goalRow(
     goalField("Title", "gm-title", G.title, { placeholder: "Autumn marathon" }),
     goalSelect("Sport", "gm-sport", G.sport,
@@ -3639,151 +3266,92 @@ function renderGoalEditor() {
       { type: "number", step: "any", min: "0" }),
     goalField("Target time", "gm-time", G.target_time, { placeholder: "3:45:00" })));
 
-  const bh = document.createElement("div");
-  bh.className = "block-head-row";
-  const bt = document.createElement("b");
-  bt.textContent = "Blocks & weeks";
-  bh.appendChild(bt);
-  const addBlock = document.createElement("button");
-  addBlock.className = "secondary sm";
-  addBlock.textContent = "+ block";
-  addBlock.addEventListener("click", () => {
-    goalDraft.blocks.push({ name: "", weeks: [] });
-    renderGoalEditor();
-  });
-  bh.appendChild(addBlock);
-  if (goalEditId != null) {
+  const head = document.createElement("div");
+  head.className = "ge-head-row";
+  const ht = document.createElement("b");
+  ht.textContent = "Weekly targets (minutes)";
+  head.appendChild(ht);
+  if (planAnchor && planAnchor.goal) {
     const delGoal = document.createElement("button");
     delGoal.className = "danger sm";
     delGoal.textContent = "Delete goal";
     delGoal.addEventListener("click", async () => {
       // No confirm dialog: the delete snapshots the season, so the toast offers Undo.
-      const name = (goalDraft.goal && goalDraft.goal.title) || "Goal";
+      const name = planAnchor.goal.title || "Goal";
       try {
-        await api("/training/anchor/" + goalEditId, undefined, "DELETE");
-        goalEditId = null;
-        goalDraft = { goal: {}, blocks: [] };
+        await api("/training/anchor", undefined, "DELETE");
         await loadAnchor(fmt(planWeekStart));
-        renderGoalEditor();
+        startGoalEdit();
         loadPlan();
-        toast("Deleted " + name + " (planned workouts were detached)", {
+        toast("Deleted " + name + " (week targets and workouts stay)", {
           action: { label: "Undo", fn: async () => {
             await undoSeason(name);
             if (!$("goal-modal").classList.contains("hidden")) {
               await loadAnchor(fmt(planWeekStart));
-              renderGoalEditor();
+              startGoalEdit();
             }
           } },
         });
       } catch (e) { setErr($("goal-modal-error"), e.message); }
     });
-    bh.appendChild(delGoal);
+    head.appendChild(delGoal);
   }
-  form.appendChild(bh);
-  goalDraft.blocks.forEach((b, bi) => form.appendChild(blockEditor(b, bi)));
+  form.appendChild(head);
+  const weeks = document.createElement("div");
+  weeks.id = "gm-weeks";
+  form.appendChild(weeks);
   body.appendChild(form);
+  // Changing the season's dates re-lays the week rows (typed values are kept
+  // in the draft); the rest of the form is untouched.
+  for (const id of ["gm-start", "gm-date"]) $(id).addEventListener("change", renderGoalWeeks);
+  renderGoalWeeks();
 }
 
-function blockField(label, key, block, attrs, onChange) {
-  const wrap = document.createElement("div");
-  const l = document.createElement("label");
-  l.textContent = label;
-  wrap.appendChild(l);
-  const inp = document.createElement("input");
-  Object.assign(inp, attrs || {});
-  inp.value = block[key] == null ? "" : block[key];
-  inp.addEventListener("input", () => { block[key] = inp.value; });
-  if (onChange) inp.addEventListener("change", onChange);
-  wrap.appendChild(inp);
-  return wrap;
-}
-
-// A dated block is one target per calendar week, so setting its dates resizes
-// the week rows to match the block's span (growing pads blanks, shrinking trims).
-// This span is form layout for an unsaved draft only — every number the plan
-// renders (week number/count, planned/actual volume) comes from the server.
-function weekSpan(block) {
-  if (!block || !block.start_date || !block.end_date) return 0;
-  const first = mondayOf(parseISO(block.start_date));
-  const last = mondayOf(parseISO(block.end_date));
-  return Math.max(1, Math.round((last - first) / 86400000 / 7) + 1);
-}
-
-function fitWeeks(block) {
-  if (!block.start_date || !block.end_date || block.end_date < block.start_date) return;
-  const n = weekSpan(block);
-  if (!isFinite(n) || n < 1) return;
-  if (!block.weeks) block.weeks = [];
-  while (block.weeks.length < n) block.weeks.push({});
-  renderGoalEditor();
-}
-
-function blockEditor(block, bi) {
-  const card = document.createElement("div");
-  card.className = "block-card";
-  const head = document.createElement("div");
-  head.className = "bc-head";
-  const title = document.createElement("b");
-  title.textContent = "Block " + (bi + 1) + (block.name ? " · " + block.name : "");
-  head.appendChild(title);
-  const del = document.createElement("button");
-  del.className = "danger sm";
-  del.textContent = "Remove";
-  del.addEventListener("click", () => {
-    goalDraft.blocks.splice(bi, 1);
-    renderGoalEditor();
-  });
-  head.appendChild(del);
-  card.appendChild(head);
-
-  card.appendChild(goalRow(
-    blockField("Name", "name", block, { placeholder: "Base" }),
-    blockField("Focus", "focus", block, { placeholder: "aerobic" })));
-  card.appendChild(goalRow(
-    blockField("Start", "start_date", block, { type: "date" }, () => fitWeeks(block)),
-    blockField("End", "end_date", block, { type: "date" }, () => fitWeeks(block))));
-  const dated = block.start_date && block.end_date && block.end_date >= block.start_date;
-  const wh = document.createElement("div");
-  wh.className = "block-head-row";
-  const wl = document.createElement("b");
-  wl.textContent = dated
-    ? "Weeks (" + weekSpan(block) + " calendar weeks)"
-    : "Weeks";
-  wh.appendChild(wl);
-  card.appendChild(wh);
-  if (dated) {
-    (block.weeks || []).forEach((w, wi) => card.appendChild(weekRow(block, w, wi)));
-  } else {
-    const hint = document.createElement("div");
-    hint.className = "muted";
-    hint.textContent = "Set a start and end date to plan week targets.";
-    card.appendChild(hint);
+// One row per calendar week of the season (start..target), plus any stored
+// week outside it so it can still be cleared. The week numbers here are form
+// layout for an unsaved draft; the plan itself shows the server's numbers.
+function renderGoalWeeks() {
+  const box = $("gm-weeks");
+  box.innerHTML = "";
+  const start = $("gm-start").value, end = $("gm-date").value;
+  const mondays = new Set(Object.keys(goalDraft.weeks));
+  if (start && end && end >= start) {
+    for (let d = mondayOf(parseISO(start)); d <= parseISO(end); d.setDate(d.getDate() + 7)) {
+      mondays.add(fmt(d));
+    }
   }
-  return card;
+  const list = [...mondays].sort();
+  if (!list.length) {
+    box.appendChild(quietLine("Set a start and target date to plan the weekly targets."));
+    return;
+  }
+  const base = start ? mondayOf(parseISO(start)) : null;
+  for (const ws of list) box.appendChild(weekRow(ws, base));
 }
 
-function weekRow(block, week, wi) {
+function weekRow(ws, base) {
+  const week = goalDraft.weeks[ws] || {};
+  const keep = () => { goalDraft.weeks[ws] = week; };
   const row = document.createElement("div");
   row.className = "week-row";
+  row.dataset.week = ws;
+  const n = base ? Math.round((parseISO(ws) - base) / 86400000 / 7) + 1 : null;
   const label = document.createElement("span");
   label.className = "w-idx";
-  label.textContent = "W" + (wi + 1);
-  label.title = "week " + (wi + 1) + " of the block";
+  label.textContent = (n && n >= 1 ? "W" + n + " · " : "")
+    + parseISO(ws).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
   row.appendChild(label);
 
-  const num = (cls, key, attrs) => {
-    const inp = document.createElement("input");
-    inp.type = "number";
-    inp.className = cls;
-    inp.value = week[key] == null ? "" : week[key];
-    Object.assign(inp, attrs || {});
-    inp.addEventListener("input", () => {
-      week[key] = inp.value === "" ? null : Number(inp.value);
-    });
-    return inp;
-  };
-  const mn = num("w-min", "duration_min", { min: "0" });
+  const mn = document.createElement("input");
+  mn.type = "number";
+  mn.className = "w-min";
+  mn.min = "0";
   mn.placeholder = "min";
+  mn.value = week.duration_min == null ? "" : week.duration_min;
+  mn.addEventListener("input", () => {
+    week.duration_min = mn.value === "" ? null : Number(mn.value);
+    keep();
+  });
   row.appendChild(mn);
 
   const dl = document.createElement("label");
@@ -3791,11 +3359,10 @@ function weekRow(block, week, wi) {
   const cb = document.createElement("input");
   cb.type = "checkbox";
   cb.checked = !!week.is_deload;
-  cb.addEventListener("change", () => { week.is_deload = cb.checked; });
+  cb.addEventListener("change", () => { week.is_deload = cb.checked; keep(); });
   dl.appendChild(cb);
   dl.appendChild(document.createTextNode("deload"));
   row.appendChild(dl);
-
   return row;
 }
 
@@ -3803,52 +3370,39 @@ async function saveGoal() {
   setErr($("goal-modal-error"), "");
   const val = (id) => { const v = $(id).value.trim(); return v === "" ? null : v; };
   const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
-  const keepIds = goalDraft.blocks
-    .map((b) => b.id).filter((id) => id != null);
-  const payload = {
+  const goal = {
     title: val("gm-title"),
     sport: val("gm-sport"),
     start_date: val("gm-start"),
     target_date: val("gm-date"),
     target_distance_km: num("gm-dist"),
     target_time: val("gm-time"),
-    blocks: goalDraft.blocks.map((b) => {
-      const entry = {
-        id: b.id != null ? b.id : null,
-        name: b.name || null,
-        focus: b.focus || null,
-        start_date: b.start_date || null,
-        end_date: b.end_date || null,
-      };
-      // Undated blocks cannot carry week targets, so only a dated block sends
-      // its weeks. The server patches by week_start, so EVERY week is sent: one
-      // with no targets clears that week's stored row.
-      if (b.start_date) {
-        const base = mondayOf(parseISO(b.start_date));
-        entry.weeks = (b.weeks || [])
-          .map((w, wi) => {
-            const ws = w.week_start || fmt(new Date(base.getTime() + wi * 7 * 86400000));
-            return {
-              week_start: ws,
-              duration_min: w.duration_min == null || w.duration_min === "" ? null : Number(w.duration_min),
-              is_deload: !!w.is_deload,
-            };
-          });
-      }
-      return entry;
-    }),
   };
-  const removed = goalOriginalBlockIds.filter((id) => !keepIds.includes(id));
-  if (removed.length) payload.delete_blocks = removed;
+  // Every week on screen is sent: one with no minutes clears that week's
+  // stored target. A week's minutes are its target, so a deload needs them.
+  const weeks = [...$("gm-weeks").querySelectorAll(".week-row")].map((r) => {
+    const w = goalDraft.weeks[r.dataset.week] || {};
+    return {
+      week_start: r.dataset.week,
+      duration_min: w.duration_min == null ? null : Number(w.duration_min),
+      is_deload: !!w.is_deload,
+    };
+  });
+  const bare = weeks.find((w) => w.is_deload && w.duration_min == null);
+  if (bare) {
+    setErr($("goal-modal-error"), "Add the minutes for the deload week of " + bare.week_start);
+    return;
+  }
+  // Goal fields only when there is a goal to patch or something to create it
+  // from, so saving week targets alone never creates an empty goal.
+  const payload = { weeks };
+  if ((planAnchor && planAnchor.goal) || Object.values(goal).some((v) => v != null)) {
+    Object.assign(payload, goal);
+  }
   try {
-    if (goalEditId != null) {
-      await api("/training/anchor/" + goalEditId, payload, "PATCH");
-    } else {
-      const created = await api("/training/anchor", payload, "POST");
-      goalEditId = created.goal ? created.goal.id : null;
-    }
+    await api("/training/anchor", payload, "PATCH");
     await loadAnchor(fmt(planWeekStart));
-    startGoalEdit(goalEditId);
+    startGoalEdit();
     loadPlan();
     toast("Goal saved", { type: "ok" });
   } catch (e) { setErr($("goal-modal-error"), e.message); }
@@ -4581,9 +4135,6 @@ $("btn-plan-today").addEventListener("click", () => { planWeekStart = mondayOf(n
 $("plan-view-week").addEventListener("click", () => setPlanView("week"));
 $("plan-view-list").addEventListener("click", () => setPlanView("list"));
 $("btn-edit-goals").addEventListener("click", openGoalsModal);
-$("pm-date").addEventListener("input", updateWorkoutPhaseBadge);
-$("pm-date").addEventListener("change", updateWorkoutPhaseBadge);
-$("pm-type").addEventListener("change", updateWorkoutPhaseBadge);
 $("pm-save").addEventListener("click", savePlan);
 $("pm-add-step").addEventListener("click", () => addStepRow(null));
 $("pm-cancel").addEventListener("click", closePlanModal);
@@ -4591,15 +4142,12 @@ $("pm-delete").addEventListener("click", deletePlan);
 $("plan-modal").addEventListener("click", (e) => { if (e.target === $("plan-modal")) closePlanModal(); });
 $("goal-save").addEventListener("click", saveGoal);
 $("goal-cancel").addEventListener("click", closeGoalModal);
-$("goal-new").addEventListener("click", () => startGoalEdit(null));
 $("goal-undo").addEventListener("click", async () => {
   setErr($("goal-modal-error"), "");
   try {
     await api("/training/undo", {}, "POST");
-    goalEditId = null;
-    goalDraft = { goal: {}, blocks: [] };
     await loadAnchor(fmt(planWeekStart));
-    renderGoalEditor();
+    startGoalEdit();
     loadPlan();
     toast("Last save undone", { type: "ok" });
   } catch (e) { setErr($("goal-modal-error"), e.message); }

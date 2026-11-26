@@ -27,8 +27,8 @@ agree.
   zone is estimated minute by minute from recent outdoor runs, relative to your
   lactate-threshold pace, so it follows your fitness and the season. Planned
   runs use it to estimate distance.
-- **A training plan you share with the AI.** Goals are split into periodized
-  blocks, then weekly targets, then dated workouts built from structured steps.
+- **A training plan you share with the AI.** One goal, a minutes target for
+  each week of its season, and dated workouts built from structured steps.
   You can drag workouts between days, see the forecast on the calendar, compare
   planned with actual, or ask the agent to reshape the week. One undo reverts
   the last destructive edit.
@@ -42,7 +42,7 @@ agree.
 <table>
   <tr>
     <td><img src="images/today.png" alt="Today tab: daily briefing with the workout's steps and weather, above the ACWR card and its history chart"></td>
-    <td><img src="images/training_plan.png" alt="Training Plan week: block progress, weekly distance target, workouts per day with weather, and planned versus actual"></td>
+    <td><img src="images/training_plan.png" alt="Training Plan week: week of the season, weekly minutes target, workouts per day with weather, and planned versus actual"></td>
   </tr>
   <tr>
     <td align="center"><b>Today</b>: briefing and ACWR</td>
@@ -120,7 +120,7 @@ The UI has four tabs:
 | --- | --- |
 | **Chat** | Streaming conversation with the agent, with charts drawn inline where the answer places them. The whole conversation is kept per account and resumes on reload; **Compact** replaces it with a summary (shown as a note) and **New chat** starts over. A live meter shows the context size. |
 | **Today** | Daily briefing (today's workout with its steps, and the weather), then cards for ACWR, Running ACWR and Pace by HR Zone. Open a card to see the breakdown and history. |
-| **Training Plan** | **Week** view: the current block's progress, the week's distance against its target, drag-and-drop workouts with the forecast, and a planned → actual row for completed sessions. **List** view: the next eight weeks. **Goals** edits goals, blocks and weekly targets. |
+| **Training Plan** | **Week** view: where the week sits in the season (week N of M, days to the goal), the week's minutes against its target, drag-and-drop workouts with the forecast, and a planned → actual row for completed sessions. **List** view: the next eight weeks. **Goal** edits the goal and its weekly targets. |
 | **Settings** | **Sync**: **Sync now**, **Sync + full re-parse**, the auto-sync toggle, the sync start date (with **Detect from Garmin**) and re-linking the Garmin login. **Preferences**: home city, excluded data types, agent reasoning effort, training principles and the agent's long-term memory. |
 
 ![Pace by HR Zone card on the Today tab: learned pace for zones 1 to 5 with uncertainty and minutes of running behind each](images/zone_paces.png)
@@ -163,7 +163,7 @@ curl -s -X POST localhost:8000/ask -H "$H" -H 'Content-Type: application/json' \
 | Auth & config | `POST /auth/register`, `POST /auth/register/mfa`, `POST /auth/login`, `POST /auth/garmin` (re-link the Garmin login), `GET /auth/me`, `GET`/`PUT /auth/config` |
 | Sync | `POST /sync`, `POST /sync/full`, `POST /sync/detect-start`, `GET /sync/status`, `POST /cron/sync` (uses `GARMIN_CRON_TOKEN`) |
 | Data | `GET /acwr`, `GET /run-acwr`, `GET /zone-paces`, `GET /activities`, `GET /weather` |
-| Training | `GET`/`POST /training/workouts`, `PATCH`/`DELETE /training/workouts/{id}`, `GET`/`POST /training/anchor`, `PATCH`/`DELETE /training/anchor/{goal_id}`, `POST /training/undo` |
+| Training | `GET`/`POST /training/workouts`, `PATCH`/`DELETE /training/workouts/{id}`, `GET`/`PATCH`/`DELETE /training/anchor`, `POST /training/undo` |
 | Agent | `POST /ask` (SSE), `GET /ask/history`, `POST /ask/clear`, `POST /ask/compact`, `POST /ask/chart` |
 
 ### CLI
@@ -203,7 +203,7 @@ The agent is built on Pydantic AI and is read-only at every layer:
 | `chart` | Validates a Plotly spec against the query result and returns a chart id; the answer places it with `<chart id="…"/>` and the UI renders it there |
 | `weather` | Stored forecast and per-activity observed weather |
 | `memory` | Long-term notes about the user (never facts that the DB already holds) |
-| `training` | Reads the season: goals, the resolved current block and week, planned-vs-actual coverage, and warnings for runs whose distance disagrees with their steps |
+| `training` | Reads the season: the goal, each week's target with its place in the season, planned workouts and planned-vs-actual coverage |
 | `training_apply` | One atomic, typed edit to the plan (or `undo`) |
 
 The system prompt carries the user's own "today" and their learned zone paces.
@@ -259,10 +259,9 @@ Every data table is keyed by `(user_id, …)` and has `FORCE ROW LEVEL SECURITY`
 | `user_profile`, `gear`, `devices` | Profile snapshots, current gear with totals, current devices |
 | `derived_metrics` | `(calendar_date, metric)` rows for ACWR, run ACWR, cadence drift and zone paces. Replaced each sync. |
 | `weather_forecast` | Stored daily Open-Meteo forecast, refreshed each sync |
-| `training_goal` | Goals (one per event) with sport, start date and target date |
-| `training_block` | Periodized phases of a goal, with name, focus, dates and baseline weekly km |
-| `training_week` | Per-week targets (distance, duration, deload flag) keyed by Monday |
-| `training_workout` | Dated workouts with structured steps, a status (`planned`, `completed`, `partial` or `skipped`) and target pace, HR zone or power |
+| `training_goal` | The account's one goal: sport, season start date, target date, distance and target time |
+| `training_week` | Per-week targets (minutes, deload flag) keyed by Monday |
+| `training_workout` | Dated workouts with a headline HR zone, structured steps (each with an HR zone or pace) and a status (`planned`, `completed`, `partial` or `skipped`) |
 | `user_state` | Agent memory, chat history, tool trace and the season undo snapshot |
 
 ## Configuration

@@ -4,7 +4,7 @@
 * :mod:`.training_validation` — plan vocabulary, normalisers, row shapers.
 * :mod:`.training_rules` — pure week math and goal/activity matching.
 * :mod:`.training_workouts` — planned workouts store (+ autocomplete).
-* :mod:`.training_anchor` — goals, blocks and week targets store.
+* :mod:`.training_anchor` — the goal and week targets store.
 * :mod:`.training_agenda` — the agent's windowed season agenda (read-only).
 * :mod:`.training_store` — the transactional season writer, undo, agent facade.
 

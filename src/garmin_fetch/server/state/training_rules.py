@@ -1,6 +1,6 @@
 """Pure training-plan rules: calendar-week math and goal/activity matching.
 
-No database access — the week/block resolution and the ONE goal-attribution
+No database access — the season-week numbering and the ONE goal-attribution
 rule live here so the store, the REST API and the agent cannot disagree.
 """
 
@@ -38,105 +38,29 @@ def _first_monday(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
 
-def _block_week_number(block_start: date, day: date) -> int:
-    """1-based calendar week (Mon..Sun) of ``day`` within a block.
-
-    A block's first week is the calendar week containing its start date, so a
-    block that starts mid-week still aligns to Mon..Sun and its week boundary is
-    exactly the plan tab's calendar week. Never returns less than 1.
-    """
-    return max(1, (day - _first_monday(block_start)).days // 7 + 1)
-
-
-def _block_week_count(block: dict[str, Any]) -> int | None:
-    """Number of calendar weeks (Mon..Sun) a dated block spans, or None.
-
-    The count comes from the block's dates, not its stored week rows, so a
-    partially-populated block still reports the full span.
-    """
-    start, end = block.get("start_date"), block.get("end_date")
-    if not start or not end:
-        return None
+def _season_week(goal: dict[str, Any] | None, monday: date) -> tuple[int | None, int | None]:
+    """``(number, count)`` of the calendar week starting ``monday`` within the
+    goal's season — the weeks from the one holding ``start_date`` to the one
+    holding ``target_date``. ``number`` is None outside the season (or with no
+    start date); ``count`` is None without both dates."""
+    start = (goal or {}).get("start_date")
+    if not start:
+        return None, None
     base = _first_monday(date.fromisoformat(start))
-    last = _first_monday(date.fromisoformat(end))
-    return (last - base).days // 7 + 1
-
-
-def _covering_block(
-    blocks: list[dict[str, Any]], start: date, end: date | None = None
-) -> dict[str, Any] | None:
-    """The shortest *dated* block overlapping ``start``..``end`` (default: that
-    one day), or None.
-
-    When several blocks overlap, the most specific (shortest) phase wins.
-    Undated blocks never cover anything.
-    """
-    lo = start.isoformat()
-    hi = (end or start).isoformat()
-    covering = [
-        b for b in blocks
-        if b.get("start_date") and b.get("end_date")
-        and b["start_date"] <= hi and b["end_date"] >= lo
-    ]
-    if not covering:
-        return None
-    return min(
-        covering,
-        key=lambda b: (
-            date.fromisoformat(b["end_date"]) - date.fromisoformat(b["start_date"])
-        ).days,
+    target = goal.get("target_date")
+    count = (
+        (_first_monday(date.fromisoformat(target)) - base).days // 7 + 1
+        if target else None
     )
-
-
-def _effective_week(stored: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The target of one calendar week: its stored row (``is_deload``
-    defaulted to False), or None. Week targets are minutes only."""
-    if stored is None:
-        return None
-    week = dict(stored)
-    if week.get("is_deload") is None:
-        week["is_deload"] = False
-    return week
-
-
-def _resolve_block_weeks(
-    block: dict[str, Any], raw_weeks: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Every calendar-week target of a block: the stored row (or an empty
-    week) for each week of a dated block's span, plus any stored week outside
-    that span."""
-    by_start = {w["week_start"]: w for w in raw_weeks if w.get("week_start")}
-    resolved: list[dict[str, Any]] = []
-    count = _block_week_count(block)
-    if count is not None:
-        base = _first_monday(date.fromisoformat(block["start_date"]))
-        for i in range(count):
-            ws = (base + timedelta(days=7 * i)).isoformat()
-            resolved.append(
-                _effective_week(by_start.get(ws))
-                or {"week_start": ws, "duration_min": None, "is_deload": False}
-            )
-    in_span = {w["week_start"] for w in resolved}
-    for w in raw_weeks:
-        if w.get("week_start") not in in_span:
-            resolved.append(_effective_week(w))
-    return resolved
-
-
-def _minutes_by_week(
-    weeks_by_block: dict[int, list[dict[str, Any]]],
-) -> dict[str, int]:
-    """Every stored week target of a goal (all blocks), keyed by Monday."""
-    return {
-        w["week_start"]: w["duration_min"]
-        for weeks in weeks_by_block.values() for w in weeks
-        if w.get("week_start") and w.get("duration_min")
-    }
+    number = (monday - base).days // 7 + 1
+    if number < 1 or (count is not None and number > count):
+        number = None
+    return number, count if count and count > 0 else None
 
 
 def _change_pct(minutes_by_week: dict[str, int], week_start: str) -> int | None:
-    """A week's target minutes vs the previous calendar week's (whole %,
-    across block boundaries); None unless both weeks have a target."""
+    """A week's target minutes vs the previous calendar week's (whole %);
+    None unless both weeks have a target."""
     prev = (date.fromisoformat(week_start) - timedelta(days=7)).isoformat()
     cur, before = minutes_by_week.get(week_start), minutes_by_week.get(prev)
     if not cur or not before:
@@ -197,39 +121,30 @@ def _workout_matches_sport(sport: str | None, activity_type: str | None) -> bool
 
     Both values come from :data:`ACTIVITY_TYPES` ("run", "cycle", "swim",
     "strength", "other"). A goal with no sport (or "other") matches all
-    workout types, and an "other" workout matches any sport. Otherwise the
-    types must match (or map via :data:`GARMIN_TYPE_MAP`).
+    workout types, and an "other" workout matches any sport; otherwise the
+    types must be equal.
     """
     if not sport or sport == "other":
         return True
-    if not activity_type or activity_type == "other":
-        return True
-    if sport == activity_type:
-        return True
-    allowed = GARMIN_TYPE_MAP.get(sport)
-    return allowed is not None and activity_type in allowed
+    return not activity_type or activity_type in ("other", sport)
 
 
 def goal_workouts(
-    goal: dict[str, Any], workouts: list[dict[str, Any]],
+    goal: dict[str, Any] | None, workouts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """The planned workouts that count toward the (one) goal's weekly
-    volume: those whose type fits its sport. An account has one goal, so
-    there is nothing else to attribute."""
-    return [
-        w for w in workouts
-        if _workout_matches_sport(goal.get("sport"), w.get("activity_type"))
-    ]
+    """The planned workouts that count toward the weekly targets: those whose
+    type fits the goal's sport (every workout without a goal)."""
+    sport = (goal or {}).get("sport")
+    return [w for w in workouts if _workout_matches_sport(sport, w.get("activity_type"))]
 
 
 def goal_activities(
-    goal: dict[str, Any], activities: list[dict[str, Any]]
+    goal: dict[str, Any] | None, activities: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """The synced activities that count toward ``goal``'s sport."""
-    return [
-        a for a in activities
-        if _goal_matches(goal.get("sport"), a.get("activity_type"))
-    ]
+    """The synced activities that count toward the weekly targets (the goal's
+    sport; every activity without a goal)."""
+    sport = (goal or {}).get("sport")
+    return [a for a in activities if _goal_matches(sport, a.get("activity_type"))]
 
 
 def _closest_activity(
