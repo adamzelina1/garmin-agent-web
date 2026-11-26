@@ -58,14 +58,25 @@ def _season_week(goal: dict[str, Any] | None, monday: date) -> tuple[int | None,
     return number, count if count and count > 0 else None
 
 
-def _change_pct(minutes_by_week: dict[str, int], week_start: str) -> int | None:
-    """A week's target minutes vs the previous calendar week's (whole %);
-    None unless both weeks have a target."""
-    prev = (date.fromisoformat(week_start) - timedelta(days=7)).isoformat()
-    cur, before = minutes_by_week.get(week_start), minutes_by_week.get(prev)
-    if not cur or not before:
-        return None
-    return round((cur - before) / before * 100)
+def _change_pct(weeks: dict[str, dict[str, Any]], week_start: str) -> int | None:
+    """A week's target minutes vs the last build week before it (whole %).
+
+    The comparison week is the nearest earlier calendar week with a target,
+    stepping back over deload weeks: a week after a deload compares with the
+    week before the deload (not the planned dip), and a deload week shows its
+    cut against the build week before it. ``weeks`` holds the stored week
+    targets by ``week_start``. None when there is no such week — a week
+    without a target ends the look-back."""
+    day = date.fromisoformat(week_start)
+    while True:
+        day -= timedelta(days=7)
+        prev = weeks.get(day.isoformat())
+        if prev is None or not prev["duration_min"]:
+            return None
+        if not prev["is_deload"]:
+            break
+    cur = weeks[week_start]["duration_min"]
+    return round((cur - prev["duration_min"]) / prev["duration_min"] * 100)
 
 
 def _coverage_entry(
@@ -76,8 +87,8 @@ def _coverage_entry(
     plan tab, the agent's read and an edit result all use.
 
     ``target_min`` is the week's ``duration_min``; ``delta_min`` is
-    scheduled minus target; ``change_pct`` is the target vs the previous
-    week's (see :func:`_change_pct`). ``est_km`` (the planned runs' estimated
+    scheduled minus target; ``change_pct`` is the target vs the last build
+    week before it (see :func:`_change_pct`). ``est_km`` (the planned runs' estimated
     km) and ``actual_km`` are for display only — km is never a target.
     Zero km/actuals (an unbuilt or future week) are None. ``km``/``mins``
     are the pre-summed planned totals and ``actual_km``/``actual_min`` the

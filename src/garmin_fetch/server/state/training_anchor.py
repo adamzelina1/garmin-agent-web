@@ -28,9 +28,9 @@ _GOAL_KEYS = (
 )
 
 
-def _minutes(weeks: list[dict[str, Any]]) -> dict[str, int]:
-    """Every week's target minutes, keyed by its Monday."""
-    return {w["week_start"]: w["duration_min"] for w in weeks if w["duration_min"]}
+def _by_start(weeks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Every stored week target, keyed by its Monday."""
+    return {w["week_start"]: w for w in weeks}
 
 
 def _week_label(number: int | None, count: int | None) -> str | None:
@@ -99,7 +99,7 @@ class TrainingAnchorStore:
         """The plan tab's view of the season.
 
         ``goal`` (or None), every stored week target with its ``change_pct``
-        vs the week before and its ``week_number`` in the season (None
+        (vs the last build week, see ``_change_pct``) and its ``week_number`` in the season (None
         outside it), and ``weekly_target``: the calendar week holding
         ``day`` (default today) as ``{week_start, week_number, week_count,
         week, coverage}`` — ``week`` is that week's stored target and
@@ -109,13 +109,13 @@ class TrainingAnchorStore:
         monday = _first_monday(date.fromisoformat(day) if day else date.today())
         rows = self._rows(user_id, goal, weeks, monday, monday)
         number, count = _season_week(goal, monday)
-        minutes = _minutes(weeks)
+        by_start = _by_start(weeks)
         return {
             "goal": goal,
             "weeks": [
                 {
                     **w,
-                    "change_pct": _change_pct(minutes, w["week_start"]),
+                    "change_pct": _change_pct(by_start, w["week_start"]),
                     "week_number": _season_week(goal, date.fromisoformat(w["week_start"]))[0],
                 }
                 for w in weeks
@@ -170,7 +170,7 @@ class TrainingAnchorStore:
             date.fromisoformat(targeted[-1]["week_start"]) + timedelta(days=6),
         )
         zero = {"km": 0.0, "min": 0.0}
-        minutes = _minutes(weeks)
+        by_start = _by_start(weeks)
         rows: list[dict[str, Any]] = []
         for week in targeted:
             ws = week["week_start"]
@@ -182,7 +182,7 @@ class TrainingAnchorStore:
                 "week_number": number,
                 "week_count": count,
                 "coverage": _coverage_entry(
-                    week, p["km"], p["min"], a["km"], a["min"], _change_pct(minutes, ws),
+                    week, p["km"], p["min"], a["km"], a["min"], _change_pct(by_start, ws),
                 ),
             })
         return rows

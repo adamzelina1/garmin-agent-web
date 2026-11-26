@@ -139,7 +139,9 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
         Returns the ``goal`` plus ``weeks``: one entry per calendar week
         (Mon..Sun) of the window with its ``target`` (``week`` — its place
         in the season, "12 of 31" —, ``target_min``, ``scheduled_min``,
-        ``delta_min``, ``change_pct`` — the target vs the previous week's —,
+        ``delta_min``, ``change_pct`` — the target vs the last build week
+        before it, stepping over deload weeks, so a return from a deload
+        compares with the week before the deload —,
         ``est_km``, ``actual_min`` / ``actual_km`` and ``deload``; null
         when the week has no target), ``planned`` workouts (each with its
         headline ``target_hr_zone`` and its steps, which carry the
@@ -170,7 +172,7 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
         estimate (a run's distance is priced from its steps) — never a target.
         The result lists the changed ids plus ``weeks``: each touched week's
         ``target_min``, ``scheduled_min``, ``delta_min``, ``change_pct`` (the
-        target vs the previous week's, in %) and ``est_km``, so no follow-up
+        target vs the last build week before it, in %) and ``est_km``, so no follow-up
         read is needed. Bring every ``delta_min`` to 0 by adjusting
         workouts; change a week's target only when the user asks. To move or
         copy workouts, read them first; never guess ids.

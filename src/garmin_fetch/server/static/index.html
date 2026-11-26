@@ -2213,7 +2213,8 @@ function goalFactsSection(G) {
 // Renders the compact weekly target-vs-actual bar into the plan toolbar (right
 // above the calendar). The verbose legend/notes are gone — the toolbar is the
 // single source for this week's numbers.
-// A week's target change vs the previous week: "+5%", "−17%", "±0%".
+// A week's target change vs the last build week (deload weeks are stepped
+// over, server-side): "+5%", "−17%", "±0%".
 function fmtChangePct(p) {
   return p > 0 ? "+" + p + "%" : p < 0 ? "−" + Math.abs(p) + "%" : "±0%";
 }
@@ -2234,7 +2235,7 @@ function renderWeeklyProgressInto(host, goal) {
   const total = target || Number(cov.scheduled_min || 0);
   const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
 
-  // The week at a glance: target, estimated km, change vs last week, deload.
+  // The week at a glance: target, estimated km, change vs the last build week, deload.
   const stats = document.createElement("div");
   stats.className = "wp-stats";
   const stat = (strong, rest, cls) => {
@@ -2248,7 +2249,7 @@ function renderWeeklyProgressInto(host, goal) {
   };
   if (target != null) stat(String(target), " min this week");
   if (cov.est_km) stat("~" + rounded(cov.est_km), " km");
-  if (cov.change_pct != null) stat(fmtChangePct(cov.change_pct), " vs last week");
+  if (cov.change_pct != null) stat(fmtChangePct(cov.change_pct), " vs last build week");
   if (cov.deload) stat("Deload", "", "tag");
   host.appendChild(stats);
 
