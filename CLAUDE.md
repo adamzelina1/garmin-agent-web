@@ -14,6 +14,7 @@ docker compose up -d --build         # Postgres (garmin-db) + server image; .env
 uv run garmin-server --port 8000     # run the API/UI locally against the containerised DB
 uv run garmin-fetch --parse --full   # single-user CLI sync + full re-parse for GARMIN_LOCAL_USER_ID
 uv run garmin-ask "avg sleep last week?"   # ask the agent locally (also: garmin-ask-web, garmin-trace)
+uv run garmin-trace --failures --all-users --since <date>   # failed tool calls grouped by tool + error pattern
 uv add <pkg>                         # add a dependency
 ```
 

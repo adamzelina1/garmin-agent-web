@@ -99,6 +99,12 @@ class UserState:
         """Drop the stored conversation so the next turn starts a fresh session."""
         self.delete(user_id, _KEY_SESSION)
 
+    def user_ids(self) -> list[int]:
+        """Every account id (``users`` is exempt from RLS)."""
+        with self._pool.connection() as conn:
+            rows = conn.execute("SELECT id FROM users ORDER BY id").fetchall()
+        return [r["id"] for r in rows]
+
     def append_trace(self, user_id: int, record: dict[str, Any]) -> None:
         """Append one trace record to the user's stored trace list (JSON)."""
         raw = self.get(user_id, _KEY_TRACE)

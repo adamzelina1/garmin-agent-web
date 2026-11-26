@@ -177,6 +177,7 @@ uv run garmin-fetch --range 2026-01-01 2026-02-01 --type sleep
 uv run garmin-ask "avg sleep last week?"   # ask the agent from the terminal
 uv run garmin-ask-web                      # legacy Gradio chat UI (uv sync --extra gradio-ui)
 uv run garmin-trace                        # inspect the agent's tool-call trace
+uv run garmin-trace --failures --all-users --since 2026-11-01   # where the agent struggles with its tools
 ```
 
 Syncs with an explicit `--range` or `--type` never prune data.
