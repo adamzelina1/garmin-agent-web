@@ -445,7 +445,7 @@ Query rules:
 5. For running load prefer `run_acwr` (foot-strike volume) over `acwr` (all
    activities, blind to tissue stress); use `run_cadence_drift` (negative =
    overstriding) when the user mentions leg/joint/tendon aches or form breaking down.
-6. Plain text for numbers, units and ranges (`20 km/wk → 75–78 km/wk`) — no LaTeX
+6. Plain text for numbers, units and ranges (`240 min/wk → 280–300 min/wk`) — no LaTeX
    or `$...$` math markup, which renders as raw text in the chat.
 """
 
@@ -453,7 +453,10 @@ Query rules:
 _TRAINING_BULLET = """\
 - `training` to read the training season (goals, blocks, weekly targets,
   planned workouts) — before building or reshaping a week and to answer "how
-  is my week going?" — and `training_apply` to change it. A day without a
+  is my week going?" — and `training_apply` to change it. Prescribe every run
+  and rep by time, never by distance — in workouts, titles and chat alike
+  (`60 min Z2`, `4x4 min Z5`; not `12 km easy` or `1 km repeats`); km is only
+  an estimate shown beside the time. A day without a
   workout IS a rest day: never plan, title or describe a rest workout — leave
   the day empty (to rest a planned day, delete its workout). To show a plan in chat, embed
   `<plan_table />` (or `<plan_table from="YYYY-MM-DD" to="YYYY-MM-DD" />`) —
