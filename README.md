@@ -201,7 +201,7 @@ The agent is built on Pydantic AI and is read-only at every layer:
 | `get_day_summary`, `get_recent_activities`, `get_activity_detail` | Fast helpers for common questions, no SQL needed |
 | `get_metric_trend` | Several daily metrics side by side, each with its last-7-day average against your normal level |
 | `chart` | Validates a Plotly spec against the query result and returns a chart id; the answer places it with `<chart id="…"/>` and the UI renders it there |
-| `weather` | Stored forecast and per-activity observed weather |
+| `weather` | Live Open-Meteo weather for a day or place the database doesn't cover, as context only (stored activity weather and the home forecast are read with SQL) |
 | `memory` | Long-term notes about the user (never facts that the DB already holds) |
 | `training` | Reads the season: the goal, each week's target with its place in the season, planned workouts and planned-vs-actual coverage |
 | `training_apply` | One atomic, typed edit to the plan (or `undo`) |
@@ -235,9 +235,8 @@ markup is stripped and the model is sent back once to make the call properly.
   slower than a lower one.
 
 Planned workouts use these values too. A workout's duration is the sum of its
-steps, and a run's distance is checked against an estimate built from each
-step's pace or zone pace: a missing distance is filled in, and a large mismatch
-comes back as a warning.
+steps, and a run's distance is always an estimate built from each step's pace
+or its HR zone's pace, re-priced on every sync while the run is still planned.
 
 ## Data model
 
@@ -281,6 +280,8 @@ Per-account settings live in the `users` table and are edited from the UI.
 | `GARMIN_AUTO_SYNC` | Default for the per-account auto-sync toggle (off unless set) |
 | `GARMIN_ACTIVITY_FREEZE_DAYS` | Trailing days re-scanned for late activity uploads |
 | `GARMIN_LOCAL_USER_ID` | Account used by the CLI tools |
+| `GARMIN_EMAIL`, `GARMIN_PASSWORD`, `GARMIN_TOKENS_PATH`, `GARMIN_HOME_LAT`, `GARMIN_HOME_LON` | CLI only (the server keeps these per account): Garmin login, token cache and the home location for weather |
+| `GARMIN_START_DATE` | Default first day to back-fill; each account can set its own |
 | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | Server-wide LLM. `openai` covers any OpenAI-compatible endpoint, including Ollama; `gemini` is also supported. |
 | `LLM_REASONING_EFFORT` | Default reasoning effort (`low`, `medium` or `high`), which each account can override |
 
@@ -326,7 +327,7 @@ src/garmin_fetch/
   tool_args.py      lenient argument types for the agent's tools
   chat_format.py    answer/session shaping (charts, leaked tool calls) for server and Gradio UI
   ask_web.py        legacy Gradio UI (optional extra)
-  trace.py          per-turn tool-call tracing
+  trace.py          per-turn tool-call tracing + failure summary
   config.py         .env loading
   server/
     app.py          FastAPI routes

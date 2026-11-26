@@ -19,10 +19,6 @@ _MAX_WORKOUTS = 200
 #: ``status``).
 _DROP = ("created_at", "updated_at", "completed")
 
-#: Workout summary fields that its steps already carry.
-_STEP_FIELDS = ("intensity", "target_hr_zone")
-
-
 def _slim(row: dict[str, Any] | None) -> dict[str, Any] | None:
     """One row without bookkeeping keys or empty (None) values (None passes
     through)."""
@@ -32,15 +28,11 @@ def _slim(row: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _workout(w: dict[str, Any]) -> dict[str, Any]:
-    """A planned workout; with steps, its targets live on the steps only,
-    and a completed workout points at its activity (listed in the week's
-    ``actual``)."""
+    """A planned workout with its headline zone and its steps; a completed
+    workout points at its activity (listed in the week's ``actual``)."""
     out = _slim(w) or {}
     out.pop("actual", None)
-    if w.get("steps"):
-        for key in _STEP_FIELDS:
-            out.pop(key, None)
-        out["steps"] = [_slim(step) for step in w["steps"]]
+    out["steps"] = [_slim(step) for step in w["steps"]]
     return out
 
 

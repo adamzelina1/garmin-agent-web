@@ -8,21 +8,27 @@ API:
 - ``POST /auth/login``      — email+password -> JWT
 - ``POST /auth/garmin``     — re-link the caller's Garmin login (JWT)
 - ``GET  /auth/me``         — current user (JWT)
+- ``GET|PUT /auth/config``  — the caller's per-account settings (JWT)
 - ``POST /sync``            — enqueue the caller's own sync (JWT)
+- ``POST /sync/full``       — sync + full re-parse of the stored raw data (JWT)
 - ``GET  /sync/status``     — sync status for the caller (JWT)
 - ``POST /sync/detect-start`` — probe Garmin for the caller's first day of history (JWT)
 - ``POST /cron/sync``       — daemon-only: enqueue every active user
-- ``GET  /acwr``            — acute-to-chronic workload ratio (JWT)
+- ``GET  /acwr``, ``GET /run-acwr`` — overall and running-only workload ratio (JWT)
+- ``GET  /zone-paces``      — the learned run pace per HR zone (JWT)
+- ``GET  /activities``      — synced activities in a date range (JWT)
+- ``GET  /weather``         — the stored weather forecast (JWT)
 - ``GET  /training/workouts``   — the caller's planned workouts (JWT, optional range)
 - ``POST /training/workouts``   — add a workout (JWT)
 - ``PATCH /training/workouts/{id}`` — partial update of a workout (JWT)
 - ``DELETE /training/workouts/{id}`` — delete a workout (JWT, undoable)
 - ``POST /training/undo``    — restore the whole season pre-destructive-edit (JWT)
 - ``GET  /training/anchor``    — goal + week targets + resolved week (JWT)
-- ``POST|PATCH|DELETE /training/anchor`` — create / patch / delete the goal (JWT)
-- ``POST /ask``             — run the read-only agent (JWT, per-user rows)
+- ``PATCH|DELETE /training/anchor`` — patch (or create) / delete the goal and week targets (JWT)
+- ``POST /ask``             — run the read-only agent over SSE (JWT, per-user rows)
 - ``GET  /ask/history``     — the stored conversation for the caller (JWT)
 - ``POST /ask/clear``       — drop the stored conversation, fresh session (JWT)
+- ``POST /ask/compact``     — fold the stored conversation into a summary (JWT)
 - ``POST /ask/chart``       — render a chart spec to Plotly JSON (JWT)
 
 Every data-touching request runs as the read-only PG role with
@@ -181,7 +187,8 @@ class TrainingWeek(BaseModel):
     """One calendar week's target, in minutes.
 
     Weeks are patched by ``week_start`` (any date; snapped to its Monday): only
-    the weeks sent are written, and a week sent with no targets is cleared.
+    the weeks sent are written, a week sent with null minutes is cleared, and a
+    new week needs its minutes.
     """
 
     week_start: str

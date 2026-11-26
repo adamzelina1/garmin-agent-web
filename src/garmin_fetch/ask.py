@@ -226,7 +226,7 @@ _TABLE_NOTES: dict[str, str] = {
     "training_week": (
         "one row per week_start (a Monday): the target for that calendar week "
         "(Mon..Sun) — duration_min (minutes; the only volume target) and an "
-        "optional is_deload flag. read-only via SQL — write only through training_apply"
+        "is_deload flag. read-only via SQL — write only through training_apply"
     ),
     "weather_forecast": (
         "stored daily Open-Meteo weather forecast refreshed each sync (calendar_date, "
@@ -1558,8 +1558,9 @@ class Weather:
         if lat is None and lon is None:
             if self._default_lat is None or self._default_lon is None:
                 raise ValueError(
-                    "no location configured: set GARMIN_HOME_LAT and "
-                    "GARMIN_HOME_LON in .env (or pass explicit lat and lon)"
+                    "no home location: the athlete sets their home city in "
+                    "Settings (the CLI reads GARMIN_HOME_LAT/GARMIN_HOME_LON); "
+                    "or pass explicit lat and lon"
                 )
             return float(self._default_lat), float(self._default_lon)
         if lat is None or lon is None:
@@ -2051,8 +2052,9 @@ def _register_tools(
     @tool("Fetching day summary…")
     def get_day_summary(calendar_date: str) -> Any:
         """Return everything stored for one date (YYYY-MM-DD): the day's
-        non-null daily_metrics values, its activities and its running-form
-        scores. Use it for "how was my day on X?" instead of multi-table SQL."""
+        non-null daily_metrics values, its activities and its run_* derived
+        metrics (run ACWR and its km loads, cadence drift, cadence, GCT). Use
+        it for "how was my day on X?" instead of multi-table SQL."""
         return db.day_summary(calendar_date)
 
     @tool(
@@ -2086,7 +2088,7 @@ def _register_tools(
         cadence, duration, distance, HR, power, load and elevation.
 
         ``sport`` optionally filters by type (e.g. 'run', 'cycling'). The window
-        is the trailing ``days`` (default 30), or the inclusive
+        is the trailing ``days`` (default 30, max 180), or the inclusive
         ``date_start``/``date_end`` range (YYYY-MM-DD; either may be open).
         ``limit`` caps the rows (default 10, max 50).
         """

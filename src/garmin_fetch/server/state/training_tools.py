@@ -78,7 +78,11 @@ class WorkoutEdit(_Spec):
     )
     intensity: Intensity | None = None
     target_hr_zone: str | None = Field(
-        None, description="the session's headline HR zone shown on its plan card (e.g. 'Z2'); per-segment zones go on the steps",
+        None,
+        description=(
+            "the session's headline HR zone shown on its plan card (e.g. 'Z2'): the main "
+            "work's zone, kept in step when the steps change; per-segment zones go on the steps"
+        ),
     )
     status: Literal[PLAN_STATUSES] | None = None
     steps: Annotated[list[Step] | None, Loose] = Field(
@@ -136,10 +140,10 @@ def training_tools(season: Any) -> tuple[Callable[..., Any], Callable[..., Any]]
         (Mon..Sun) of the window with its ``target`` (``week`` — its place
         in the season, "12 of 31" —, ``target_min``, ``scheduled_min``,
         ``delta_min``, ``change_pct`` — the target vs the previous week's —,
-        ``est_km``, ``actual_min`` / ``actual_km`` and ``deload``; absent
-        when the week has no target), ``planned`` workouts (a workout with
-        steps carries its zone/pace targets on the steps) and ``actual``
-        synced activities. Empty fields are left out. ``can_undo`` says
+        ``est_km``, ``actual_min`` / ``actual_km`` and ``deload``; null
+        when the week has no target), ``planned`` workouts (each with its
+        headline ``target_hr_zone`` and its steps, which carry the
+        per-segment zone/pace targets) and ``actual`` synced activities. Empty fields are left out. ``can_undo`` says
         whether the last destructive edit can be rolled back. Read before
         building or reshaping a week, and to answer "how is my week going?".
 

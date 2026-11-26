@@ -737,7 +737,7 @@
             <button id="plan-view-week" class="active" title="Week calendar">Week</button>
             <button id="plan-view-list" title="List the next 8 weeks">List</button>
           </div>
-          <button id="btn-edit-goals" class="secondary" title="Edit the goal and weekly targets">Goal</button>
+          <button id="btn-edit-goal" class="secondary" title="Edit the goal and weekly targets">Goal</button>
         </div>
         <div class="hidden" id="plan-anchor"></div>
         <div class="banner warn dismissible" style="margin-top:0" id="plan-onboard">
@@ -3190,7 +3190,7 @@ async function deletePlan() {
 // minutes target per calendar week of its season. Saving goes through the
 // same transactional writer as the agent and is undoable.
 
-function openGoalsModal() {
+function openGoalModal() {
   setErr($("goal-modal-error"), "");
   $("goal-modal").classList.remove("hidden");
   startGoalEdit();
@@ -4134,7 +4134,7 @@ $("plan-next").addEventListener("click", () => { planWeekStart.setDate(planWeekS
 $("btn-plan-today").addEventListener("click", () => { planWeekStart = mondayOf(new Date()); loadPlan(); });
 $("plan-view-week").addEventListener("click", () => setPlanView("week"));
 $("plan-view-list").addEventListener("click", () => setPlanView("list"));
-$("btn-edit-goals").addEventListener("click", openGoalsModal);
+$("btn-edit-goal").addEventListener("click", openGoalModal);
 $("pm-save").addEventListener("click", savePlan);
 $("pm-add-step").addEventListener("click", () => addStepRow(null));
 $("pm-cancel").addEventListener("click", closePlanModal);
